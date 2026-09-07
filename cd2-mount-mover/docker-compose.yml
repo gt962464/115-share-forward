@@ -16,9 +16,9 @@ services:
       STABLE_POLLS: "2"
       LOG_LEVEL: INFO
     volumes:
-      - /vol2/1000/转存:/source:rw
-      - /vol2/1000/CloudDrive/自动转存:/target:rw
+      - /tmp/115-source:/source:rw
+      - /tmp/115-target:/target:rw
       - ./state:/state:rw
-      - /vol2/1000/docker/115/card-bot/state:/pipeline-state:rw
+      - ../card-bot/state:/pipeline-state:rw
     tmpfs:
       - /tmp

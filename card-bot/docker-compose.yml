@@ -37,8 +37,8 @@ services:
       LLM_API_KEY: ${LLM_API_KEY}
       LLM_MODEL: ${LLM_MODEL}
     volumes:
-      - /vol2/1000/docker/115/card-bot:/cardbot:ro
-      - /vol2/1000/docker/115/card-bot/state:/cardbot-state
+      - ./:/cardbot:ro
+      - ./state:/cardbot-state
 
   tg-user-monitor:
     build: ./tg-monitor

@@ -49,6 +49,28 @@ logger.add(sys.stderr, level=os.getenv("LOG_LEVEL", "INFO"),
            format="{time:HH:mm:ss} | {level} | {message}")
 
 # ── 配置 ──────────────────────────────────────────────
+
+def _load_env_file():
+    """Read .env file and override empty environment variables."""
+    env_paths = [
+        Path(__file__).parent / ".env",
+        Path(__file__).parent.parent / ".env",
+    ]
+    for env_path in env_paths:
+        if env_path.exists():
+            for line in env_path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                if key and not os.environ.get(key):
+                    os.environ[key] = value
+            break
+
+_load_env_file()
+
 P115_COOKIE = os.getenv("P115_COOKIE", "").strip()
 P115_SAVE_DIR = os.getenv("P115_SAVE_DIR", "115-Share").strip()
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()

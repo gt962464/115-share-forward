@@ -9,7 +9,7 @@ services:
       - "18810:18810"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - /vol2/1000/docker/115/card-bot:/project
+      - ..:/project
       - ./data:/admin-data
     environment:
       TZ: Asia/Shanghai
