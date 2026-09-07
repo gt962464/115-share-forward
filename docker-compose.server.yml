@@ -1,0 +1,61 @@
+# ============================================
+# 115 分享转发 · 服务器部署 Compose
+# 适配美国服务器（无 NAS 挂载路径）
+# 跳过 cd2-mount-mover（NAS 专用）
+# 端口：8000(grok2api 已占) / 18800 / 18810 / 18811
+# ============================================
+
+services:
+  # ── 核心卡片机器人 ──
+  p115-card-bot:
+    image: listeningltg/p115-share:latest
+    container_name: p115-card-bot
+    restart: unless-stopped
+    entrypoint: ["python", "/cardbot/cardbot.py"]
+    working_dir: /app
+    env_file:
+      - .env
+    environment:
+      TZ: Asia/Shanghai
+      CLEANUP_STATE_FILE: /cardbot-state/cleanup_queue.json
+      RETRY_STATE_FILE: /cardbot-state/retry_queue.json
+      PROCESSED_STATE_FILE: /cardbot-state/processed_links.json
+      PIPELINE_QUEUE_DIR: /cardbot-state/mount-pipeline-queue
+      PIPELINE_115_ROOT: /自动转存
+      PIPELINE_INTERVAL: "60"
+      PIPELINE_GROUP_DELAY: "300"
+      PIPELINE_SERIES_DELAY: "1800"
+      PIPELINE_TASK_TIMEOUT: "180"
+    volumes:
+      - ./card-bot:/cardbot:ro
+      - ./data/cardbot-state:/cardbot-state
+
+  # ── 管理后台 API ──
+  card-admin:
+    build: ./card-bot/admin
+    container_name: card-admin
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "18810:18810"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./card-bot:/project
+      - ./data/admin-data:/admin-data
+    environment:
+      TZ: Asia/Shanghai
+      ADMIN_HOST: 0.0.0.0
+      ADMIN_PORT: 18810
+      PROJECT_DIR: /project
+      ADMIN_DATA_DIR: /admin-data
+
+  # ── 前端面板 ──
+  card-admin-web:
+    build: ./frontend
+    container_name: card-admin-web
+    restart: unless-stopped
+    ports:
+      - "18811:80"
+    environment:
+      TZ: Asia/Shanghai
