@@ -3738,12 +3738,25 @@ async def handle_card_text(message: types.Message):
 
 
 async def main():
-    if not P115_COOKIE:
-        logger.error("缺少 P115_COOKIE，无法驱动 115 转存。请在环境变量/.env 中配置。")
-        return
-    if not TG_BOT_TOKEN:
-        logger.error("缺少 TG_BOT_TOKEN，无法启动 Telegram 机器人。")
-        return
+    while not P115_COOKIE or not TG_BOT_TOKEN:
+        missing = []
+        if not P115_COOKIE:
+            missing.append("P115_COOKIE")
+        if not TG_BOT_TOKEN:
+            missing.append("TG_BOT_TOKEN")
+        logger.warning("缺少必填配置: " + ", ".join(missing) + "，等待 30 秒后重试...请在管理面板填写配置并重启。")
+        await asyncio.sleep(30)
+        _load_env_file()
+        global P115_COOKIE, TG_BOT_TOKEN, P115_SAVE_DIR, TG_CHANNEL_ID, TG_USER_ID, TMDB_API_KEY, LLM_API_BASE, LLM_API_KEY, LLM_MODEL
+        P115_COOKIE = os.getenv("P115_COOKIE", "").strip()
+        TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
+        P115_SAVE_DIR = os.getenv("P115_SAVE_DIR", "自动转存").strip()
+        TG_CHANNEL_ID = os.getenv("TG_CHANNEL_ID", "").strip()
+        TG_USER_ID = os.getenv("TG_USER_ID", "").strip()
+        TMDB_API_KEY = os.getenv("TMDB_API_KEY", "").strip()
+        LLM_API_BASE = os.getenv("LLM_API_BASE", "").strip()
+        LLM_API_KEY = os.getenv("LLM_API_KEY", "").strip()
+        LLM_MODEL = os.getenv("LLM_MODEL", "").strip()
 
     # 先补齐 P115-Share ORM 表（cardbot 直接启动时不会经过原 Web 入口）
     try:
