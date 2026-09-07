@@ -1,6 +1,8 @@
 services:
   card-bot:
-    image: listeningltg/p115-share:latest
+    build:
+      context: ..
+      dockerfile: card-bot/Dockerfile
     # 覆盖原镜像 entrypoint，直接跑卡片机器人（复用镜像内已装好的 p115client/aiogram）
     entrypoint: ["python", "/cardbot/cardbot.py"]
     container_name: p115-card-bot
@@ -47,7 +49,7 @@ services:
     env_file:
       - ./tg-monitor/.env
     ports:
-      - "18800:18800"
+      - "127.0.0.1:18800:18800"
     environment:
       TZ: Asia/Shanghai
       TG_MONITOR_WEB_HOST: 0.0.0.0

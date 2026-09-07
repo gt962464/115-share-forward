@@ -72,7 +72,7 @@ def _load_env_file():
 _load_env_file()
 
 P115_COOKIE = os.getenv("P115_COOKIE", "").strip()
-P115_SAVE_DIR = os.getenv("P115_SAVE_DIR", "115-Share").strip()
+P115_SAVE_DIR = (os.getenv("P115_SAVE_DIR") or "自动转存").strip()
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
 TG_CHANNEL_ID = os.getenv("TG_CHANNEL_ID", "").strip()       # 卡片发布频道
 TG_USER_ID = os.getenv("TG_USER_ID", "").strip()             # 管理员 ID（始终拥有投稿权限）
@@ -82,29 +82,29 @@ TG_SUBMITTER_IDS = {
 }
 TMDB_API_KEY = os.getenv("TMDB_API_KEY", "").strip()
 TG_PROXY = os.getenv("TG_PROXY", "").strip()                 # 例: socks5://127.0.0.1:7890
-TMDB_LANG = os.getenv("TMDB_LANG", "zh-CN").strip()
+TMDB_LANG = (os.getenv("TMDB_LANG") or "zh-CN").strip()
 APP_HTTP_PROXY = os.getenv("APP_HTTP_PROXY", "").strip()     # 给 TMDB/豆瓣/海报下载用的代理
-AUTO_PROCESS_115_LINKS = os.getenv("AUTO_PROCESS_115_LINKS", "1").strip().lower() in {"1", "true", "yes", "on"}
+AUTO_PROCESS_115_LINKS = (os.getenv("AUTO_PROCESS_115_LINKS") or "1").strip().lower() in {"1", "true", "yes", "on"}
 RECYCLE_PASSWORD = os.getenv("RECYCLE_PASSWORD", "").strip()  # 仅用于永久清空回收站，不写入代码/日志
 # 115 创建分享后可能进入"文件正在系统处理中/生成快照"；等待审核完成再推频道。
-SHARE_AUDIT_WAIT_TIMEOUT = int(os.getenv("SHARE_AUDIT_WAIT_TIMEOUT", str(15 * 60)))
-SHARE_AUDIT_POLL_INTERVAL = int(os.getenv("SHARE_AUDIT_POLL_INTERVAL", "30"))
+SHARE_AUDIT_WAIT_TIMEOUT = int(os.getenv("SHARE_AUDIT_WAIT_TIMEOUT") or str(15 * 60))
+SHARE_AUDIT_POLL_INTERVAL = int(os.getenv("SHARE_AUDIT_POLL_INTERVAL") or "30")
 
 # ── LLM 辅助识别（OpenAI 兼容接口，用于文件名歧义/误写修正）──
-LLM_API_BASE = os.getenv("LLM_API_BASE", "https://apihub.agnes-ai.com/v1").strip()
+LLM_API_BASE = (os.getenv("LLM_API_BASE") or "https://apihub.agnes-ai.com/v1").strip()
 LLM_API_KEY = os.getenv("LLM_API_KEY", "").strip()
-LLM_MODEL = os.getenv("LLM_MODEL", "agnes-2.5-flash").strip()
+LLM_MODEL = (os.getenv("LLM_MODEL") or "agnes-2.5-flash").strip()
 # 限流：30 RPM / 200.0M TPM / 20 并发
 
 # 发送成功后自动清理：到期移入回收站并清空回收站。
 # 频道发送成功后立即清理任务目录；回收站随后使用 RECYCLE_PASSWORD 清空。
-AUTO_DELETE_AFTER = int(os.getenv("AUTO_DELETE_AFTER", "0"))
+AUTO_DELETE_AFTER = int(os.getenv("AUTO_DELETE_AFTER") or "0")
 CLEANUP_STATE_FILE = os.getenv("CLEANUP_STATE_FILE", "/cardbot-state/cleanup_queue.json")
 _cleanup_lock = asyncio.Lock()
 _cleanup_queue = []
 
 # 测试模式开关：1=纯解析+私聊出卡片（不调用115转存、不发频道），2=同上但仍然调用115仅做信息查询不发频道
-CARD_BOT_TEST_MODE = os.getenv("CARD_BOT_TEST_MODE", "0").strip()
+CARD_BOT_TEST_MODE = (os.getenv("CARD_BOT_TEST_MODE") or "0").strip()
 
 # ── 115 客户端（复用 P115-Share 的 p115client 封装）────
 # 关键：P115-Share 的 settings 是 Pydantic BaseSettings，会读取环境变量 P115_COOKIE；
@@ -3738,6 +3738,7 @@ async def handle_card_text(message: types.Message):
 
 
 async def main():
+    global P115_COOKIE, TG_BOT_TOKEN, P115_SAVE_DIR, TG_CHANNEL_ID, TG_USER_ID, TMDB_API_KEY, LLM_API_BASE, LLM_API_KEY, LLM_MODEL
     while not P115_COOKIE or not TG_BOT_TOKEN:
         missing = []
         if not P115_COOKIE:
@@ -3747,16 +3748,15 @@ async def main():
         logger.warning("缺少必填配置: " + ", ".join(missing) + "，等待 30 秒后重试...请在管理面板填写配置并重启。")
         await asyncio.sleep(30)
         _load_env_file()
-        global P115_COOKIE, TG_BOT_TOKEN, P115_SAVE_DIR, TG_CHANNEL_ID, TG_USER_ID, TMDB_API_KEY, LLM_API_BASE, LLM_API_KEY, LLM_MODEL
         P115_COOKIE = os.getenv("P115_COOKIE", "").strip()
         TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
-        P115_SAVE_DIR = os.getenv("P115_SAVE_DIR", "自动转存").strip()
+        P115_SAVE_DIR = (os.getenv("P115_SAVE_DIR") or "自动转存").strip()
         TG_CHANNEL_ID = os.getenv("TG_CHANNEL_ID", "").strip()
         TG_USER_ID = os.getenv("TG_USER_ID", "").strip()
         TMDB_API_KEY = os.getenv("TMDB_API_KEY", "").strip()
-        LLM_API_BASE = os.getenv("LLM_API_BASE", "").strip()
+        LLM_API_BASE = (os.getenv("LLM_API_BASE") or "https://apihub.agnes-ai.com/v1").strip()
         LLM_API_KEY = os.getenv("LLM_API_KEY", "").strip()
-        LLM_MODEL = os.getenv("LLM_MODEL", "").strip()
+        LLM_MODEL = (os.getenv("LLM_MODEL") or "agnes-2.5-flash").strip()
 
     # 先补齐 P115-Share ORM 表（cardbot 直接启动时不会经过原 Web 入口）
     try:

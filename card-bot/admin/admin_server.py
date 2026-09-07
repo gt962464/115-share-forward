@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from aiohttp import web
+import aiohttp
 
 HOST = os.getenv("ADMIN_HOST", "0.0.0.0")
 PORT = int(os.getenv("ADMIN_PORT", "18810"))
@@ -34,45 +35,22 @@ CARD_ENV = PROJECT_DIR / ".env"
 MONITOR_ENV = PROJECT_DIR / "tg-monitor" / ".env"
 ROOT_ENV = PROJECT_DIR.parent / ".env"
 MOVER_CONTAINER = "cd2-mount-mover"
+MOVER_ENABLED = os.getenv("MOVER_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
 MOVER_STATE_FILE = PROJECT_DIR / "cd2-mount-mover" / "state" / "state.json"
 MOVER_PIPELINE_DIR = PROJECT_DIR / "state" / "mount-pipeline-queue"
-MOVER_SOURCE_DIR = "/vol2/1000/转存"
-MOVER_TARGET_DIR = "/vol2/1000/CloudDrive/自动转存"
-MANAGED_SERVICES = ["p115-card-bot", "tg-user-monitor", MOVER_CONTAINER]
+MOVER_SOURCE_DIR = os.getenv("MOVER_SOURCE_DIR", "/vol2/1000/转存")
+MOVER_TARGET_DIR = os.getenv("MOVER_TARGET_DIR", "/vol2/1000/CloudDrive/自动转存")
+MANAGED_SERVICES = ["p115-card-bot", "tg-user-monitor"] + ([MOVER_CONTAINER] if MOVER_ENABLED else [])
 BACKUP_DIR = DATA_DIR / "backups"
 SESSION_COOKIE = "card_admin_session"
 SESSIONS: dict[str, float] = {}
 ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 SENSITIVE_KEYS = {"P115_COOKIE", "TG_API_HASH", "TG_BOT_TOKEN", "RECYCLE_PASSWORD", "ADMIN_PASSWORD", "ADMIN_SECRET"}
-EDITABLE_CARD_KEYS = ["P115_COOKIE", "TG_BOT_TOKEN", "TG_CHANNEL_ID", "TG_USER_ID", "TG_ALLOW_CHATS", "TMDB_API_KEY", "TMDB_LANG", "TG_PROXY", "APP_HTTP_PROXY", "LOG_LEVEL", "CARD_BOT_TEST_MODE", "P115_SAVE_DIR", "RECYCLE_PASSWORD", "LLM_API_BASE", "LLM_API_KEY", "LLM_MODEL"]
+EDITABLE_CARD_KEYS = ["P115_COOKIE", "TG_BOT_TOKEN", "TG_CHANNEL_ID", "TG_USER_ID", "TG_ALLOW_CHATS", "TG_SUBMITTER_IDS", "TMDB_API_KEY", "TMDB_LANG", "TG_PROXY", "APP_HTTP_PROXY", "LOG_LEVEL", "CARD_BOT_TEST_MODE", "P115_SAVE_DIR", "RECYCLE_PASSWORD", "LLM_API_BASE", "LLM_API_KEY", "LLM_MODEL"]
 LLM_CARD_KEYS = ["LLM_API_BASE", "LLM_API_KEY", "LLM_MODEL"]
 LLM_PROMPT_FILE = DATA_DIR / "llm_prompt.json"
 EDITABLE_MONITOR_KEYS = ["TG_API_ID", "TG_API_HASH", "TG_BOT_TOKEN", "TG_PHONE", "TG_SOURCE_CHAT", "TG_FORWARD_TO", "TG_PROXY", "TG_START_FROM", "TG_FORWARD_TIMEOUT", "TG_MONITOR_WEB_PORT", "TG_MONITOR_WEB_SECRET", "LOG_LEVEL"]
 EDITABLE_ROOT_KEYS = ["P115_COOKIE", "TG_BOT_TOKEN", "TG_CHANNEL_ID", "TG_USER_ID", "TG_ALLOW_CHATS", "TMDB_API_KEY", "TMDB_LANG", "LLM_API_BASE", "LLM_API_KEY", "LLM_MODEL", "TG_PROXY", "APP_HTTP_PROXY", "P115_SAVE_DIR", "LOG_LEVEL", "AUTO_PROCESS_115_LINKS", "AUTO_DELETE_AFTER", "RECYCLE_PASSWORD", "ADMIN_PASSWORD", "ADMIN_SECRET"]
-
-# 字段中文说明（大白话）
-FIELD_LABELS = {
-    "P115_SAVE_DIR": "保存目录名",
-    "TG_CHANNEL_ID": "频道ID",
-    "TG_USER_ID": "管理员ID",
-    "TG_ALLOW_CHATS": "允许的聊天ID",
-    "TMDB_API_KEY": "TMDB密钥",
-    "TMDB_LANG": "语言",
-    "TG_PROXY": "TG代理",
-    "APP_HTTP_PROXY": "HTTP代理",
-    "LOG_LEVEL": "日志级别",
-    "CARD_BOT_TEST_MODE": "测试模式",
-    "LLM_API_BASE": "API地址",
-    "LLM_API_KEY": "API密钥",
-    "LLM_MODEL": "模型名称",
-    "TG_PHONE": "手机号",
-    "TG_SOURCE_CHAT": "来源聊天",
-    "TG_FORWARD_TO": "转发目标",
-    "TG_START_FROM": "起始消息ID",
-    "TG_FORWARD_TIMEOUT": "转发超时",
-    "TG_MONITOR_WEB_PORT": "网页端口",
-    "TG_MONITOR_WEB_SECRET": "网页密钥",
-}
 
 
 def now() -> float:
@@ -108,6 +86,27 @@ async def body_middleware(request: web.Request, handler):
         raise
     except Exception as exc:
         return web.json_response({"ok": False, "error": str(exc)[:300]}, status=500)
+
+
+@web.middleware
+async def cors_middleware(request: web.Request, handler):
+    if request.method == "OPTIONS":
+        return web.Response(
+            status=204,
+            headers={
+                "Access-Control-Allow-Origin": request.headers.get("Origin", "*"),
+                "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+                "Access-Control-Allow-Headers": "Content-Type, Authorization",
+                "Access-Control-Allow-Credentials": "true",
+                "Access-Control-Max-Age": "86400",
+            },
+        )
+    response = await handler(request)
+    origin = request.headers.get("Origin")
+    if origin:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+    return response
 
 
 def parse_env(path: Path) -> dict[str, str]:
@@ -153,7 +152,7 @@ def redact(values: dict[str, str]) -> dict[str, str]:
 
 class DockerSocket:
     """Minimal Docker Engine API client over the mounted Unix socket."""
-    def request(self, method: str, path: str, body: bytes = b"", timeout: int = 30) -> tuple[int, str]:
+    def request_bytes(self, method: str, path: str, body: bytes = b"", timeout: int = 30) -> tuple[int, bytes]:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(timeout)
         try:
@@ -178,6 +177,10 @@ class DockerSocket:
         header_text = head.decode("latin1").lower()
         if "transfer-encoding: chunked" in header_text:
             payload = self._decode_chunked(payload)
+        return status, payload
+
+    def request(self, method: str, path: str, body: bytes = b"", timeout: int = 30) -> tuple[int, str]:
+        status, payload = self.request_bytes(method, path, body, timeout)
         return status, payload.decode("utf-8", "replace")
 
     @staticmethod
@@ -208,6 +211,41 @@ class DockerSocket:
             return status, payload
 
 
+def demux_docker_log(payload: bytes) -> str:
+    """Demux Docker multiplexed stream frames (8-byte header per frame) and clean control characters."""
+    if not payload:
+        return ""
+    output = []
+    offset = 0
+    n = len(payload)
+    while offset < n:
+        if offset + 8 <= n and payload[offset] in (0, 1, 2) and payload[offset+1:offset+4] == b"\x00\x00\x00":
+            size = int.from_bytes(payload[offset+4:offset+8], byteorder="big")
+            frame_end = offset + 8 + size
+            if frame_end <= n:
+                output.append(payload[offset+8:frame_end])
+                offset = frame_end
+                continue
+            else:
+                output.append(payload[offset+8:])
+                break
+        else:
+            next_hdr = -1
+            for candidate in (b"\x01\x00\x00\x00", b"\x02\x00\x00\x00"):
+                pos = payload.find(candidate, offset + 1)
+                if pos != -1 and (next_hdr == -1 or pos < next_hdr):
+                    next_hdr = pos
+            if next_hdr != -1:
+                output.append(payload[offset:next_hdr])
+                offset = next_hdr
+            else:
+                output.append(payload[offset:])
+                break
+    text = b"".join(output).decode("utf-8", "replace")
+    clean_chars = [ch for ch in text if ord(ch) in (9, 10, 13) or ord(ch) >= 32]
+    return "".join(clean_chars)
+
+
 DOCKER = DockerSocket()
 
 
@@ -228,8 +266,9 @@ def docker(*args: str, timeout: int = 30) -> tuple[int, str]:
         return (0 if status < 300 else 1), str(data)
     if command == "logs" and len(args) >= 4:
         name = args[-1]
-        status, payload = DOCKER.request("GET", f"/containers/{name}/logs?stdout=1&stderr=1&tail=300", timeout=timeout)
-        return (0 if status < 300 else 1), payload
+        status, payload = DOCKER.request_bytes("GET", f"/containers/{name}/logs?stdout=1&stderr=1&tail=300", timeout=timeout)
+        log_text = demux_docker_log(payload)
+        return (0 if status < 300 else 1), log_text
     return 1, f"unsupported docker operation: {args}"
 
 
@@ -243,9 +282,10 @@ def service_status(name: str) -> dict[str, str]:
 
 def mount_mover_snapshot() -> dict[str, Any]:
     snapshot: dict[str, Any] = {
-        "service": service_status(MOVER_CONTAINER),
-        "source": MOVER_SOURCE_DIR,
-        "target": MOVER_TARGET_DIR,
+        "enabled": MOVER_ENABLED,
+        "service": service_status(MOVER_CONTAINER) if MOVER_ENABLED else {"name": MOVER_CONTAINER, "status": "disabled"},
+        "source": MOVER_SOURCE_DIR if MOVER_ENABLED else "",
+        "target": MOVER_TARGET_DIR if MOVER_ENABLED else "",
         "baseline_done": False,
         "tracked": 0,
         "counts": {"baseline": 0, "waiting": 0, "moving": 0, "completed": 0},
@@ -253,6 +293,8 @@ def mount_mover_snapshot() -> dict[str, Any]:
         "pipeline_counts": {"pending": 0, "processing": 0, "failed": 0, "done": 0},
         "pipeline_jobs": [],
     }
+    if not MOVER_ENABLED:
+        return snapshot
     try:
         data = json.loads(MOVER_STATE_FILE.read_text(encoding="utf-8"))
     except (FileNotFoundError, OSError, json.JSONDecodeError):
@@ -307,223 +349,1690 @@ def backup_config() -> str:
     return stamp
 
 
-def render_field(key: str, value: str) -> str:
-    safe = escape(str(value or ""), quote=True)
-    placeholder = "保持不变" if value == "********" else ""
-    return f'<label>{escape(key)}<input name="{escape(key)}" value="{safe}" placeholder="{placeholder}"></label>'
+LOGIN_PAGE = r'''<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>115 分享转发 · 管理后台</title>
+<style>
+:root {
+  --bg: #f8fafc;
+  --surface: #ffffff;
+  --surface-hover: #f1f5f9;
+  --surface-active: #e2e8f0;
+  --border: #e2e8f0;
+  --border-subtle: #f1f5f9;
+  --border-focus: #2563eb;
+  --text: #0f172a;
+  --text-secondary: #475569;
+  --text-muted: #94a3b8;
+  --primary: #2563eb;
+  --primary-hover: #1d4ed8;
+  --primary-light: #eff6ff;
+  --primary-border: #bfdbfe;
+  --success: #16a34a;
+  --success-bg: #f0fdf4;
+  --success-border: #bbf7d0;
+  --danger: #dc2626;
+  --danger-bg: #fef2f2;
+  --danger-border: #fecaca;
+  --warning: #d97706;
+  --warning-bg: #fffbeb;
+  --warning-border: #fde68a;
+  --radius-sm: 6px;
+  --radius: 8px;
+  --radius-lg: 12px;
+  --shadow-sm: 0 1px 2px 0 rgba(0,0,0,0.05);
+  --shadow: 0 1px 3px 0 rgba(0,0,0,0.08), 0 1px 2px -1px rgba(0,0,0,0.04);
+  --shadow-md: 0 4px 6px -1px rgba(0,0,0,0.07), 0 2px 4px -2px rgba(0,0,0,0.04);
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: 13.5px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  min-height: 100vh;
+}
+button, input, select, textarea { font-family: inherit; }
 
+/* ── Login Page ── */
+#login {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  padding: 24px;
+}
+.login-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 36px 32px;
+  width: 100%;
+  max-width: 380px;
+  box-shadow: var(--shadow-md);
+}
+.login-brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 20px;
+}
+.login-logo {
+  width: 40px;
+  height: 40px;
+  background: var(--primary);
+  color: #fff;
+  font-weight: 700;
+  font-size: 16px;
+  border-radius: var(--radius);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  letter-spacing: -0.5px;
+}
+.login-brand h1 {
+  font-size: 17px;
+  font-weight: 600;
+  color: var(--text);
+  line-height: 1.3;
+}
+.login-brand p {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.login-group {
+  margin-bottom: 14px;
+}
+.login-group label {
+  display: block;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  margin-bottom: 5px;
+}
+.login-input-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+.login-input-wrap input {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 13.5px;
+  outline: none;
+  background: #fff;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+.login-input-wrap input:focus {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px rgba(37,99,235,0.12);
+}
+.login-btn {
+  width: 100%;
+  padding: 10px;
+  background: var(--primary);
+  color: #fff;
+  border: none;
+  border-radius: var(--radius-sm);
+  font-size: 13.5px;
+  font-weight: 500;
+  cursor: pointer;
+  margin-top: 18px;
+  transition: background 0.15s;
+}
+.login-btn:hover { background: var(--primary-hover); }
+.login-msg {
+  color: var(--danger);
+  font-size: 12px;
+  margin-top: 10px;
+  min-height: 18px;
+  text-align: center;
+}
 
-def render_admin_page(message: str = "") -> str:
-    card = parse_env(CARD_ENV)
-    monitor = parse_env(MONITOR_ENV)
-    services = [service_status("p115-card-bot"), service_status("tg-user-monitor")]
-    service_html = "".join(f'<div class="service"><b>{escape(s["name"])}</b><span class="{escape(s["status"])}">{escape(s["status"])}</span></div>' for s in services)
-    card_html = "".join(render_field(k, "********" if k in SENSITIVE_KEYS and card.get(k) else card.get(k, "")) for k in EDITABLE_CARD_KEYS)
-    monitor_html = "".join(render_field(k, "********" if k in SENSITIVE_KEYS and monitor.get(k) else monitor.get(k, "")) for k in EDITABLE_MONITOR_KEYS)
-    log_code, log_text = docker("logs", "--tail", "120", "tg-user-monitor")
-    queue_path = PROJECT_DIR / "state" / "retry_queue.json"
-    queue_text = queue_path.read_text(encoding="utf-8") if queue_path.exists() else "[]"
-    notice = f'<div class="notice">{escape(message)}</div>' if message else ""
-    return f'''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>115 分享转发 · 管理后台</title><style>body{{font:14px system-ui;margin:0;background:#f3f6fb;color:#152238}}header{{background:#fff;padding:18px 24px;border-bottom:1px solid #dce5f1}}main{{max-width:1100px;margin:18px auto;padding:0 14px}}.grid{{display:grid;grid-template-columns:1fr 1fr;gap:14px}}section{{background:#fff;border:1px solid #dce5f1;border-radius:12px;padding:16px}}.wide{{grid-column:1/-1}}h2{{font-size:16px;margin:0 0 12px}}label{{display:block;color:#60718a;font-size:12px;margin:7px 0}}input{{display:block;width:100%;box-sizing:border-box;padding:9px;border:1px solid #cbd7e7;border-radius:8px;margin-top:4px}}button{{border:0;border-radius:8px;background:#1769e0;color:#fff;padding:9px 12px;margin:5px 5px 0 0}}button.red{{background:#c13b45}}.service{{display:flex;justify-content:space-between;padding:10px;border-bottom:1px solid #edf1f6}}.running{{color:#16865b}}.stopped,.not_found{{color:#c13b45}}pre{{background:#111b2b;color:#d8e6ff;padding:12px;border-radius:8px;max-height:240px;overflow:auto;white-space:pre-wrap;word-break:break-word}}.notice{{background:#eaf5ee;color:#146b49;padding:10px;border-radius:8px;margin-bottom:14px}}@media(max-width:760px){{.grid{{grid-template-columns:1fr}}.wide{{grid-column:auto}}}}</style><header><b>115 分享转发 · 管理后台</b></header><main>{notice}<div class="grid"><section><h2>服务状态</h2>{service_html}<form method="post" action="/action"><button name="action" value="refresh">刷新状态</button><button name="action" value="backup">备份配置</button></form></section><section><h2>Telegram 监听配置</h2><form method="post" action="/env/monitor">{monitor_html}<button type="submit">保存并重启监听器</button></form></section><section><h2>卡片机器人配置</h2><form method="post" action="/env/card">{card_html}<button type="submit">保存并重启卡片机器人</button></form></section><section><h2>服务操作</h2><form method="post" action="/action"><button name="action" value="compose-up">启动全部服务</button><button name="action" value="compose-down" class="red">停止全部服务</button><button name="action" value="clear-retry">清空重试队列</button></form></section><section class="wide"><h2>实时日志</h2><pre>{escape(log_text[-4000:])}</pre></section><section class="wide"><h2>自动重试队列</h2><pre>{escape(queue_text[-4000:])}</pre></section></div></main></body></html>'''
+/* ── App Layout ── */
+#app { display: none; min-height: 100vh; }
+.header {
+  background: rgba(255,255,255,0.95);
+  border-bottom: 1px solid var(--border);
+  height: 52px;
+  padding: 0 24px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  backdrop-filter: blur(8px);
+}
+.header-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.header-logo {
+  width: 28px;
+  height: 28px;
+  background: var(--primary);
+  color: #fff;
+  font-weight: 700;
+  font-size: 13px;
+  border-radius: var(--radius-sm);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.header-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+}
+.header-badge {
+  font-size: 11px;
+  font-weight: 500;
+  padding: 2px 7px;
+  border-radius: 4px;
+  background: var(--surface-hover);
+  color: var(--text-secondary);
+  border: 1px solid var(--border);
+}
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.conn-pill {
+  font-size: 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border-radius: 20px;
+  background: var(--success-bg);
+  color: var(--success);
+  border: 1px solid var(--success-border);
+  font-weight: 500;
+}
+.conn-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.btn-icon {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 6px 12px;
+  font-size: 12.5px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: #fff;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.btn-icon:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+  border-color: var(--border-hover, #cbd5e1);
+}
+.btn-icon.danger:hover {
+  background: var(--danger-bg);
+  color: var(--danger);
+  border-color: var(--danger-border);
+}
 
+/* ── Main Container & Navigation Tabs ── */
+.main {
+  max-width: 1280px;
+  margin: 0 auto;
+  padding: 20px 24px;
+}
+.nav-tabs {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 20px;
+  overflow-x: auto;
+}
+.nav-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 16px;
+  font-size: 13.5px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  transition: color 0.15s, border-color 0.15s;
+  white-space: nowrap;
+}
+.nav-tab:hover { color: var(--text); }
+.nav-tab.active {
+  color: var(--primary);
+  border-bottom-color: var(--primary);
+  font-weight: 600;
+}
+.tab-pane { display: none; }
+.tab-pane.active { display: block; }
 
-LOGIN_PAGE = r'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>115 项目管理后台</title><link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet"><style>
-:root{--bg:#fafbfc;--surface:#ffffff;--surface-hover:#f8f9fa;--border:#e5e7eb;--border-light:#f0f1f3;--text:#111827;--text-secondary:#6b7280;--text-muted:#9ca3af;--primary:#3b82f6;--primary-hover:#2563eb;--primary-light:#eff6ff;--success:#10b981;--success-bg:#ecfdf5;--danger:#ef4444;--danger-bg:#fef2f2;--warning:#f59e0b;--warning-bg:#fffbeb;--radius:12px;--radius-sm:8px;--shadow-sm:0 1px 2px 0 rgba(0,0,0,0.05);--shadow:0 1px 3px 0 rgba(0,0,0,0.1),0 1px 2px -1px rgba(0,0,0,0.1);--shadow-md:0 4px 6px -1px rgba(0,0,0,0.1),0 2px 4px -2px rgba(0,0,0,0.1);--font-sans:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;--font-mono:'JetBrains Mono',ui-monospace,SFMono-Regular,monospace}*{box-sizing:border-box;margin:0;padding:0}body{background:var(--bg);color:var(--text);font-family:var(--font-sans);font-size:14px;line-height:1.6;-webkit-font-smoothing:antialiased}
-#login{display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
-.login-card{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:40px;width:100%;max-width:400px;box-shadow:var(--shadow-md)}
-.login-card h1{font-size:24px;font-weight:700;margin-bottom:8px;background:linear-gradient(135deg,var(--primary),#8b5cf6);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
-.login-card .subtitle{color:var(--text-secondary);font-size:14px;margin-bottom:32px}
-.login-card input{width:100%;padding:12px 16px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:14px;font-family:var(--font-sans);transition:border-color 0.2s,box-shadow 0.2s}
-.login-card input:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px var(--primary-light)}
-.login-card button{width:100%;padding:12px;background:var(--primary);color:#fff;border:none;border-radius:var(--radius-sm);font-size:14px;font-weight:600;font-family:var(--font-sans);cursor:pointer;transition:background 0.2s,transform 0.1s;margin-top:16px}
-.login-card button:hover{background:var(--primary-hover)}
-.login-card button:active{transform:scale(0.98)}
-#loginMsg{color:var(--danger);font-size:13px;margin-top:12px;text-align:center;min-height:20px}
-#app{display:none;min-height:100vh}
-.header{background:var(--surface);border-bottom:1px solid var(--border);padding:16px 32px;display:flex;justify-content:space-between;align-items:center;position:sticky;top:0;z-index:100;backdrop-filter:blur(8px);background:rgba(255,255,255,0.9)}
-.header-left{display:flex;align-items:center;gap:16px}
-.header-logo{width:36px;height:36px;background:linear-gradient(135deg,var(--primary),#8b5cf6);border-radius:10px;display:flex;align-items:center;justify-content:center;color:#fff;font-weight:700;font-size:16px}
-.header-title{font-size:18px;font-weight:700;color:var(--text)}
-.header-subtitle{font-size:12px;color:var(--text-muted);margin-top:2px}
-.btn-logout{padding:8px 16px;background:transparent;color:var(--text-secondary);border:1px solid var(--border);border-radius:var(--radius-sm);font-size:13px;font-weight:500;cursor:pointer;transition:all 0.2s;font-family:var(--font-sans)}
-.btn-logout:hover{background:var(--danger-bg);color:var(--danger);border-color:var(--danger)}
-.main{max-width:1400px;margin:0 auto;padding:24px 32px}
-.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:20px}
-.wide{grid-column:1/-1}
-.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:24px;transition:box-shadow 0.2s}
-.card:hover{box-shadow:var(--shadow)}
-.card-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px}
-.card-title{font-size:16px;font-weight:600;color:var(--text);display:flex;align-items:center;gap:10px}
-.card-title::before{content:'';width:3px;height:18px;background:linear-gradient(180deg,var(--primary),#8b5cf6);border-radius:2px}
-.card-badge{font-size:12px;font-weight:500;padding:4px 10px;border-radius:20px;background:var(--primary-light);color:var(--primary)}
-.service{display:flex;justify-content:space-between;align-items:center;padding:14px 16px;border:1px solid var(--border-light);border-radius:var(--radius-sm);margin-bottom:10px;background:var(--surface-hover);transition:all 0.2s}
-.service:last-child{margin-bottom:0}
-.service:hover{background:var(--surface);border-color:var(--border)}
-.service-info{display:flex;flex-direction:column;gap:4px}
-.service-name{font-weight:600;font-size:14px}
-.service-meta{font-size:12px;color:var(--text-muted)}
-.status-badge{font-size:12px;font-weight:600;padding:4px 12px;border-radius:20px}
-.status-running{background:var(--success-bg);color:var(--success)}
-.status-stopped{background:var(--danger-bg);color:var(--danger)}
-.fields{display:grid;grid-template-columns:repeat(2,1fr);gap:16px}
-.field{display:flex;flex-direction:column;gap:6px}
-.field label{font-size:12px;font-weight:500;color:var(--text-secondary);text-transform:uppercase;letter-spacing:0.5px}
-.field input,.field textarea{padding:10px 14px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:14px;font-family:var(--font-sans);transition:border-color 0.2s,box-shadow 0.2s;background:var(--surface)}
-.field input:focus,.field textarea:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px var(--primary-light)}
-.field input::placeholder{color:var(--text-muted)}
-.prompt-area{display:flex;flex-direction:column;gap:12px}
-.prompt-header{display:flex;justify-content:space-between;align-items:center}
-.prompt-label{font-size:13px;font-weight:600;color:var(--text-secondary)}
-.prompt-textarea{width:100%;min-height:280px;padding:16px;border:1px solid var(--border);border-radius:var(--radius-sm);font-family:var(--font-mono);font-size:13px;line-height:1.7;resize:vertical;transition:border-color 0.2s,box-shadow 0.2s;background:var(--surface)}
-.prompt-textarea:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px var(--primary-light)}
-.btn-group{display:flex;gap:10px;flex-wrap:wrap;margin-top:16px}
-.btn{padding:10px 18px;border-radius:var(--radius-sm);font-size:13px;font-weight:500;font-family:var(--font-sans);cursor:pointer;transition:all 0.2s;display:inline-flex;align-items:center;gap:6px;border:none}
-.btn:active{transform:scale(0.98)}
-.btn-primary{background:var(--primary);color:#fff}
-.btn-primary:hover{background:var(--primary-hover)}
-.btn-secondary{background:var(--surface);color:var(--text-secondary);border:1px solid var(--border)}
-.btn-secondary:hover{background:var(--surface-hover);color:var(--text);border-color:var(--text-muted)}
-.btn-danger{background:var(--danger);color:#fff}
-.btn-danger:hover{background:#dc2626}
-.btn-sm{padding:6px 12px;font-size:12px}
-.log-controls{display:flex;gap:10px;align-items:center;margin-bottom:12px}
-.log-controls select{padding:8px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:13px;font-family:var(--font-sans);background:var(--surface);cursor:pointer}
-pre{background:#1e293b;color:#e2e8f0;padding:16px;border-radius:var(--radius-sm);font-family:var(--font-mono);font-size:12px;line-height:1.6;max-height:400px;overflow:auto;white-space:pre-wrap;word-break:break-word}
-pre::-webkit-scrollbar{width:8px;height:8px}
-pre::-webkit-scrollbar-track{background:#334155;border-radius:4px}
-pre::-webkit-scrollbar-thumb{background:#475569;border-radius:4px}
-pre::-webkit-scrollbar-thumb:hover{background:#64748b}
- .hint{font-size:12px;color:var(--text-muted);margin-top:8px}
- .danger{color:var(--danger)}
- .notice{background:var(--success-bg);color:var(--success);padding:12px 16px;border-radius:var(--radius-sm);margin-bottom:20px;font-size:13px;font-weight:500}
- .flow{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:12px;margin-bottom:20px}
- .flow-node{border:1px solid var(--border);border-radius:var(--radius-sm);padding:14px;background:var(--surface-hover)}
- .flow-node strong{display:block;font-size:14px;margin-bottom:4px}
- .flow-node span{display:block;color:var(--text-secondary);font-size:12px;word-break:break-all}
- .flow-arrow{font-size:22px;color:var(--primary);font-weight:700}
- .mover-stats{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:16px}
- .mover-stat{border:1px solid var(--border-light);border-radius:var(--radius-sm);padding:10px;background:var(--surface-hover)}
- .mover-stat strong{display:block;font-size:20px;color:var(--text)}
- .mover-stat span{font-size:12px;color:var(--text-secondary)}
- .mover-files{max-height:280px}
- .status-not_found{background:var(--danger-bg);color:var(--danger)}
- @media(max-width:1024px){.grid{grid-template-columns:1fr}.wide{grid-column:auto}.fields{grid-template-columns:1fr}}
- @media(max-width:640px){.header{padding:12px 16px}.main{padding:16px}.card{padding:20px}.prompt-textarea{min-height:200px}.flow{grid-template-columns:1fr}.flow-arrow{transform:rotate(90deg);text-align:center}.mover-stats{grid-template-columns:repeat(2,1fr)}}
-</style></head><body>
+/* ── Cards & Grid ── */
+.grid-2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+.grid-3 {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 14px;
+  margin-bottom: 16px;
+}
+@media(max-width: 900px) {
+  .grid-2 { grid-template-columns: 1fr; }
+  .grid-3 { grid-template-columns: 1fr; }
+}
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 20px;
+  box-shadow: var(--shadow-sm);
+  margin-bottom: 16px;
+}
+.card:last-child { margin-bottom: 0; }
+.card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 16px;
+}
+.card-title {
+  font-size: 14.5px;
+  font-weight: 600;
+  color: var(--text);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.card-desc {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: -10px;
+  margin-bottom: 16px;
+}
+
+/* ── Stats Tile ── */
+.stat-tile {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px 18px;
+  box-shadow: var(--shadow-sm);
+}
+.stat-label {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+.stat-value {
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--text);
+  margin-top: 4px;
+}
+.stat-sub {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  margin-top: 2px;
+}
+
+/* ── Services List ── */
+.svc-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 14px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: #fafbfc;
+  margin-bottom: 10px;
+  transition: all 0.15s;
+}
+.svc-item:last-child { margin-bottom: 0; }
+.svc-item:hover {
+  background: #fff;
+  border-color: var(--border);
+}
+.svc-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.svc-name {
+  font-weight: 600;
+  font-size: 13.5px;
+  color: var(--text);
+}
+.svc-meta {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  margin-top: 2px;
+}
+.svc-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 9px;
+  border-radius: 20px;
+  text-transform: capitalize;
+}
+.badge.running {
+  background: var(--success-bg);
+  color: var(--success);
+  border: 1px solid var(--success-border);
+}
+.badge.stopped {
+  background: var(--danger-bg);
+  color: var(--danger);
+  border: 1px solid var(--danger-border);
+}
+.badge.not_found {
+  background: var(--warning-bg);
+  color: var(--warning);
+  border: 1px solid var(--warning-border);
+}
+.badge.unknown {
+  background: var(--surface-hover);
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+}
+
+/* ── Action Buttons ── */
+.btn-group {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 14px;
+}
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 14px;
+  font-size: 12.5px;
+  font-weight: 500;
+  border-radius: var(--radius-sm);
+  border: 1px solid transparent;
+  cursor: pointer;
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+.btn:active { transform: scale(0.99); }
+.btn-primary {
+  background: var(--primary);
+  color: #fff;
+}
+.btn-primary:hover { background: var(--primary-hover); }
+.btn-outline {
+  background: #fff;
+  border-color: var(--border);
+  color: var(--text-secondary);
+}
+.btn-outline:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+  border-color: var(--border-hover, #cbd5e1);
+}
+.btn-danger-outline {
+  background: #fff;
+  border-color: var(--danger-border);
+  color: var(--danger);
+}
+.btn-danger-outline:hover {
+  background: var(--danger-bg);
+}
+.btn-sm {
+  padding: 4px 9px;
+  font-size: 11.5px;
+}
+
+/* ── Form Fields & Config ── */
+.subtabs {
+  display: flex;
+  gap: 6px;
+  background: var(--surface-hover);
+  padding: 3px;
+  border-radius: var(--radius-sm);
+  margin-bottom: 18px;
+  width: fit-content;
+}
+.subtab {
+  padding: 6px 14px;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.subtab:hover { color: var(--text); }
+.subtab.active {
+  background: #fff;
+  color: var(--text);
+  box-shadow: 0 1px 2px rgba(0,0,0,0.06);
+  font-weight: 600;
+}
+.subpane { display: none; }
+.subpane.active { display: block; }
+
+.fields-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px 20px;
+  width: 100%;
+  box-sizing: border-box;
+}
+@media(max-width: 860px) {
+  .fields-grid { grid-template-columns: minmax(0, 1fr); }
+}
+.field-item {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  box-sizing: border-box;
+}
+.field-label-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 6px;
+  gap: 8px;
+  min-width: 0;
+}
+.field-label {
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.field-key {
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+.field-input-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+}
+.field-input-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+  flex: 1;
+  min-width: 0;
+  width: 100%;
+}
+.field-input-wrap input {
+  width: 100%;
+  min-width: 0;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  outline: none;
+  background: #fff;
+  color: var(--text);
+  transition: border-color 0.15s, box-shadow 0.15s;
+  box-sizing: border-box;
+}
+.field-input-wrap input:focus {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px rgba(37,99,235,0.12);
+}
+.field-input-wrap.is-secret input {
+  padding-right: 36px;
+  font-family: var(--font-mono);
+}
+.field-eye-btn {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  padding: 2px 4px;
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 2;
+}
+.field-eye-btn:hover { color: var(--text); }
+.btn-test {
+  flex-shrink: 0;
+  padding: 0 12px;
+  height: 35px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: #fff;
+  color: var(--primary);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s;
+  white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+}
+.btn-test:hover {
+  background: var(--primary-light);
+  border-color: var(--primary-border);
+}
+.btn-test:active { transform: scale(0.98); }
+.btn-test:disabled { opacity: 0.6; cursor: not-allowed; }
+
+/* ── LLM Prompt Editor ── */
+.prompt-box {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.prompt-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.prompt-len {
+  font-size: 12px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+}
+.prompt-textarea {
+  width: 100%;
+  min-height: 380px;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.65;
+  background: #fafbfc;
+  color: #1e293b;
+  outline: none;
+  resize: vertical;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+.prompt-textarea:focus {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px rgba(37,99,235,0.12);
+  background: #fff;
+}
+
+/* ── Realtime Logs Terminal ── */
+.log-card {
+  display: flex;
+  flex-direction: column;
+}
+.log-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.log-toolbar-left, .log-toolbar-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.log-select {
+  padding: 6px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 12.5px;
+  outline: none;
+  background: #fff;
+  color: var(--text);
+  cursor: pointer;
+}
+.log-select:focus { border-color: var(--primary); }
+.log-live-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--success);
+  display: inline-block;
+  animation: pulse 2s infinite;
+}
+@keyframes pulse {
+  0% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.3; transform: scale(0.85); }
+  100% { opacity: 1; transform: scale(1); }
+}
+.log-live-dot.paused {
+  background: var(--text-muted);
+  animation: none;
+}
+.terminal-window {
+  background: #0d1117;
+  border: 1px solid #21262d;
+  border-radius: var(--radius-sm);
+  padding: 14px 16px;
+  height: 520px;
+  overflow-y: auto;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.6;
+  color: #c9d1d9;
+  white-space: pre-wrap;
+  word-break: break-all;
+  position: relative;
+}
+.terminal-window::-webkit-scrollbar { width: 8px; height: 8px; }
+.terminal-window::-webkit-scrollbar-track { background: #0d1117; }
+.terminal-window::-webkit-scrollbar-thumb { background: #30363d; border-radius: 4px; }
+.terminal-window::-webkit-scrollbar-thumb:hover { background: #484f58; }
+
+/* ── Mount Mover & Queue ── */
+.mover-grid {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 10px;
+  margin-bottom: 14px;
+}
+@media(max-width: 700px) {
+  .mover-grid { grid-template-columns: repeat(2, 1fr); }
+}
+.mover-stat {
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  padding: 10px;
+  text-align: center;
+  background: #fafbfc;
+}
+.mover-stat-num {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--text);
+}
+.mover-stat-lbl {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  margin-top: 2px;
+}
+.code-block {
+  background: #0d1117;
+  color: #c9d1d9;
+  border: 1px solid #21262d;
+  border-radius: var(--radius-sm);
+  padding: 12px 14px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.55;
+  max-height: 320px;
+  overflow: auto;
+  white-space: pre-wrap;
+}
+
+/* ── Toast ── */
+.toast-container {
+  position: fixed;
+  bottom: 24px;
+  right: 24px;
+  z-index: 9999;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  pointer-events: none;
+}
+.toast-item {
+  background: #0f172a;
+  color: #fff;
+  padding: 10px 18px;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  opacity: 0;
+  transform: translateY(10px);
+  transition: all 0.2s ease;
+  pointer-events: auto;
+}
+.toast-item.show { opacity: 1; transform: translateY(0); }
+.toast-item.ok { background: #15803d; }
+.toast-item.err { background: #b91c1c; }
+.toast-item.info { background: #1d4ed8; }
+</style>
+</head>
+<body>
+
+<!-- Login Screen -->
 <div id="login">
-<div class="login-card">
-<h1>115 分享转发</h1>
-<p class="subtitle">管理后台 · 仅限内网访问</p>
-<form id="loginForm">
-<input id="pwd" name="password" type="password" placeholder="输入管理员密码" autocomplete="current-password">
-<button type="submit">登录</button>
-</form>
-<p id="loginMsg"></p>
+  <div class="login-card">
+    <div class="login-brand">
+      <div class="login-logo">115</div>
+      <div>
+        <h1>115 分享转发</h1>
+        <p>轻量管理后台 · 局域网控制面板</p>
+      </div>
+    </div>
+    <form id="loginForm" onsubmit="event.preventDefault(); doLogin();">
+      <div class="login-group" id="urlGroup" style="display:none">
+        <label>后端 API 地址</label>
+        <div class="login-input-wrap" style="display:flex;gap:8px;align-items:center">
+          <input id="login-url" type="text" placeholder="http://127.0.0.1:18810" style="flex:1">
+          <button type="button" class="btn btn-outline btn-sm" id="testConnBtn" onclick="testConnection()">测试连接</button>
+        </div>
+        <div id="testConnMsg" style="font-size:12px;margin-top:6px"></div>
+      </div>
+      <div class="login-group">
+        <label>管理员访问密码</label>
+        <div class="login-input-wrap">
+          <input id="login-pwd" type="password" placeholder="请输入管理密码" autofocus autocomplete="current-password">
+        </div>
+      </div>
+      <div class="login-msg" id="loginMsg"></div>
+      <button class="login-btn" id="loginBtn" type="submit">登 录</button>
+    </form>
+  </div>
 </div>
-</div>
+
+<!-- Main App Screen -->
 <div id="app">
-<header class="header">
-<div class="header-left">
-<div class="header-logo">115</div>
-<div>
-<div class="header-title">115 分享转发 · 管理后台</div>
-<div class="header-subtitle">Card Bot & Telegram Monitor</div>
+  <header class="header">
+    <div class="header-left">
+      <div class="header-logo">115</div>
+      <span class="header-title">115 分享转发 · 管理后台</span>
+      <span class="header-badge">v2.0 极简版</span>
+    </div>
+    <div class="header-right">
+      <span class="conn-pill" id="connPill"><span class="conn-dot"></span><span id="connText">已连接</span></span>
+      <button class="btn-icon" onclick="refreshOverview(true)" title="刷新页面数据">🔄 刷新</button>
+      <button class="btn-icon danger" onclick="doLogout()" title="退出当前登录">退出</button>
+    </div>
+  </header>
+
+  <main class="main">
+    <!-- Top Navigation Tabs -->
+    <nav class="nav-tabs">
+      <div class="nav-tab active" onclick="switchNavTab('overview')">📊 服务概览</div>
+      <div class="nav-tab" onclick="switchNavTab('config')">⚙️ 配置管理</div>
+      <div class="nav-tab" onclick="switchNavTab('llm')">🤖 LLM 提示词</div>
+      <div class="nav-tab" onclick="switchNavTab('logs')">📜 实时日志</div>
+      <div class="nav-tab" onclick="switchNavTab('queue')">🔁 队列与转存</div>
+    </nav>
+
+    <!-- Tab 1: Overview -->
+    <section id="pane-overview" class="tab-pane active">
+      <div class="grid-3">
+        <div class="stat-tile">
+          <div class="stat-label">核心容器</div>
+          <div class="stat-value" id="stat-containers">- / -</div>
+          <div class="stat-sub" id="stat-containers-sub">检查中...</div>
+        </div>
+        <div class="stat-tile">
+          <div class="stat-label">重试队列</div>
+          <div class="stat-value" id="stat-queue">-</div>
+          <div class="stat-sub">待重试错误链接数</div>
+        </div>
+        <div class="stat-tile">
+          <div class="stat-label">挂载转存</div>
+          <div class="stat-value" id="stat-mover" style="font-size:16px;font-weight:600">-</div>
+          <div class="stat-sub" id="stat-mover-sub">本地目录移动流水线</div>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="card">
+          <div class="card-header">
+            <h2 class="card-title">🖥️ 核心服务状态</h2>
+            <button class="btn btn-outline btn-sm" onclick="loadOverview()">刷新</button>
+          </div>
+          <div id="services-list"><div style="color:var(--text-muted);text-align:center;padding:24px">加载中...</div></div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <h2 class="card-title">⚡ 常用快捷操作</h2>
+          </div>
+          <div class="btn-group" style="margin-top:0">
+            <button class="btn btn-outline" onclick="doAction('backup')">📦 备份当前配置</button>
+            <button class="btn btn-outline" onclick="doAction('clear-retry')">🗑️ 清空重试队列</button>
+            <button class="btn btn-outline" onclick="doAction('compose-up')">🚀 启动全部服务</button>
+            <button class="btn btn-danger-outline" onclick="doAction('compose-down')">⏹️ 停止全部服务</button>
+          </div>
+          <div style="margin-top:16px;padding:12px;border:1px solid var(--border-subtle);border-radius:var(--radius-sm);background:#fafbfc">
+            <div style="font-size:12px;font-weight:600;color:var(--text);margin-bottom:4px">💡 温馨提示</div>
+            <p style="font-size:12px;color:var(--text-secondary);line-height:1.6">
+              • 修改配置后点击“保存并重启”，容器将自动重启加载新配置。<br>
+              • 敏感字段如 Cookie、Token 在后台已脱敏保护，输入框留空保存将保持原值不变。
+            </p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Tab 2: Configuration -->
+    <section id="pane-config" class="tab-pane">
+      <div class="card">
+        <div class="card-header">
+          <h2 class="card-title">⚙️ 服务配置中心</h2>
+          <span style="font-size:12px;color:var(--text-muted)">带 * 号项为必填核心凭据</span>
+        </div>
+        <div class="subtabs">
+          <div class="subtab active" onclick="switchConfigSubtab('card')">卡片机器人 (cardbot)</div>
+          <div class="subtab" onclick="switchConfigSubtab('monitor')">Telegram 监听器 (monitor)</div>
+          <div class="subtab" onclick="switchConfigSubtab('root')">全局与环境变量 (root .env)</div>
+        </div>
+
+        <div id="subpane-card" class="subpane active">
+          <div class="fields-grid" id="fields-card"></div>
+          <div class="btn-group">
+            <button class="btn btn-primary" onclick="saveConfig('card')">💾 保存卡片机器人配置并重启</button>
+          </div>
+        </div>
+
+        <div id="subpane-monitor" class="subpane">
+          <div class="fields-grid" id="fields-monitor"></div>
+          <div class="btn-group">
+            <button class="btn btn-primary" onclick="saveConfig('monitor')">💾 保存 Telegram 监听配置并重启</button>
+          </div>
+        </div>
+
+        <div id="subpane-root" class="subpane">
+          <div class="fields-grid" id="fields-root"></div>
+          <div class="btn-group">
+            <button class="btn btn-primary" onclick="saveConfig('root')">💾 保存全局环境变量</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Tab 3: LLM Prompt -->
+    <section id="pane-llm" class="tab-pane">
+      <div class="card">
+        <div class="card-header">
+          <h2 class="card-title">🤖 LLM 影视名识别参数</h2>
+          <button class="btn btn-primary btn-sm" onclick="saveConfig('llm')">保存 LLM 配置</button>
+        </div>
+        <div class="fields-grid" id="fields-llm" style="margin-bottom:14px"></div>
+      </div>
+
+      <div class="card">
+        <div class="prompt-box">
+          <div class="prompt-header">
+            <div>
+              <h2 class="card-title">📝 识别 System Prompt 提示词</h2>
+              <div style="font-size:12px;color:var(--text-muted);margin-top:2px">用于引导大模型提取规范中文名、年份、季集及分辨率</div>
+            </div>
+            <div style="display:flex;align-items:center;gap:10px">
+              <span class="prompt-len" id="promptLen">0 字</span>
+              <button class="btn btn-outline btn-sm" onclick="resetLlmPrompt()">↩ 恢复默认</button>
+              <button class="btn btn-primary btn-sm" onclick="saveLlmPrompt()">💾 保存提示词</button>
+            </div>
+          </div>
+          <textarea class="prompt-textarea" id="llmPrompt" placeholder="正在加载提示词..."></textarea>
+        </div>
+      </div>
+    </section>
+
+    <!-- Tab 4: Live Logs -->
+    <section id="pane-logs" class="tab-pane">
+      <div class="card log-card">
+        <div class="log-toolbar">
+          <div class="log-toolbar-left">
+            <span style="font-weight:600;font-size:13px">服务选择:</span>
+            <select class="log-select" id="logServiceSelect" onchange="loadLogs(true)">
+              <option value="p115-card-bot">p115-card-bot (卡片机器人)</option>
+              <option value="tg-user-monitor">tg-user-monitor (TG 监听器)</option>
+              <option value="cd2-mount-mover">cd2-mount-mover (挂载转存)</option>
+            </select>
+            <select class="log-select" id="logIntervalSelect" onchange="changeLogInterval()">
+              <option value="0">自动刷新: 关</option>
+              <option value="3000">自动刷新: 3秒</option>
+              <option value="5000" selected>自动刷新: 5秒</option>
+              <option value="15000">自动刷新: 15秒</option>
+            </select>
+            <span class="log-live-dot" id="logLiveDot" title="正在实时拉取"></span>
+          </div>
+          <div class="log-toolbar-right">
+            <span style="font-size:11.5px;color:var(--text-muted);font-family:var(--font-mono)" id="logStatusText">共 0 行</span>
+            <button class="btn btn-outline btn-sm" onclick="loadLogs(true)">🔄 刷新</button>
+            <button class="btn btn-outline btn-sm" onclick="copyLogs()">📋 复制</button>
+            <button class="btn btn-outline btn-sm" onclick="clearLogsView()">🧹 清屏</button>
+            <button class="btn btn-outline btn-sm" onclick="scrollLogToBottom()">⬇️ 滚到底</button>
+          </div>
+        </div>
+        <div class="terminal-window" id="terminalBox">正在加载日志...</div>
+      </div>
+    </section>
+
+    <!-- Tab 5: Queue & Mover -->
+    <section id="pane-queue" class="tab-pane">
+      <div class="card">
+        <div class="card-header">
+          <h2 class="card-title">🔁 自动重试队列 (retry_queue.json)</h2>
+          <div style="display:flex;gap:8px">
+            <button class="btn btn-outline btn-sm" onclick="loadQueue()">刷新</button>
+            <button class="btn btn-danger-outline btn-sm" onclick="doAction('clear-retry')">清空队列</button>
+          </div>
+        </div>
+        <p class="card-desc">转存失败或未匹配到 TMDB 的链接将自动在此重试，默认指数退避重试。</p>
+        <pre class="code-block" id="queueContent">加载中...</pre>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <h2 class="card-title">📂 本地挂载转存流水线 (cd2-mount-mover)</h2>
+          <button class="btn btn-outline btn-sm" onclick="loadMover()">刷新状态</button>
+        </div>
+        <div id="moverContent">加载中...</div>
+      </div>
+    </section>
+  </main>
 </div>
-</div>
-<button class="btn-logout" onclick="logout()">退出登录</button>
-</header>
-<main class="main">
-<div id="notice"></div>
-<div class="grid">
-<section class="card">
-<div class="card-header"><h2 class="card-title">服务状态</h2></div>
-<div id="services"></div>
-<div class="btn-group"><button class="btn btn-primary" onclick="refresh()">刷新状态</button><button class="btn btn-secondary" onclick="act('backup')">备份配置</button></div>
-</section>
-<section class="card wide">
-<div class="card-header"><h2 class="card-title">挂载转存流程</h2><span id="moverBadge" class="card-badge">cd2-mount-mover</span></div>
-<div class="flow"><div class="flow-node"><strong>123 云盘挂载</strong><span id="moverSource">加载中...</span></div><div class="flow-arrow">→</div><div class="flow-node"><strong>115 云盘挂载</strong><span id="moverTarget">加载中...</span></div></div>
-<div id="moverStats" class="mover-stats"></div>
-<div class="btn-group"><button class="btn btn-primary btn-sm" onclick="mountMover()">刷新流程</button><button class="btn btn-secondary btn-sm" onclick="restart('cd2-mount-mover')">重启转存服务</button></div>
-<pre id="moverFiles" class="mover-files">加载中...</pre>
-<pre id="moverPipeline" class="mover-files">闭环队列加载中...</pre>
-</section>
-<section class="card">
-<div class="card-header"><h2 class="card-title">卡片机器人配置</h2><span class="card-badge">p115-card-bot</span></div>
-<div class="fields" id="cardFields"></div>
-<div class="btn-group"><button class="btn btn-primary" onclick="saveEnv('card')">保存配置</button><button class="btn btn-secondary" onclick="restart('p115-card-bot')">重启机器人</button></div>
-</section>
-<section class="card wide">
-<div class="card-header"><h2 class="card-title">LLM 辅助识别</h2><span class="card-badge">AI Powered</span></div>
-<div style="display:grid;grid-template-columns:1fr 1fr;gap:24px">
-<div>
-<h3 style="font-size:14px;font-weight:600;margin-bottom:16px;color:var(--text)">基础配置</h3>
-<div class="fields" id="llmFields"></div>
-<div class="btn-group"><button class="btn btn-primary" onclick="saveEnv('llm')">保存 LLM 配置</button><button class="btn btn-secondary" onclick="restart('p115-card-bot')">重启生效</button></div>
-</div>
-<div>
-<div class="prompt-area">
-<div class="prompt-header"><span class="prompt-label">辅助识别提示词</span><div style="display:flex;gap:8px"><button class="btn btn-secondary btn-sm" onclick="resetLlmPrompt()">恢复默认</button><button class="btn btn-primary btn-sm" onclick="saveLlmPrompt()">保存提示词</button></div></div>
-<textarea id="llmPrompt" class="prompt-textarea" placeholder="加载中..."></textarea>
-<p class="hint">修改提示词后点击"保存提示词"立即生效，无需重启。</p>
-</div>
-</div>
-</div>
-</section>
-<section class="card">
-<div class="card-header"><h2 class="card-title">Telegram 监听</h2><span class="card-badge">tg-user-monitor</span></div>
-<div class="fields" id="monitorFields"></div>
-<div class="btn-group"><button class="btn btn-primary" onclick="saveEnv('monitor')">保存配置</button><button class="btn btn-secondary" onclick="restart('tg-user-monitor')">重启监听器</button></div>
-<p class="hint">S7 目标使用你的用户账号直发；不要把 Token 填进这里。</p>
-</section>
-<section class="card">
-<div class="card-header"><h2 class="card-title">操作提示</h2></div>
-<div style="font-size:13px;color:var(--text-secondary);line-height:1.8">
-<p>• 修改配置后要点击对应的<b>重启按钮</b>才会生效</p>
-<p>• 敏感值只显示掩码；后台不提供直接查看 Cookie、Token 的功能</p>
-<p style="margin-top:16px;display:flex;gap:10px"><button class="btn btn-secondary" onclick="act('compose-up')">启动全部服务</button><button class="btn btn-danger" onclick="act('compose-down')">停止全部服务</button></p>
-</div>
-</section>
-<section class="card wide">
-<div class="card-header"><h2 class="card-title">实时日志</h2></div>
-<div class="log-controls"><select id="logService"><option value="p115-card-bot">卡片机器人</option><option value="tg-user-monitor">Telegram 监听器</option><option value="cd2-mount-mover">挂载转存</option></select><button class="btn btn-primary btn-sm" onclick="logs()">刷新日志</button></div>
-<pre id="log">加载中...</pre>
-</section>
-<section class="card wide">
-<div class="card-header"><h2 class="card-title">自动重试队列</h2></div>
-<div class="btn-group" style="margin-bottom:12px"><button class="btn btn-primary btn-sm" onclick="retryQueue()">刷新队列</button><button class="btn btn-danger btn-sm" onclick="act('clear-retry')">清空队列</button></div>
-<pre id="queue">加载中...</pre>
-</section>
-</div>
-</main>
-</div>
+
+<div class="toast-container" id="toastBox"></div>
+
 <script>
-const cardKeys=['P115_SAVE_DIR','TG_CHANNEL_ID','TG_USER_ID','TG_ALLOW_CHATS','TMDB_API_KEY','TMDB_LANG','TG_PROXY','APP_HTTP_PROXY','LOG_LEVEL','CARD_BOT_TEST_MODE'];
-const llmKeys=['LLM_API_BASE','LLM_API_KEY','LLM_MODEL'];
-const monitorKeys=['TG_PHONE','TG_SOURCE_CHAT','TG_FORWARD_TO','TG_PROXY','TG_START_FROM','TG_FORWARD_TIMEOUT','TG_MONITOR_WEB_PORT','TG_MONITOR_WEB_SECRET','LOG_LEVEL'];
-const fieldLabels={'P115_SAVE_DIR':'保存目录名','TG_CHANNEL_ID':'频道ID','TG_USER_ID':'管理员ID','TG_ALLOW_CHATS':'允许的聊天ID','TMDB_API_KEY':'TMDB密钥','TMDB_LANG':'语言','TG_PROXY':'TG代理','APP_HTTP_PROXY':'HTTP代理','LOG_LEVEL':'日志级别','CARD_BOT_TEST_MODE':'测试模式','LLM_API_BASE':'API地址','LLM_API_KEY':'API密钥','LLM_MODEL':'模型名称','TG_PHONE':'手机号','TG_SOURCE_CHAT':'来源聊天','TG_FORWARD_TO':'转发目标','TG_START_FROM':'起始消息ID','TG_FORWARD_TIMEOUT':'转发超时','TG_MONITOR_WEB_PORT':'网页端口','TG_MONITOR_WEB_SECRET':'网页密钥'};
-let state={};
-async function req(path,opts={}){let r=await fetch(path,{credentials:'same-origin',...opts});let j=await r.json().catch(()=>({}));if(r.status===401){showLogin();throw Error('未登录')}if(!r.ok)throw Error(j.error||j.message||'请求失败');return j}
-document.querySelector('#loginForm').addEventListener('submit',e=>{e.preventDefault();login()});
-async function login(){let msg=document.querySelector('#loginMsg');let password=document.querySelector('#pwd').value;if(!password){msg.textContent='请输入管理员密码';return}msg.textContent='';try{await req('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password})});showApp();await refresh()}catch(e){msg.textContent='登录失败：'+e.message}}
-async function logout(){await req('/api/logout',{method:'POST'});showLogin()}
-function showLogin(){document.querySelector('#login').style.display='flex';document.querySelector('#app').style.display='none'}
-function showApp(){document.querySelector('#login').style.display='none';document.querySelector('#app').style.display='block'}
-function fields(id,values,keys){document.querySelector('#'+id).innerHTML=keys.map(k=>{let val=values[k]||'';let isSecret=val==='********';let label=fieldLabels[k]||k;return '<div class="field"><label>'+label+'</label><input data-key="'+k+'" type="'+(isSecret?'password':'text')+'" value="'+(isSecret?'':val)+'" placeholder="'+(isSecret?'保持不变':'请输入'+label)+'" '+(isSecret?'data-secret="1"':'')+'></div>'}).join('')}
-async function refresh(){try{let j=await req('/api/overview');state=j;document.querySelector('#services').innerHTML=j.services.map(s=>'<div class="service"><div class="service-info"><div class="service-name">'+s.name+'</div><div class="service-meta">启动: '+(s.started||'-')+'　重启: '+(s.restart_count||'-')+'</div></div><span class="status-badge status-'+s.status+'">'+s.status+'</span></div>').join('');fields('cardFields',j.card_env,cardKeys);fields('llmFields',j.card_env,llmKeys);fields('monitorFields',j.monitor_env,monitorKeys);await loadLlmPrompt();await logs();await retryQueue();await mountMover();showApp()}catch(e){if(e.message==='未登录')showLogin()}}
-async function saveEnv(kind){let id=kind==='card'?'cardFields':kind==='llm'?'llmFields':'monitorFields';let updates={};document.querySelectorAll('#'+id+' input').forEach(x=>{if(x.dataset.secret&&x.value){updates[x.dataset.key]=x.value}else if(!x.dataset.secret&&x.value&&x.value!=='********'){updates[x.dataset.key]=x.value}});try{await req('/api/env/'+kind,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({updates})});alert('配置已保存');refresh()}catch(e){alert(e.message)}}
-async function restart(name){try{await req('/api/service/'+encodeURIComponent(name)+'/restart',{method:'POST'});alert('已重启 '+name);refresh()}catch(e){alert(e.message)}}
-async function loadLlmPrompt(){try{let j=await req('/api/llm-prompt');document.querySelector('#llmPrompt').value=j.prompt||''}catch(e){}}
-async function saveLlmPrompt(){let prompt=document.querySelector('#llmPrompt').value;try{await req('/api/llm-prompt',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt})});alert('提示词已保存')}catch(e){alert(e.message)}}
-async function resetLlmPrompt(){if(!confirm('确定恢复默认提示词？'))return;try{await req('/api/llm-prompt/reset',{method:'POST'});alert('已恢复默认');await loadLlmPrompt()}catch(e){alert(e.message)}}
-async function logs(){try{let j=await req('/api/logs?name='+encodeURIComponent(document.querySelector('#logService').value));document.querySelector('#log').textContent=j.log||'(暂无日志)'}catch(e){document.querySelector('#log').textContent=e.message}}
-async function retryQueue(){try{let j=await req('/api/retry-queue');document.querySelector('#queue').textContent=JSON.stringify(j.queue,null,2)}catch(e){document.querySelector('#queue').textContent=e.message}}
-function bytes(n){n=Number(n||0);if(n<1024)return n+' B';let u=['KB','MB','GB','TB'],i=-1;do{n/=1024;i++}while(n>=1024&&i<u.length-1);return n.toFixed(2)+' '+u[i]}
-async function mountMover(){try{let j=await req('/api/mount-mover');let s=j.service||{};document.querySelector('#moverBadge').textContent='状态：'+(s.status||'unknown');document.querySelector('#moverSource').textContent=j.source;document.querySelector('#moverTarget').textContent=j.target;let c=j.counts||{};document.querySelector('#moverStats').innerHTML=[['已跟踪',j.tracked||0],['基线',c.baseline||0],['等待稳定',c.waiting||0],['处理中',c.moving||0],['已移动',c.completed||0]].map(x=>'<div class="mover-stat"><strong>'+x[1]+'</strong><span>'+x[0]+'</span></div>').join('');let files=j.files||[];document.querySelector('#moverFiles').textContent=files.length?files.map(x=>x.status+' | '+bytes(x.size)+' | '+x.path).join('\n'):'暂无转存记录';let counts=j.pipeline_counts||{};let jobs=j.pipeline_jobs||[];document.querySelector('#moverPipeline').textContent='待处理: '+(counts.pending||0)+' | 处理中: '+(counts.processing||0)+' | 失败重试: '+(counts.failed||0)+' | 已发布: '+(counts.done||0)+'\n'+(jobs.length?jobs.map(x=>x.status+' | '+(x.title||x.path)+(x.share_link?' | '+x.share_link:'')+(x.error?' | '+x.error:'')).join('\n'):'暂无闭环任务')}catch(e){document.querySelector('#moverFiles').textContent=e.message;document.querySelector('#moverPipeline').textContent=e.message}}
-async function act(kind){try{let j=await req('/api/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:kind})});alert(j.message||'操作完成');refresh()}catch(e){alert(e.message)}}
-req('/api/me').then(()=>{showApp();refresh()}).catch(()=>{showLogin()});
-setInterval(()=>{if(!document.querySelector('#app').classList.contains('hidden'))refresh()},15000)
-</script></body></html>'''
+// ── State & Config ──
+let API_BASE = '';
+let activeNav = 'overview';
+let activeConfigSub = 'card';
+let logTimer = null;
+let logIsScrolledUp = false;
+let editingConfig = false;
+let currentEnvData = { card: {}, monitor: {}, root: {} };
+let currentRawLogs = '';
+
+const labelMaps = {
+  P115_COOKIE: '115 账号 Cookie',
+  TG_BOT_TOKEN: 'Telegram Bot Token',
+  TG_CHANNEL_ID: '卡片发布频道 ID',
+  TG_USER_ID: '管理员用户 ID',
+  TG_ALLOW_CHATS: '允许触发的聊天/群组 ID',
+  TG_SUBMITTER_IDS: '投稿白名单用户 ID',
+  TMDB_API_KEY: 'TMDB API 密钥',
+  TMDB_LANG: 'TMDB 语言偏好',
+  TG_PROXY: 'Telegram 代理 (SOCKS5/HTTP)',
+  APP_HTTP_PROXY: 'HTTP 代理 (下载海报/请求TMDB)',
+  LOG_LEVEL: '日志级别 (INFO/DEBUG/WARN)',
+  CARD_BOT_TEST_MODE: '测试模式 (0:发频道, 1:纯私聊, 2:查网盘私聊)',
+  P115_SAVE_DIR: '115 保存目录名',
+  RECYCLE_PASSWORD: '115 回收站永久清空密码',
+  AUTO_PROCESS_115_LINKS: '自动识别 115 链接 (1:开启, 0:关闭)',
+  AUTO_DELETE_AFTER: '发送后自动清理延迟秒数 (0:不清理)',
+  ADMIN_PASSWORD: '管理后台密码',
+  ADMIN_SECRET: '管理后台密钥',
+  LLM_API_BASE: 'LLM API 地址',
+  LLM_API_KEY: 'LLM API 密钥',
+  LLM_MODEL: 'LLM 模型名称',
+  TG_API_ID: 'Telegram API ID',
+  TG_API_HASH: 'Telegram API Hash',
+  TG_PHONE: 'TG 登录手机号',
+  TG_SOURCE_CHAT: '监控来源聊天 ID / 频道',
+  TG_FORWARD_TO: '转发目标聊天 ID',
+  TG_START_FROM: '起始消息 ID',
+  TG_FORWARD_TIMEOUT: '转发超时时间 (秒)',
+  TG_MONITOR_WEB_PORT: '监听器网页端口',
+  TG_MONITOR_WEB_SECRET: '监听器网页密钥'
+};
+
+const cardKeys = ['P115_COOKIE','TG_BOT_TOKEN','TG_CHANNEL_ID','TG_USER_ID','TG_ALLOW_CHATS','TG_SUBMITTER_IDS','TMDB_API_KEY','TMDB_LANG','TG_PROXY','APP_HTTP_PROXY','P115_SAVE_DIR','LOG_LEVEL','CARD_BOT_TEST_MODE','RECYCLE_PASSWORD'];
+const llmKeys = ['LLM_API_BASE','LLM_API_KEY','LLM_MODEL'];
+const monitorKeys = ['TG_API_ID','TG_API_HASH','TG_BOT_TOKEN','TG_PHONE','TG_SOURCE_CHAT','TG_FORWARD_TO','TG_PROXY','TG_START_FROM','TG_FORWARD_TIMEOUT','TG_MONITOR_WEB_PORT','TG_MONITOR_WEB_SECRET','LOG_LEVEL'];
+const rootKeys = ['P115_COOKIE','TG_BOT_TOKEN','TG_CHANNEL_ID','TG_USER_ID','TG_ALLOW_CHATS','TMDB_API_KEY','TMDB_LANG','LLM_API_BASE','LLM_API_KEY','LLM_MODEL','TG_PROXY','APP_HTTP_PROXY','P115_SAVE_DIR','LOG_LEVEL','AUTO_PROCESS_115_LINKS','AUTO_DELETE_AFTER','RECYCLE_PASSWORD','ADMIN_PASSWORD','ADMIN_SECRET'];
+const secretKeys = new Set(['P115_COOKIE','TG_BOT_TOKEN','TG_API_HASH','RECYCLE_PASSWORD','ADMIN_PASSWORD','ADMIN_SECRET','LLM_API_KEY']);
+
+const testKindMap = {
+  P115_COOKIE: 'p115',
+  TG_BOT_TOKEN: 'telegram',
+  TMDB_API_KEY: 'tmdb',
+  LLM_API_BASE: 'llm',
+  TG_PROXY: 'proxy',
+  APP_HTTP_PROXY: 'proxy'
+};
+
+// ── Helpers ──
+function esc(s) {
+  if (s == null) return '';
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function toast(msg, type = 'ok') {
+  const box = document.getElementById('toastBox');
+  const item = document.createElement('div');
+  item.className = 'toast-item ' + type;
+  item.innerHTML = (type === 'ok' ? '✅ ' : type === 'err' ? '❌ ' : 'ℹ️ ') + esc(msg);
+  box.appendChild(item);
+  requestAnimationFrame(() => item.classList.add('show'));
+  setTimeout(() => {
+    item.classList.remove('show');
+    setTimeout(() => item.remove(), 250);
+  }, 3200);
+}
+
+async function req(path, opts = {}) {
+  const url = API_BASE ? API_BASE.replace(/\/$/, '') + path : path;
+  const res = await fetch(url, { credentials: 'include', ...opts });
+  if (res.status === 401) {
+    showLogin();
+    throw new Error('未登录或会话已过期');
+  }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || data.message || '请求失败 (' + res.status + ')');
+  return data;
+}
+
+// ── Tab Switching ──
+function switchNavTab(tabId) {
+  activeNav = tabId;
+  document.querySelectorAll('.nav-tab').forEach((el, idx) => {
+    const ids = ['overview', 'config', 'llm', 'logs', 'queue'];
+    el.classList.toggle('active', ids[idx] === tabId);
+  });
+  document.querySelectorAll('.tab-pane').forEach(el => el.classList.remove('active'));
+  const target = document.getElementById('pane-' + tabId);
+  if (target) target.classList.add('active');
+
+  if (tabId === 'logs') {
+    loadLogs(true);
+  } else if (tabId === 'llm') {
+    loadLlmPrompt();
+  } else if (tabId === 'queue') {
+    loadQueue();
+    loadMover();
+  }
+}
+
+function switchConfigSubtab(subId) {
+  activeConfigSub = subId;
+  const subs = ['card', 'monitor', 'root'];
+  document.querySelectorAll('.subtab').forEach((el, idx) => {
+    el.classList.toggle('active', subs[idx] === subId);
+  });
+  document.querySelectorAll('.subpane').forEach(el => el.classList.remove('active'));
+  const target = document.getElementById('subpane-' + subId);
+  if (target) target.classList.add('active');
+}
+
+// ── Auth ──
+function showLogin() {
+  document.getElementById('login').style.display = 'flex';
+  document.getElementById('app').style.display = 'none';
+  clearInterval(logTimer);
+}
+
+function showApp() {
+  document.getElementById('login').style.display = 'none';
+  document.getElementById('app').style.display = 'block';
+  changeLogInterval();
+}
+
+async function doLogin() {
+  const btn = document.getElementById('loginBtn');
+  const msg = document.getElementById('loginMsg');
+  const pwdInput = document.getElementById('login-pwd');
+  const urlInput = document.getElementById('login-url');
+
+  if (urlInput && urlInput.value.trim()) {
+    API_BASE = urlInput.value.trim().replace(/\/$/, '');
+    localStorage.setItem('115_api_url', API_BASE);
+  }
+
+  const pwd = pwdInput.value;
+  if (!pwd) {
+    msg.textContent = '请输入管理员密码';
+    return;
+  }
+  msg.textContent = '';
+  btn.disabled = true;
+  btn.textContent = '正在验证...';
+
+  try {
+    const d = await req('/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: pwd })
+    });
+    if (d.ok) {
+      showApp();
+      refreshOverview();
+      toast('登录成功');
+    } else {
+      msg.textContent = d.error || '登录失败';
+    }
+  } catch (err) {
+    msg.textContent = '登录失败: ' + err.message;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '登 录';
+  }
+}
+
+async function testConnection() {
+  const urlInput = document.getElementById('login-url');
+  const msg = document.getElementById('testConnMsg');
+  const base = (urlInput && urlInput.value.trim()) || API_BASE;
+  if (!base) {
+    if (msg) { msg.textContent = '请先填写后端地址'; msg.style.color = '#ef4444'; }
+    return;
+  }
+  const url = base.replace(/\/$/, '') + '/api/health';
+  if (msg) { msg.textContent = '正在连接...'; msg.style.color = '#64748b'; }
+  try {
+    const res = await fetch(url, { method: 'GET' });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok && data.ok !== false) {
+      if (msg) { msg.textContent = '✅ 连接成功（' + (data.service || 'card-admin') + '）'; msg.style.color = '#16a34a'; }
+    } else {
+      if (msg) { msg.textContent = '服务返回 HTTP ' + res.status; msg.style.color = '#ef4444'; }
+    }
+  } catch (e) {
+    if (msg) { msg.textContent = '❌ 连接失败：' + e.message; msg.style.color = '#ef4444'; }
+  }
+}
+
+async function doLogout() {
+  try { await req('/api/logout', { method: 'POST' }); } catch (e) {}
+  showLogin();
+  toast('已退出登录', 'info');
+}
+
+// ── Overview & Services ──
+async function refreshOverview(manual = false) {
+  try {
+    await loadOverview();
+    if (manual) toast('数据已刷新');
+  } catch (e) {
+    toast(e.message, 'err');
+  }
+}
+
+async function loadOverview() {
+  const d = await req('/api/overview');
+  renderServices(d.services || []);
+  currentEnvData.card = d.card_env || {};
+  currentEnvData.monitor = d.monitor_env || {};
+  currentEnvData.root = d.root_env || {};
+
+  // Render fields only if user is not actively editing
+  if (!editingConfig) {
+    renderFields('fields-card', currentEnvData.card, cardKeys);
+    renderFields('fields-monitor', currentEnvData.monitor, monitorKeys);
+    renderFields('fields-root', currentEnvData.root, rootKeys);
+    renderFields('fields-llm', currentEnvData.card, llmKeys);
+  }
+
+  // Update stat tiles
+  const services = d.services || [];
+  const running = services.filter(s => s.status === 'running').length;
+  document.getElementById('stat-containers').textContent = running + ' / ' + services.length;
+  document.getElementById('stat-containers-sub').textContent = running === services.length ? '全部服务正常运行' : '存在未启动服务';
+
+  // Check mover & queue softly
+  loadQueueStat();
+  loadMoverStat();
+}
+
+function renderServices(services) {
+  const box = document.getElementById('services-list');
+  if (!services.length) {
+    box.innerHTML = '<div style="color:var(--text-muted);text-align:center;padding:16px">无可用服务</div>';
+    return;
+  }
+  box.innerHTML = services.map(s => {
+    const isRunning = s.status === 'running';
+    return `
+      <div class="svc-item">
+        <div class="svc-left">
+          <span class="badge ${esc(s.status)}">${esc(s.status)}</span>
+          <div>
+            <div class="svc-name">${esc(s.name)}</div>
+            <div class="svc-meta">启动: ${esc(s.started || '-')} · 重启计数: ${esc(s.restart_count || '0')}</div>
+          </div>
+        </div>
+        <div class="svc-right">
+          <button class="btn btn-outline btn-sm" onclick="svcAction('${esc(s.name)}', 'restart')" title="重启服务">🔄 重启</button>
+          ${isRunning 
+            ? `<button class="btn btn-danger-outline btn-sm" onclick="svcAction('${esc(s.name)}', 'stop')" title="停止容器">⏹️ 停止</button>`
+            : `<button class="btn btn-outline btn-sm" onclick="svcAction('${esc(s.name)}', 'start')" title="启动容器">▶️ 启动</button>`
+          }
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+async function svcAction(name, action) {
+  try {
+    toast(`正在${action === 'restart' ? '重启' : action === 'stop' ? '停止' : '启动'} ${name}...`, 'info');
+    await req('/api/service/' + encodeURIComponent(name) + '/' + action, { method: 'POST' });
+    toast(`${name} ${action} 完成`);
+    setTimeout(loadOverview, 1500);
+  } catch (e) {
+    toast(`操作失败: ${e.message}`, 'err');
+  }
+}
+
+// ── Fields & Form ──
+function renderFields(containerId, envData, keys) {
+  const box = document.getElementById(containerId);
+  if (!box) return;
+  box.innerHTML = keys.map(k => {
+    const val = envData[k] || '';
+    const isSecret = secretKeys.has(k) || val === '********';
+    const label = labelMaps[k] || k;
+    const reqMark = (k === 'P115_COOKIE' || k === 'TG_BOT_TOKEN' || k === 'TG_CHANNEL_ID') ? ' *' : '';
+    const testKind = (typeof testKindMap !== 'undefined') ? testKindMap[k] : null;
+    return `
+      <div class="field-item">
+        <div class="field-label-row">
+          <label class="field-label" title="${esc(label)}">${esc(label)}${reqMark}</label>
+          <span class="field-key">${esc(k)}</span>
+        </div>
+        <div class="field-input-row">
+          <div class="field-input-wrap ${isSecret ? 'is-secret' : ''}">
+            <input 
+              data-key="${esc(k)}" 
+              type="${isSecret ? 'password' : 'text'}" 
+              value="${isSecret && val === '********' ? '' : esc(val)}"
+              placeholder="${isSecret ? '保持现有不变 (留空不修改)' : '请输入 ' + esc(label)}"
+              data-secret="${isSecret ? '1' : '0'}"
+              onfocus="editingConfig = true"
+              onblur="setTimeout(() => { if (!document.activeElement || document.activeElement.tagName !== 'INPUT') editingConfig = false; }, 300)"
+            >
+            ${isSecret ? `<button type="button" class="field-eye-btn" onclick="togglePass(this)" title="显示/隐藏密码">👁️</button>` : ''}
+          </div>
+          ${testKind ? `<button type="button" class="btn-test" onclick="testField('${testKind}', '${esc(k)}', this)" title="测试此项连接">测试</button>` : ''}
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+function togglePass(btn) {
+  const input = btn.parentElement.querySelector('input');
+  if (!input) return;
+  if (input.type === 'password') {
+    input.type = 'text';
+    btn.textContent = '🔒';
+  } else {
+    input.type = 'password';
+    btn.textContent = '👁️';
+  }
+}
+
+function inputVal(key) {
+  const els = document.querySelectorAll('input[data-key="' + key + '"]');
+  for (const el of els) {
+    if (el.value && el.value.trim()) return el.value.trim();
+  }
+  return '';
+}
+
+async function testField(kind, key, btn) {
+  const origText = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = '测试中...'; }
+  const payload = {};
+  if (kind === 'p115') payload.cookie = inputVal(key);
+  else if (kind === 'telegram') payload.token = inputVal(key);
+  else if (kind === 'tmdb') payload.api_key = inputVal(key);
+  else if (kind === 'llm') { payload.base = inputVal('LLM_API_BASE'); payload.key = inputVal('LLM_API_KEY'); payload.model = inputVal('LLM_MODEL'); }
+  else if (kind === 'proxy') payload.proxy = inputVal(key);
+  toast('正在测试连接...', 'info');
+  try {
+    const d = await req('/api/test/' + kind, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    toast(d.message || (d.ok ? '连接成功' : (d.error || '连接失败')), d.ok ? 'ok' : 'err');
+  } catch (e) {
+    toast('测试失败: ' + e.message, 'err');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = origText; }
+  }
+}
+
+async function saveConfig(kind) {
+  const containerId = kind === 'card' ? 'fields-card' : kind === 'monitor' ? 'fields-monitor' : kind === 'llm' ? 'fields-llm' : 'fields-root';
+  const inputs = document.querySelectorAll('#' + containerId + ' input');
+  const updates = {};
+  inputs.forEach(inp => {
+    const key = inp.dataset.key;
+    const val = inp.value.trim();
+    if (inp.dataset.secret === '1') {
+      if (val) updates[key] = val; // Only update if user typed new value
+    } else {
+      updates[key] = val;
+    }
+  });
+
+  try {
+    toast('正在保存配置...', 'info');
+    await req('/api/env/' + (kind === 'llm' ? 'llm' : kind), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ updates })
+    });
+    toast('配置已成功保存！相关服务已自动重启生效');
+    editingConfig = false;
+    setTimeout(loadOverview, 2000);
+  } catch (e) {
+    toast('保存失败: ' + e.message, 'err');
+  }
+}
+
+// ── LLM Prompt ──
+async function loadLlmPrompt() {
+  try {
+    const d = await req('/api/llm-prompt');
+    const area = document.getElementById('llmPrompt');
+    area.value = d.prompt || '';
+    updatePromptLen();
+    area.oninput = updatePromptLen;
+  } catch (e) {
+    toast('加载提示词失败: ' + e.message, 'err');
+  }
+}
+
+function updatePromptLen() {
+  const area = document.getElementById('llmPrompt');
+  document.getElementById('promptLen').textContent = (area.value || '').length + ' 字';
+}
+
+async function saveLlmPrompt() {
+  const prompt = document.getElementById('llmPrompt').value;
+  try {
+    await req('/api/llm-prompt', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt })
+    });
+    toast('LLM 提示词已保存生效');
+  } catch (e) {
+    toast('保存提示词失败: ' + e.message, 'err');
+  }
+}
+
+async function resetLlmPrompt() {
+  if (!confirm('确定要恢复默认的影视解析提示词吗？现有修改将被覆盖。')) return;
+  try {
+    await req('/api/llm-prompt/reset', { method: 'POST' });
+    toast('已恢复为默认提示词');
+    loadLlmPrompt();
+  } catch (e) {
+    toast('恢复失败: ' + e.message, 'err');
+  }
+}
+
+// ── Clean Terminal & Logs (Crucial Display Fix) ──
+function formatLogHtml(text) {
+  if (!text) return '<span style="color:#8b949e">(当前无日志)</span>';
+  const lines = text.split('\n');
+  return lines.map(line => {
+    const escaped = esc(line);
+    if (!escaped.trim()) return '<div style="min-height:1.2em"></div>';
+    if (/error|traceback|syntaxerror|exception|critical|fatal/i.test(line)) {
+      return `<div style="color:#f87171;background:rgba(239,68,68,0.1);padding:1px 4px;border-radius:3px">${escaped}</div>`;
+    } else if (/warn|warning/i.test(line)) {
+      return `<div style="color:#fbbf24">${escaped}</div>`;
+    } else if (/success|completed|完成|已连接|初始化完成/i.test(line)) {
+      return `<div style="color:#4ade80">${escaped}</div>`;
+    }
+    return `<div>${escaped}</div>`;
+  }).join('');
+}
+
+function sanitizeLogText(text) {
+  if (!text) return '';
+  // 1. Strip Docker 8-byte frame multiplex headers (pattern: \x01/\x02 followed by \x00\x00\x00)
+  text = text.replace(/[\x00-\x02]\x00\x00\x00[\s\S]{4}/g, '');
+  // 2. Strip non-printable ASCII control characters except \t, \n, \r
+  text = text.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '');
+  // 3. Strip ANSI escape sequences (e.g. \x1B[31m, \x1B[0m)
+  text = text.replace(/\x1B\[[0-9;]*[a-zA-Z]/g, '');
+  return text;
+}
+
+const terminalBox = document.getElementById('terminalBox');
+terminalBox.addEventListener('scroll', () => {
+  const threshold = 40;
+  const atBottom = terminalBox.scrollHeight - terminalBox.scrollTop - terminalBox.clientHeight <= threshold;
+  logIsScrolledUp = !atBottom;
+});
+
+async function loadLogs(forceScroll = false) {
+  const svc = document.getElementById('logServiceSelect').value;
+  const box = document.getElementById('terminalBox');
+  try {
+    const d = await req('/api/logs?name=' + encodeURIComponent(svc));
+    let raw = d.log || '(当前无日志)';
+    let cleaned = sanitizeLogText(raw);
+    currentRawLogs = cleaned;
+    
+    // Count lines
+    const lines = cleaned.split('\n');
+    document.getElementById('logStatusText').textContent = '共 ' + lines.length + ' 行';
+    
+    box.innerHTML = formatLogHtml(cleaned);
+    
+    // Auto-scroll logic: only scroll to bottom if user hasn't scrolled up or force requested
+    if (forceScroll || !logIsScrolledUp) {
+      box.scrollTop = box.scrollHeight;
+    }
+  } catch (e) {
+    box.textContent = '获取日志失败: ' + e.message;
+  }
+}
+
+function clearLogsView() {
+  document.getElementById('terminalBox').textContent = '(已清屏)';
+  document.getElementById('logStatusText').textContent = '共 0 行';
+}
+
+function copyLogs() {
+  const text = currentRawLogs || document.getElementById('terminalBox').textContent;
+  if (!text) return;
+  navigator.clipboard.writeText(text).then(() => {
+    toast('日志已复制到剪贴板');
+  }).catch(() => {
+    toast('复制失败，请手动选取复制', 'err');
+  });
+}
+
+function scrollLogToBottom() {
+  const box = document.getElementById('terminalBox');
+  box.scrollTop = box.scrollHeight;
+  logIsScrolledUp = false;
+}
+
+function changeLogInterval() {
+  clearInterval(logTimer);
+  const ms = parseInt(document.getElementById('logIntervalSelect').value, 10);
+  const dot = document.getElementById('logLiveDot');
+  if (ms > 0) {
+    dot.classList.remove('paused');
+    dot.title = `每 ${ms / 1000} 秒自动刷新`;
+    logTimer = setInterval(() => {
+      if (activeNav === 'logs') loadLogs(false);
+    }, ms);
+  } else {
+    dot.classList.add('paused');
+    dot.title = '自动刷新已暂停';
+  }
+}
+
+// ── Queue & Mover ──
+async function loadQueue() {
+  try {
+    const d = await req('/api/retry-queue');
+    const q = d.queue || [];
+    document.getElementById('queueContent').textContent = q.length ? JSON.stringify(q, null, 2) : '[] (当前无待重试任务)';
+  } catch (e) {
+    document.getElementById('queueContent').textContent = '加载失败: ' + e.message;
+  }
+}
+
+async function loadQueueStat() {
+  try {
+    const d = await req('/api/retry-queue');
+    const q = d.queue || [];
+    document.getElementById('stat-queue').textContent = q.length + ' 个';
+  } catch (e) {
+    document.getElementById('stat-queue').textContent = '-';
+  }
+}
+
+async function loadMover() {
+  const box = document.getElementById('moverContent');
+  try {
+    const d = await req('/api/mount-mover');
+    if (d.enabled === false) {
+      box.innerHTML = `
+        <div style="padding:16px;border:1px solid var(--border-subtle);border-radius:var(--radius-sm);background:#fafbfc;color:var(--text-secondary)">
+          <div style="font-weight:600;margin-bottom:4px;color:var(--text)">ℹ️ 挂载转存服务未启用</div>
+          <p style="font-size:12.5px;color:var(--text-muted);line-height:1.6">
+            此功能专为 NAS 本地 CD2 挂载路径（123盘 → 115）自动搬移设计。服务器部署环境已自动跳过。<br>
+            如需开启，请在环境变量中设置 <code>MOVER_ENABLED=1</code>。
+          </p>
+        </div>
+      `;
+      return;
+    }
+    const c = d.counts || {};
+    box.innerHTML = `
+      <div class="mover-grid">
+        <div class="mover-stat"><div class="mover-stat-num">${d.tracked || 0}</div><div class="mover-stat-lbl">已跟踪</div></div>
+        <div class="mover-stat"><div class="mover-stat-num">${c.waiting || 0}</div><div class="mover-stat-lbl">等待稳定</div></div>
+        <div class="mover-stat"><div class="mover-stat-num">${c.moving || 0}</div><div class="mover-stat-lbl">处理中</div></div>
+        <div class="mover-stat"><div class="mover-stat-num">${c.completed || 0}</div><div class="mover-stat-lbl">已移动</div></div>
+        <div class="mover-stat"><div class="mover-stat-num">${(d.pipeline_jobs || []).length}</div><div class="mover-stat-lbl">闭环任务</div></div>
+      </div>
+      <div style="font-size:12px;color:var(--text-secondary);margin-bottom:8px">
+        <div>来源路径: <code>${esc(d.source || '-')}</code></div>
+        <div>目标路径: <code>${esc(d.target || '-')}</code></div>
+      </div>
+    `;
+  } catch (e) {
+    box.textContent = '加载失败: ' + e.message;
+  }
+}
+
+async function loadMoverStat() {
+  try {
+    const d = await req('/api/mount-mover');
+    const el = document.getElementById('stat-mover');
+    if (d.enabled === false) {
+      el.textContent = '未启用';
+      document.getElementById('stat-mover-sub').textContent = '服务器环境 (无需挂载)';
+    } else {
+      el.textContent = '运行中';
+      document.getElementById('stat-mover-sub').textContent = `已跟踪 ${d.tracked || 0} 个文件`;
+    }
+  } catch (e) {
+    document.getElementById('stat-mover').textContent = '-';
+  }
+}
+
+// ── Actions ──
+async function doAction(action) {
+  const names = {
+    'backup': '备份当前配置',
+    'clear-retry': '清空重试队列',
+    'compose-up': '启动全部服务',
+    'compose-down': '停止全部服务'
+  };
+  if ((action === 'clear-retry' || action === 'compose-down') && !confirm(`确定要${names[action] || action}吗？`)) {
+    return;
+  }
+  try {
+    toast(`正在执行: ${names[action] || action}...`, 'info');
+    const d = await req('/api/action', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action })
+    });
+    toast(d.message || '操作成功完成');
+    setTimeout(refreshOverview, 1500);
+  } catch (e) {
+    toast('操作失败: ' + e.message, 'err');
+  }
+}
+
+// ── Init ──
+(function init() {
+  const savedUrl = localStorage.getItem('115_api_url');
+  if (savedUrl) {
+    API_BASE = savedUrl;
+  } else if (window.location.port === '18811') {
+    API_BASE = window.location.protocol + '//' + window.location.hostname + ':18810';
+  }
+  const inp = document.getElementById('login-url');
+  if (inp && API_BASE) inp.value = API_BASE;
+  if (window.location.port !== '18810' && window.location.port !== '') {
+    const urlGroup = document.getElementById('urlGroup');
+    if (urlGroup) urlGroup.style.display = 'block';
+  }
+  // Background light polling for overview when idle
+  setInterval(() => {
+    if (activeNav === 'overview' && !editingConfig && document.getElementById('app').style.display !== 'none') {
+      loadOverview();
+    }
+  }, 20000);
+
+  // Check auth
+  req('/api/me').then(() => {
+    showApp();
+    refreshOverview();
+  }).catch(() => {
+    showLogin();
+  });
+})();
+</script>
+</body>
+</html>
+'''
 
 
 async def index(request: web.Request):
@@ -535,7 +2044,7 @@ async def index(request: web.Request):
 
 
 async def login(request: web.Request):
-    if not ADMIN_PASSWORD or ADMIN_PASSWORD == "change-this-password":
+    if not ADMIN_PASSWORD:
         return web.json_response({"ok": False, "error": "后台 ADMIN_PASSWORD 尚未设置安全密码"}, status=503)
     if request.content_type == "application/x-www-form-urlencoded":
         data = await request.post()
@@ -628,7 +2137,8 @@ async def restart(request: web.Request):
 
 
 async def logs(request: web.Request):
-    name = request.query.get("name", "tg-user-monitor")
+    require_auth(request)
+    name = request.query.get("name", "p115-card-bot")
     if name not in set(MANAGED_SERVICES):
         raise web.HTTPBadRequest(text="不允许查看此容器")
     code, output = docker("logs", "--tail", "300", name, timeout=30)
@@ -755,16 +2265,141 @@ async def reset_llm_prompt(request: web.Request):
     return web.json_response({"ok": True, "message": "已恢复默认提示词"})
 
 
+# ── 连接测试 ──────────────────────────────────────────
+async def _http_fetch(url: str, *, headers: dict | None = None, proxy: str | None = None, timeout: int = 12):
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers or {}, proxy=proxy or None,
+                                   timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
+                return resp.status, (await resp.text())[:500]
+    except Exception as exc:
+        return 0, str(exc)[:500]
+
+
+def _resolve_value(body: dict, body_key: str, env_key: str) -> str:
+    value = str(body.get(body_key) or "").strip()
+    if value:
+        return value
+    for path in (CARD_ENV, ROOT_ENV, MONITOR_ENV):
+        value = parse_env(path).get(env_key, "").strip()
+        if value:
+            return value
+    return ""
+
+
+async def health(request: web.Request):
+    return web.json_response({"ok": True, "service": "card-admin"})
+
+
+async def test_telegram(request: web.Request):
+    require_auth(request)
+    token = _resolve_value(json_body(request), "token", "TG_BOT_TOKEN")
+    if not token:
+        return web.json_response({"ok": False, "error": "未提供 Bot Token（请填写后测试，或先在配置中保存）"})
+    status, text = await _http_fetch(f"https://api.telegram.org/bot{token}/getMe")
+    if status != 200:
+        return web.json_response({"ok": False, "error": f"Telegram 返回 {status}: {text[:200]}"})
+    username = ""
+    try:
+        username = (json.loads(text).get("result") or {}).get("username", "")
+    except Exception:
+        pass
+    return web.json_response({"ok": True, "message": "Bot 连接成功" + (f"（@{username}）" if username else "")})
+
+
+async def test_tmdb(request: web.Request):
+    require_auth(request)
+    key = _resolve_value(json_body(request), "api_key", "TMDB_API_KEY")
+    if not key:
+        return web.json_response({"ok": False, "error": "未提供 TMDB API Key"})
+    status, text = await _http_fetch(f"https://api.themoviedb.org/3/configuration?api_key={key}")
+    if status != 200:
+        return web.json_response({"ok": False, "error": f"TMDB 返回 {status}: {text[:200]}"})
+    return web.json_response({"ok": True, "message": "TMDB API 连接成功"})
+
+
+async def test_llm(request: web.Request):
+    require_auth(request)
+    body = json_body(request)
+    base = str(body.get("base") or parse_env(CARD_ENV).get("LLM_API_BASE") or parse_env(ROOT_ENV).get("LLM_API_BASE") or "").strip().rstrip("/")
+    key = str(body.get("key") or parse_env(CARD_ENV).get("LLM_API_KEY") or parse_env(ROOT_ENV).get("LLM_API_KEY") or "").strip()
+    model = str(body.get("model") or parse_env(CARD_ENV).get("LLM_MODEL") or parse_env(ROOT_ENV).get("LLM_MODEL") or "").strip()
+    if not base:
+        return web.json_response({"ok": False, "error": "未提供 LLM API 地址"})
+    if not model:
+        return web.json_response({"ok": False, "error": "未提供 LLM 模型名"})
+    headers = {"Content-Type": "application/json"}
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 1,
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{base}/chat/completions", json=payload, headers=headers,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                status = resp.status
+                text = await resp.text()
+    except Exception as e:
+        return web.json_response({"ok": False, "error": f"LLM 请求失败: {str(e)[:200]}"})
+    if status in (401, 403):
+        return web.json_response({"ok": False, "error": f"LLM 鉴权失败（{status}），请检查 API Key"})
+    if status == 200:
+        return web.json_response({"ok": True, "message": "LLM API 连接成功" + (f"（模型 {model}）" if model else "")})
+    if status == 404:
+        return web.json_response({"ok": False, "error": f"LLM 接口 404，地址可能不对：{base}"})
+    return web.json_response({"ok": False, "error": f"LLM 接口返回 {status}: {text[:200]}"})
+
+
+async def test_p115(request: web.Request):
+    require_auth(request)
+    cookie = _resolve_value(json_body(request), "cookie", "P115_COOKIE")
+    if not cookie:
+        return web.json_response({"ok": False, "error": "未提供 115 Cookie"})
+    try:
+        from p115client import P115Client
+        client = P115Client(cookie)
+        info = await client.user_info(async_=True)
+    except Exception as e:
+        return web.json_response({"ok": False, "error": f"115 连接失败: {str(e)[:200]}"})
+    if isinstance(info, dict) and info.get("state"):
+        data = info.get("data") or {}
+        name = data.get("user_name") or data.get("user_id") or ""
+        return web.json_response({"ok": True, "message": "115 Cookie 有效" + (f"（{name}）" if name else "")})
+    return web.json_response({"ok": False, "error": "115 Cookie 无效或已过期"})
+
+
+async def test_proxy(request: web.Request):
+    require_auth(request)
+    proxy = str(json_body(request).get("proxy") or "").strip()
+    if not proxy:
+        proxy = parse_env(CARD_ENV).get("TG_PROXY", "").strip() or parse_env(CARD_ENV).get("APP_HTTP_PROXY", "").strip()
+    if not proxy:
+        return web.json_response({"ok": False, "error": "未提供代理地址"})
+    status, text = await _http_fetch("https://api.telegram.org", proxy=proxy, timeout=12)
+    if status in (200, 301, 302, 404, 405):
+        return web.json_response({"ok": True, "message": "代理连通正常"})
+    return web.json_response({"ok": False, "error": f"代理测试失败: {text[:200]}"})
+
+
 async def main():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    app = web.Application(middlewares=[body_middleware])
+    app = web.Application(middlewares=[cors_middleware, body_middleware])
     app.add_routes([
         web.get("/", index), web.post("/api/login", login), web.post("/api/logout", logout), web.get("/api/me", me),
+        web.get("/api/health", health),
         web.get("/api/overview", overview), web.post("/api/env/{kind}", update_env), web.post("/api/restart", restart),
         web.post("/api/service/{service}/{action}", service_action),
         web.get("/api/logs", logs), web.get("/api/retry-queue", retry_queue), web.get("/api/mount-mover", mount_mover), web.post("/api/action", action),
         web.get("/api/llm-prompt", get_llm_prompt), web.post("/api/llm-prompt", update_llm_prompt),
         web.post("/api/llm-prompt/reset", reset_llm_prompt),
+        web.post("/api/test/telegram", test_telegram), web.post("/api/test/tmdb", test_tmdb),
+        web.post("/api/test/llm", test_llm), web.post("/api/test/p115", test_p115),
+        web.post("/api/test/proxy", test_proxy),
     ])
     runner = web.AppRunner(app)
     await runner.setup()

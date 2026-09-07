@@ -8,7 +8,7 @@ services:
     volumes:
       - ./state:/tg-monitor-state
     ports:
-      - "18800:18800"
+      - "127.0.0.1:18800:18800"
     environment:
       TZ: Asia/Shanghai
       TG_MONITOR_WEB_HOST: 0.0.0.0

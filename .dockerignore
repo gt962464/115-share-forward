@@ -1,0 +1,11 @@
+.git
+.gitignore
+.env
+**/.env
+data/
+**/__pycache__/
+**/state/
+*.pyc
+*.pyo
+*.session
+*.session-journal

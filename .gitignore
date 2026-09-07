@@ -10,7 +10,6 @@
 id_ed25519*
 *.session
 *.session-journal
-*.session吧
 
 # Python 运行时
 __pycache__/

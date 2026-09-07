@@ -6,7 +6,7 @@ services:
     env_file:
       - .env
     ports:
-      - "18810:18810"
+      - "127.0.0.1:18810:18810"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ..:/project

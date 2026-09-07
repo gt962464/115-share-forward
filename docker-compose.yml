@@ -3,7 +3,7 @@ services:
     image: listeningltg/p115-share:latest
     container_name: p115-share
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     environment:
       TZ: Asia/Shanghai
     volumes:
@@ -15,6 +15,6 @@ services:
     container_name: card-admin-web
     restart: unless-stopped
     ports:
-      - "18811:80"
+      - "127.0.0.1:18811:80"
     environment:
       TZ: Asia/Shanghai

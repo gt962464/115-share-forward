@@ -2,13 +2,15 @@
 # 115 分享转发 · 服务器部署 Compose
 # 适配美国服务器（无 NAS 挂载路径）
 # 跳过 cd2-mount-mover（NAS 专用）
-# 端口：8000(grok2api 已占) / 18800 / 18810 / 18811
+# 端口：18800(tg-monitor 监听转发登录) / 18810(后台API) / 18811(前端面板)
 # ============================================
 
 services:
   # ── 核心卡片机器人 ──
   p115-card-bot:
-    image: listeningltg/p115-share:latest
+    build:
+      context: .
+      dockerfile: card-bot/Dockerfile
     container_name: p115-card-bot
     restart: unless-stopped
     entrypoint: ["python", "/cardbot/cardbot.py"]
@@ -38,7 +40,7 @@ services:
     env_file:
       - .env
     ports:
-      - "18810:18810"
+      - "127.0.0.1:18810:18810"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./card-bot:/project
@@ -56,6 +58,23 @@ services:
     container_name: card-admin-web
     restart: unless-stopped
     ports:
-      - "18811:80"
+      - "127.0.0.1:18811:80"
     environment:
       TZ: Asia/Shanghai
+
+  # ── Telegram 监听转发（可选）──
+  # 用你的真实 Telegram 用户账号监听来源聊天，把 115 链接转发给卡片机器人
+  tg-user-monitor:
+    build: ./card-bot/tg-monitor
+    container_name: tg-user-monitor
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:18800:18800"
+    environment:
+      TZ: Asia/Shanghai
+      TG_MONITOR_WEB_HOST: 0.0.0.0
+      TG_MONITOR_WEB_PORT: 18800
+    volumes:
+      - ./data/tg-monitor-state:/tg-monitor-state
