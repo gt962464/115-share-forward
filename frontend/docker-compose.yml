@@ -1,0 +1,9 @@
+services:
+  card-admin-web:
+    build: .
+    container_name: card-admin-web
+    restart: unless-stopped
+    ports:
+      - "18811:80"
+    environment:
+      TZ: Asia/Shanghai

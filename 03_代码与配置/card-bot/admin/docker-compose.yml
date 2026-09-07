@@ -1,0 +1,19 @@
+services:
+  card-admin:
+    build: .
+    container_name: card-admin
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "18810:18810"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /vol2/1000/docker/115/card-bot:/project
+      - ./data:/admin-data
+    environment:
+      TZ: Asia/Shanghai
+      ADMIN_HOST: 0.0.0.0
+      ADMIN_PORT: 18810
+      PROJECT_DIR: /project
+      ADMIN_DATA_DIR: /admin-data

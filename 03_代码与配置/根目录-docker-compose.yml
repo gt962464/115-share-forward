@@ -1,0 +1,11 @@
+services:
+  p115-share:
+    image: listeningltg/p115-share:latest
+    container_name: p115-share
+    ports:
+      - "8000:8000"
+    environment:
+      TZ: Asia/Shanghai
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped

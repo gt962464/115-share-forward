@@ -1,0 +1,465 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>115 分享转发 · 管理后台</title>
+<style>
+:root{--bg:#f0f2f5;--surface:#fff;--border:#e0e3e8;--text:#1a1d21;--text2:#666;--text3:#999;--blue:#2563eb;--blue2:#1d4ed8;--green:#16a34a;--red:#dc2626;--orange:#ea580c;--radius:10px;--shadow:0 1px 3px rgba(0,0,0,.08)}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;min-height:100vh}
+
+/* Login */
+#login-page{display:flex;align-items:center;justify-content:center;min-height:100vh;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%)}
+.login-box{background:#fff;border-radius:16px;padding:40px;width:380px;max-width:90vw;box-shadow:0 20px 60px rgba(0,0,0,.15)}
+.login-box h1{font-size:20px;margin-bottom:6px}
+.login-box p{color:var(--text2);font-size:13px;margin-bottom:24px}
+.login-box input{width:100%;padding:12px 14px;border:1.5px solid var(--border);border-radius:8px;font-size:14px;outline:none;transition:border .2s}
+.login-box input:focus{border-color:var(--blue)}
+.login-box button{width:100%;margin-top:14px;padding:12px;background:var(--blue);color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;transition:background .2s}
+.login-box button:hover{background:var(--blue2)}
+.login-box .err{color:var(--red);font-size:13px;margin-top:10px;display:none}
+
+/* App */
+#app-page{display:none}
+.topbar{background:#fff;border-bottom:1px solid var(--border);padding:0 24px;height:52px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:100}
+.topbar h1{font-size:16px;font-weight:600}
+.topbar .right{display:flex;align-items:center;gap:12px}
+.topbar .conn{font-size:12px;color:var(--text3);background:var(--bg);padding:4px 10px;border-radius:6px}
+.topbar .btn-sm{padding:6px 14px;border:1px solid var(--border);border-radius:6px;background:#fff;font-size:12px;cursor:pointer;color:var(--text2);transition:all .15s}
+.topbar .btn-sm:hover{border-color:var(--blue);color:var(--blue)}
+.topbar .btn-sm.danger{color:var(--red);border-color:#fecaca}
+.topbar .btn-sm.danger:hover{background:#fef2f2}
+
+.container{max-width:1200px;margin:0 auto;padding:20px}
+
+/* Config URL bar */
+.url-bar{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:14px 18px;margin-bottom:16px;display:flex;align-items:center;gap:12px}
+.url-bar label{font-size:13px;color:var(--text2);white-space:nowrap}
+.url-bar input{flex:1;padding:8px 12px;border:1.5px solid var(--border);border-radius:6px;font-size:13px;outline:none}
+.url-bar input:focus{border-color:var(--blue)}
+.url-bar .btn{padding:8px 18px;background:var(--blue);color:#fff;border:none;border-radius:6px;font-size:13px;font-weight:500;cursor:pointer;white-space:nowrap}
+.url-bar .btn:hover{background:var(--blue2)}
+.url-bar .status{font-size:12px;padding:4px 10px;border-radius:20px;white-space:nowrap}
+.url-bar .status.ok{background:#dcfce7;color:var(--green)}
+.url-bar .status.err{background:#fee2e2;color:var(--red)}
+.url-bar .status.idle{background:#f3f4f6;color:var(--text3)}
+
+/* Grid */
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+@media(max-width:800px){.grid{grid-template-columns:1fr}}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:18px;box-shadow:var(--shadow)}
+.card.full{grid-column:1/-1}
+.card h2{font-size:14px;font-weight:600;margin-bottom:14px;display:flex;align-items:center;gap:8px}
+.card h2 .icon{font-size:16px}
+
+/* Services */
+.svc{display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid #f3f4f6}
+.svc:last-child{border:none}
+.svc .name{font-weight:500;font-size:13px}
+.svc .meta{font-size:11px;color:var(--text3)}
+.badge{display:inline-block;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:600;text-transform:uppercase}
+.badge.running{background:#dcfce7;color:var(--green)}
+.badge.stopped{background:#fee2e2;color:var(--red)}
+.badge.not_found{background:#fef3c7;color:var(--orange)}
+.badge.unknown{background:#f3f4f6;color:var(--text3)}
+.svc-actions{display:flex;gap:6px;margin-top:2px}
+.svc-actions button{font-size:11px;padding:3px 8px;border:1px solid var(--border);border-radius:4px;background:#fff;cursor:pointer;color:var(--text2);transition:all .15s}
+.svc-actions button:hover{border-color:var(--blue);color:var(--blue)}
+
+/* Fields */
+.field{margin-bottom:12px}
+.field label{display:block;font-size:12px;color:var(--text2);margin-bottom:4px;font-weight:500}
+.field input,.field select{width:100%;padding:8px 12px;border:1.5px solid var(--border);border-radius:6px;font-size:13px;outline:none;transition:border .2s;font-family:inherit}
+.field input:focus,.field select:focus{border-color:var(--blue)}
+.field .hint{font-size:11px;color:var(--text3);margin-top:2px}
+
+/* Buttons */
+.btn{padding:8px 16px;border:none;border-radius:6px;font-size:13px;font-weight:500;cursor:pointer;transition:all .15s}
+.btn-primary{background:var(--blue);color:#fff}.btn-primary:hover{background:var(--blue2)}
+.btn-green{background:var(--green);color:#fff}.btn-green:hover{background:#15803d}
+.btn-red{background:var(--red);color:#fff}.btn-red:hover{background:#b91c1c}
+.btn-outline{background:#fff;border:1px solid var(--border);color:var(--text2)}.btn-outline:hover{border-color:var(--blue);color:var(--blue)}
+.btn-group{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+
+/* Log */
+.log-box{background:#1a1d21;color:#d4d4d8;font:12px/1.5 "JetBrains Mono",ui-monospace,SFMono-Regular,monospace;padding:14px;border-radius:8px;max-height:320px;overflow:auto;white-space:pre-wrap;word-break:break-all}
+.log-header{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+.log-header select{padding:6px 10px;border:1px solid var(--border);border-radius:6px;font-size:12px}
+
+/* Queue */
+pre.json{background:#1a1d21;color:#d4d4d8;font:12px/1.5 "JetBrains Mono",ui-monospace,SFMono-Regular,monospace;padding:14px;border-radius:8px;max-height:280px;overflow:auto;white-space:pre-wrap;word-break:break-all}
+
+/* Mover */
+.mover-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(80px,1fr));gap:10px;margin-bottom:14px}
+.mover-stat{text-align:center;padding:10px;background:var(--bg);border-radius:8px}
+.mover-stat .num{font-size:22px;font-weight:700;color:var(--blue)}
+.mover-stat .lbl{font-size:11px;color:var(--text3);margin-top:2px}
+
+/* Toast */
+.toast{position:fixed;bottom:20px;right:20px;background:#1a1d21;color:#fff;padding:12px 20px;border-radius:8px;font-size:13px;z-index:9999;opacity:0;transform:translateY(10px);transition:all .3s;pointer-events:none}
+.toast.show{opacity:1;transform:translateY(0)}
+.toast.ok{background:var(--green)}
+.toast.err{background:var(--red)}
+
+/* Tabs */
+.tabs{display:flex;gap:4px;margin-bottom:14px;border-bottom:1px solid var(--border);padding-bottom:0}
+.tab{padding:8px 14px;font-size:13px;color:var(--text3);cursor:pointer;border-bottom:2px solid transparent;transition:all .15s;font-weight:500}
+.tab:hover{color:var(--text)}
+.tab.active{color:var(--blue);border-bottom-color:var(--blue)}
+.tab-content{display:none}.tab-content.active{display:block}
+
+/* Spinner */
+.spinner{display:inline-block;width:14px;height:14px;border:2px solid #fff;border-top-color:transparent;border-radius:50%;animation:spin .6s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+
+<!-- ========== Login ========== -->
+<div id="login-page">
+  <div class="login-box">
+    <h1>📁 115 分享转发</h1>
+    <p>管理后台 · 请输入密码登录</p>
+    <input id="login-url" type="text" placeholder="后端地址 (如 http://192.168.31.70:18810)" style="margin-bottom:10px">
+    <input id="login-pwd" type="password" placeholder="管理密码" autofocus>
+    <div id="login-err" class="err"></div>
+    <button id="login-btn" onclick="doLogin()">登 录</button>
+  </div>
+</div>
+
+<!-- ========== App ========== -->
+<div id="app-page">
+  <div class="topbar">
+    <h1>📁 115 分享转发 · 管理后台</h1>
+    <div class="right">
+      <span class="conn" id="conn-info"></span>
+      <button class="btn-sm" onclick="refreshAll()">🔄 刷新</button>
+      <button class="btn-sm danger" onclick="doLogout()">退出</button>
+    </div>
+  </div>
+
+  <div class="container">
+    <!-- Connection bar -->
+    <div class="url-bar">
+      <label>后端地址</label>
+      <input id="api-url" type="text" placeholder="http://192.168.31.70:18810">
+      <button class="btn" onclick="connect()">连接</button>
+      <span class="status idle" id="conn-status">未连接</span>
+    </div>
+
+    <!-- Dashboard Grid -->
+    <div class="grid">
+      <!-- Services -->
+      <div class="card">
+        <h2><span class="icon">🖥️</span> 服务状态</h2>
+        <div id="services"><div style="color:var(--text3);text-align:center;padding:20px">加载中...</div></div>
+        <div class="btn-group">
+          <button class="btn btn-outline" onclick="refreshServices()">刷新</button>
+          <button class="btn btn-green" onclick="doAction('compose-up')">启动全部</button>
+          <button class="btn btn-red" onclick="doAction('compose-down')">停止全部</button>
+        </div>
+      </div>
+
+      <!-- Quick Actions -->
+      <div class="card">
+        <h2><span class="icon">⚡</span> 快捷操作</h2>
+        <div class="btn-group" style="margin-top:0">
+          <button class="btn btn-outline" onclick="doAction('backup')">📦 备份配置</button>
+          <button class="btn btn-outline" onclick="doAction('clear-retry')">🗑️ 清空重试队列</button>
+          <button class="btn btn-outline" onclick="refreshAll()">🔄 全部刷新</button>
+        </div>
+        <div id="mover-summary" style="margin-top:14px"></div>
+      </div>
+
+      <!-- Config Tabs -->
+      <div class="card full">
+        <h2><span class="icon">⚙️</span> 配置管理</h2>
+        <div class="tabs">
+          <div class="tab active" onclick="switchTab(this,'tab-card')">卡片机器人</div>
+          <div class="tab" onclick="switchTab(this,'tab-monitor')">Telegram 监听</div>
+          <div class="tab" onclick="switchTab(this,'tab-llm')">LLM 提示词</div>
+        </div>
+        <div id="tab-card" class="tab-content active"></div>
+        <div id="tab-monitor" class="tab-content"></div>
+        <div id="tab-llm" class="tab-content"></div>
+      </div>
+
+      <!-- Logs -->
+      <div class="card full">
+        <h2><span class="icon">📜</span> 实时日志</h2>
+        <div class="log-header">
+          <select id="log-svc" onchange="loadLogs()">
+            <option value="p115-card-bot">p115-card-bot</option>
+            <option value="tg-user-monitor">tg-user-monitor</option>
+            <option value="cd2-mount-mover">cd2-mount-mover</option>
+          </select>
+          <button class="btn btn-outline" onclick="loadLogs()" style="padding:5px 12px;font-size:12px">刷新日志</button>
+        </div>
+        <div class="log-box" id="log-output">加载中...</div>
+      </div>
+
+      <!-- Retry Queue -->
+      <div class="card">
+        <h2><span class="icon">🔁</span> 重试队列</h2>
+        <div class="json" id="queue-output">加载中...</div>
+      </div>
+
+      <!-- Mount Mover -->
+      <div class="card">
+        <h2><span class="icon">📂</span> 转存状态</h2>
+        <div id="mover-output">加载中...</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+// ── State ──
+let API = '';
+let logged = false;
+
+// ── Field labels ──
+const cardLabels = {
+  P115_SAVE_DIR:'保存目录名',TG_CHANNEL_ID:'频道ID',TG_USER_ID:'管理员ID',
+  TG_ALLOW_CHATS:'允许的聊天ID',TMDB_API_KEY:'TMDB密钥',TMDB_LANG:'语言',
+  TG_PROXY:'TG代理',APP_HTTP_PROXY:'HTTP代理',LOG_LEVEL:'日志级别',
+  CARD_BOT_TEST_MODE:'测试模式',LLM_API_BASE:'API地址',LLM_API_KEY:'API密钥',LLM_MODEL:'模型名称'
+};
+const monitorLabels = {
+  TG_PHONE:'手机号',TG_SOURCE_CHAT:'来源聊天',TG_FORWARD_TO:'转发目标',
+  TG_PROXY:'TG代理',TG_START_FROM:'起始消息ID',TG_FORWARD_TIMEOUT:'转发超时',
+  TG_MONITOR_WEB_PORT:'网页端口',TG_MONITOR_WEB_SECRET:'网页密钥',LOG_LEVEL:'日志级别'
+};
+const llmKeys = ['LLM_API_BASE','LLM_API_KEY','LLM_MODEL'];
+
+// ── Helpers ──
+function toast(msg, type='ok'){
+  const t=document.getElementById('toast');
+  t.textContent=msg;t.className='toast '+type+' show';
+  setTimeout(()=>t.className='toast',3000);
+}
+async function api(path, opts={}){
+  const r=await fetch(API+path,{credentials:'include',...opts});
+  if(r.status===401){logged=false;showLogin();throw new Error('未登录')}
+  const d=await r.json();
+  if(!r.ok&&d.error)throw new Error(d.error);
+  return d;
+}
+function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
+
+// ── Tab switching ──
+function switchTab(el, id){
+  el.parentElement.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+  el.classList.add('active');
+  el.closest('.card').querySelectorAll('.tab-content').forEach(c=>c.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+}
+
+// ── Auth ──
+function showLogin(){document.getElementById('login-page').style.display='flex';document.getElementById('app-page').style.display='none'}
+function showApp(){document.getElementById('login-page').style.display='none';document.getElementById('app-page').style.display='block'}
+
+async function doLogin(){
+  const url=document.getElementById('login-url').value.trim().replace(/\/$/,'');
+  const pwd=document.getElementById('login-pwd').value;
+  const err=document.getElementById('login-err');
+  if(!url){err.textContent='请输入后端地址';err.style.display='block';return}
+  if(!pwd){err.textContent='请输入密码';err.style.display='block';return}
+  API=url;
+  try{
+    const r=await fetch(API+'/api/login',{method:'POST',credentials:'include',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pwd})});
+    const d=await r.json();
+    if(!r.ok||!d.ok){err.textContent=d.error||'登录失败';err.style.display='block';return}
+    logged=true;
+    document.getElementById('api-url').value=API;
+    document.getElementById('login-err').style.display='none';
+    localStorage.setItem('115_api_url',API);
+    showApp();
+    connect();
+  }catch(e){err.textContent='连接失败: '+e.message;err.style.display='block'}
+}
+
+async function doLogout(){
+  try{await api('/api/logout',{method:'POST'})}catch(e){}
+  logged=false;showLogin();
+}
+
+async function connect(){
+  const url=document.getElementById('api-url').value.trim().replace(/\/$/,'');
+  const st=document.getElementById('conn-status');
+  if(!url){st.textContent='请输入地址';st.className='status err';return}
+  API=url;
+  try{
+    await api('/api/me');
+    st.textContent='已连接';st.className='status ok';
+    document.getElementById('conn-info').textContent=API;
+    refreshAll();
+  }catch(e){
+    st.textContent='连接失败';st.className='status err';
+  }
+}
+
+// ── Refresh ──
+async function refreshAll(){
+  await Promise.all([refreshServices(),loadLogs(),loadQueue(),loadMover(),loadLlmPrompt()]);
+}
+
+async function refreshServices(){
+  try{
+    const d=await api('/api/overview');
+    renderServices(d.services);
+    renderFields('tab-card',d.card_env,cardLabels);
+    renderFields('tab-monitor',d.monitor_env,monitorLabels);
+  }catch(e){toast(e.message,'err')}
+}
+
+function renderServices(services){
+  const h=services.map(s=>
+    <div class="svc">
+      <div><div class="name"></div>
+      <div class="meta">启动:  · 重启: </div></div>
+      <div style="display:flex;align-items:center;gap:8px">
+        <span class="badge "></span>
+        <div class="svc-actions">
+          <button onclick="restartSvc('')" title="重启">🔄</button>
+          <button onclick="serviceAction('','stop')" title="停止">⏹</button>
+        </div>
+      </div>
+    </div>).join('');
+  document.getElementById('services').innerHTML=h||'<div style="color:var(--text3)">无数据</div>';
+}
+
+function renderFields(containerId, env, labels){
+  const el=document.getElementById(containerId);
+  const keys=Object.keys(labels);
+  el.innerHTML=keys.map(k=>{
+    const v=env[k]||'';
+    const isSecret=v==='********';
+    return <div class="field">
+      <label></label>
+      <input data-key="" type="" value="" placeholder="" >
+    </div>;
+  }).join('')+
+  <div class="btn-group"><button class="btn btn-primary" onclick="saveEnv('','')">💾 保存配置</button></div>;
+}
+
+async function saveEnv(kind, containerId){
+  const updates={};
+  document.querySelectorAll('#'+containerId+' input').forEach(inp=>{
+    if(inp.dataset.secret&&inp.value)updates[inp.dataset.key]=inp.value;
+    else if(!inp.dataset.secret&&inp.value&&inp.value!=='********')updates[inp.dataset.key]=inp.value;
+  });
+  try{
+    await api('/api/env/'+kind,{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({updates})});
+    toast('配置已保存并重启');
+    setTimeout(refreshServices,2000);
+  }catch(e){toast(e.message,'err')}
+}
+
+async function restartSvc(name){
+  try{await api('/api/service/'+encodeURIComponent(name)+'/restart',{method:'POST'});toast('已重启 '+name);setTimeout(refreshServices,2000)}
+  catch(e){toast(e.message,'err')}
+}
+async function serviceAction(name,action){
+  try{await api('/api/service/'+encodeURIComponent(name)+'/'+action,{method:'POST'});toast('已'+action+' '+name);setTimeout(refreshServices,2000)}
+  catch(e){toast(e.message,'err')}
+}
+
+// ── Logs ──
+async function loadLogs(){
+  const svc=document.getElementById('log-svc').value;
+  try{
+    const d=await api('/api/logs?name='+encodeURIComponent(svc));
+    document.getElementById('log-output').textContent=d.log||'(暂无日志)';
+    const box=document.getElementById('log-output');box.scrollTop=box.scrollHeight;
+  }catch(e){document.getElementById('log-output').textContent=e.message}
+}
+
+// ── Queue ──
+async function loadQueue(){
+  try{
+    const d=await api('/api/retry-queue');
+    document.getElementById('queue-output').textContent=JSON.stringify(d.queue,null,2)||'[]';
+  }catch(e){document.getElementById('queue-output').textContent=e.message}
+}
+
+// ── Mover ──
+async function loadMover(){
+  try{
+    const d=await api('/api/mount-mover');
+    const s=d.service||{};
+    const c=d.counts||{};
+    const pc=d.pipeline_counts||{};
+    document.getElementById('mover-output').innerHTML=
+      <div class="mover-grid">
+        <div class="mover-stat"><div class="num"></div><div class="lbl">已跟踪</div></div>
+        <div class="mover-stat"><div class="num"></div><div class="lbl">等待稳定</div></div>
+        <div class="mover-stat"><div class="num"></div><div class="lbl">处理中</div></div>
+        <div class="mover-stat"><div class="num"></div><div class="lbl">已移动</div></div>
+      </div>
+      <div style="font-size:12px;color:var(--text2);margin-bottom:8px">
+        <div>来源: <code></code></div>
+        <div>目标: <code></code></div>
+        <div>服务状态: <span class="badge "></span></div>
+      </div>;
+    const ms=document.getElementById('mover-summary');
+    if(ms)ms.innerHTML=<div style="font-size:13px;color:var(--text2)">
+      <div>转存:  / </div>
+      <div>闭环:  已完成 ·  待处理 ·  失败</div>
+    </div>;
+  }catch(e){document.getElementById('mover-output').textContent=e.message}
+}
+
+// ── LLM Prompt ──
+async function loadLlmPrompt(){
+  try{
+    const d=await api('/api/llm-prompt');
+    document.getElementById('tab-llm').innerHTML=
+      <div class="field"><label>LLM 提示词</label>
+      <textarea id="llm-prompt" style="width:100%;min-height:200px;padding:12px;border:1.5px solid var(--border);border-radius:6px;font:13px/1.5 monospace;resize:vertical"></textarea></div>
+      <div class="btn-group">
+        <button class="btn btn-primary" onclick="saveLlmPrompt()">💾 保存提示词</button>
+        <button class="btn btn-outline" onclick="resetLlmPrompt()">↩ 恢复默认</button>
+      </div>;
+  }catch(e){}
+}
+async function saveLlmPrompt(){
+  try{
+    await api('/api/llm-prompt',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({prompt:document.getElementById('llm-prompt').value})});
+    toast('提示词已保存');
+  }catch(e){toast(e.message,'err')}
+}
+async function resetLlmPrompt(){
+  if(!confirm('确定恢复默认提示词？'))return;
+  try{await api('/api/llm-prompt/reset',{method:'POST'});toast('已恢复默认');loadLlmPrompt()}
+  catch(e){toast(e.message,'err')}
+}
+
+// ── Actions ──
+async function doAction(action){
+  const labels={'backup':'备份配置','compose-up':'启动全部服务','compose-down':'停止全部服务','clear-retry':'清空重试队列'};
+  if((action==='compose-down'||action==='clear-retry')&&!confirm('确定'+labels[action]+'？'))return;
+  try{
+    const d=await api('/api/action',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({action})});
+    toast(d.message||labels[action]+'完成');
+    refreshAll();
+  }catch(e){toast(e.message,'err')}
+}
+
+// ── Init ──
+(function init(){
+  const saved=localStorage.getItem('115_api_url');
+  if(saved){document.getElementById('login-url').value=saved;document.getElementById('api-url').value=saved}
+  document.getElementById('login-pwd').addEventListener('keydown',e=>{if(e.key==='Enter')doLogin()});
+  document.getElementById('api-url').addEventListener('keydown',e=>{if(e.key==='Enter')connect()});
+})();
+</script>
+</body>
+</html>
