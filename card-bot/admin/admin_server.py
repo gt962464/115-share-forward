@@ -32,6 +32,7 @@ ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "").strip()
 ADMIN_SECRET = os.getenv("ADMIN_SECRET", "").strip()
 CARD_ENV = PROJECT_DIR / ".env"
 MONITOR_ENV = PROJECT_DIR / "tg-monitor" / ".env"
+ROOT_ENV = PROJECT_DIR.parent / ".env"
 MOVER_CONTAINER = "cd2-mount-mover"
 MOVER_STATE_FILE = PROJECT_DIR / "cd2-mount-mover" / "state" / "state.json"
 MOVER_PIPELINE_DIR = PROJECT_DIR / "state" / "mount-pipeline-queue"
@@ -47,6 +48,7 @@ EDITABLE_CARD_KEYS = ["P115_SAVE_DIR", "TG_CHANNEL_ID", "TG_USER_ID", "TG_ALLOW_
 LLM_CARD_KEYS = ["LLM_API_BASE", "LLM_API_KEY", "LLM_MODEL"]
 LLM_PROMPT_FILE = DATA_DIR / "llm_prompt.json"
 EDITABLE_MONITOR_KEYS = ["TG_PHONE", "TG_SOURCE_CHAT", "TG_FORWARD_TO", "TG_PROXY", "TG_START_FROM", "TG_FORWARD_TIMEOUT", "TG_MONITOR_WEB_PORT", "TG_MONITOR_WEB_SECRET", "LOG_LEVEL"]
+EDITABLE_ROOT_KEYS = ["P115_COOKIE", "TG_BOT_TOKEN", "TG_CHANNEL_ID", "TG_USER_ID", "TG_ALLOW_CHATS", "TMDB_API_KEY", "TMDB_LANG", "LLM_API_BASE", "LLM_API_KEY", "LLM_MODEL", "TG_PROXY", "APP_HTTP_PROXY", "P115_SAVE_DIR", "LOG_LEVEL", "AUTO_PROCESS_115_LINKS", "AUTO_DELETE_AFTER", "RECYCLE_PASSWORD", "ADMIN_PASSWORD", "ADMIN_SECRET"]
 
 # 字段中文说明（大白话）
 FIELD_LABELS = {
@@ -570,7 +572,7 @@ async def me(request: web.Request):
 
 async def overview(request: web.Request):
     require_auth(request)
-    return web.json_response({"services": [service_status(name) for name in MANAGED_SERVICES], "card_env": redact(parse_env(CARD_ENV)), "monitor_env": redact(parse_env(MONITOR_ENV))})
+    return web.json_response({"services": [service_status(name) for name in MANAGED_SERVICES], "card_env": redact(parse_env(CARD_ENV)), "monitor_env": redact(parse_env(MONITOR_ENV)), "root_env": redact(parse_env(ROOT_ENV))})
 
 
 async def mount_mover(request: web.Request):
@@ -607,6 +609,8 @@ async def update_env(request: web.Request):
     elif kind == "monitor":
         write_env(MONITOR_ENV, updates, EDITABLE_MONITOR_KEYS)
         docker("restart", "tg-user-monitor")
+    elif kind == "root":
+        write_env(ROOT_ENV, updates, EDITABLE_ROOT_KEYS)
     else:
         raise web.HTTPNotFound(text="未知配置类型")
     if request.content_type == "application/x-www-form-urlencoded":

@@ -179,10 +179,12 @@ pre.json{background:#1a1d21;color:#d4d4d8;font:12px/1.5 "JetBrains Mono",ui-mono
           <div class="tab active" onclick="switchTab(this,'tab-card')">卡片机器人</div>
           <div class="tab" onclick="switchTab(this,'tab-monitor')">Telegram 监听</div>
           <div class="tab" onclick="switchTab(this,'tab-llm')">LLM 提示词</div>
+          <div class="tab" onclick="switchTab(this,'tab-env')">环境变量</div>
         </div>
         <div id="tab-card" class="tab-content active"></div>
         <div id="tab-monitor" class="tab-content"></div>
         <div id="tab-llm" class="tab-content"></div>
+        <div id="tab-env" class="tab-content"></div>
       </div>
 
       <!-- Logs -->
@@ -314,6 +316,7 @@ async function refreshServices(){
     renderServices(d.services);
     renderFields('tab-card',d.card_env,cardLabels);
     renderFields('tab-monitor',d.monitor_env,monitorLabels);
+    renderFields('tab-env',d.root_env||{},rootLabels);
   }catch(e){toast(e.message,'err')}
 }
 
@@ -333,20 +336,23 @@ function renderServices(services){
   document.getElementById('services').innerHTML=h||'<div style="color:var(--text3)">无数据</div>';
 }
 
-function renderFields(containerId, env, labels){
-  const el=document.getElementById(containerId);
-  const keys=Object.keys(labels);
-  el.innerHTML=keys.map(k=>{
-    const v=env[k]||'';
-    const isSecret=v==='********';
-    return <div class="field">
-      <label></label>
-      <input data-key="" type="" value="" placeholder="" >
-    </div>;
-  }).join('')+
-  <div class="btn-group"><button class="btn btn-primary" onclick="saveEnv('','')">💾 保存配置</button></div>;
+function renderFields(containerId, env, labels, kind){
+  if(!kind)kind=containerId==='tab-card'?'card':containerId==='tab-monitor'?'monitor':'root';
+  var el=document.getElementById(containerId);
+  var keys=Object.keys(labels);
+  el.innerHTML=keys.map(function(k){
+    var v=env[k]||'';
+    var isSecret=v==='********';
+    var req=(k==='P115_COOKIE'||k==='TG_BOT_TOKEN'||k==='TG_CHANNEL_ID');
+    var h='<div class="field"><label';
+    if(req)h+=' class="required"';
+    h+='>'+esc(labels[k])+'</label><input data-key="'+esc(k)+'" type="'+(isSecret?'password':'text')+'" value="'+(isSecret?'':esc(v))+'" placeholder="'+(isSecret?'保持不变':'请输入'+labels[k])+'" ';
+    if(isSecret)h+='data-secret="1" ';
+    h+='></div>';
+    return h;
+  }).join('')+'<div class="btn-group"><button class="btn btn-primary" onclick="saveBtn('+kind+','+containerId+')">保存配置</button></div>';
 }
-
+function saveBtn(kind,containerId){saveEnv(kind,containerId)}
 async function saveEnv(kind, containerId){
   const updates={};
   document.querySelectorAll('#'+containerId+' input').forEach(inp=>{
