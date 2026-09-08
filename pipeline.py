@@ -109,8 +109,12 @@ def parse_filename(name: str) -> dict:
         "title": name, "quality": "", "source": "",
         "encode": "", "episode": "", "year": "",
     }
-    # 去除常见后缀
-    clean = re.sub(r"\.(mkv|mp4|ts|m2ts|avi|mov|flv|wmv|rmvb|webm|m4v)$", "", name, flags=re.IGNORECASE)
+    # 去除常见视频后缀，title 用去掉扩展名的干净名
+    clean = re.sub(
+        r"\.(mkv|mp4|ts|m2ts|avi|mov|flv|wmv|rmvb|webm|m4v|mpg|mpeg|vob|3gp|f4v|rm|asf|divx)$",
+        "", name, flags=re.IGNORECASE,
+    )
+    result["title"] = clean
     # 画质
     q = re.search(r"(2160p|1080p|720p|480p|4K|UHD)", clean, re.IGNORECASE)
     if q:
@@ -193,6 +197,20 @@ VIDEO_EXTS = (
 )
 
 
+async def _walk_share_items(svc, share_url: str, payload) -> list:
+    """遍历分享全部条目。兼容不同版本 p115client：
+    旧版 share_iterdir_walk 吃 payload dict，新版直接吃链接字符串
+    （传 dict 会报 'dict' object has no attribute 'strip'）。"""
+    from p115client.tool import share_iterdir_walk
+    try:
+        return [it async for it in share_iterdir_walk(svc.client, payload, async_=True)]
+    except AttributeError as e:
+        if "strip" not in str(e):
+            raise
+        logger.info("p115client 为新版签名，改用链接字符串遍历分享")
+        return [it async for it in share_iterdir_walk(svc.client, share_url, async_=True)]
+
+
 async def fetch_share_video_files(share_url: str) -> tuple[list[str], str]:
     """列出分享中的视频文件名。返回 (视频列表, 诊断信息)。"""
     svc = await get_svc()
@@ -205,9 +223,8 @@ async def fetch_share_video_files(share_url: str) -> tuple[list[str], str]:
     samples = []
     try:
         from p115client.util import share_extract_payload
-        from p115client.tool import share_iterdir_walk
         payload = share_extract_payload(share_url)
-        async for item in share_iterdir_walk(svc.client, payload, async_=True):
+        for item in await _walk_share_items(svc, share_url, payload):
             # 115 分享条目：文件带 fid，目录带 cid
             is_dir = item.get("cid") is not None and item.get("fid") is None
             if is_dir:
@@ -291,10 +308,25 @@ async def process_link(
     if not video_names:
         return {"status": "error", "message": f"分享中没有视频文件（{scan_diag}）"}
     
-    # ── 3) 解析元数据 ──
+    # ── 3) 解析元数据（正则 → OpenAI+TMDB 辅助识别）──
     base_name = title_override or video_names[0] or top_name
     parsed = parse_filename(base_name)
     display_title = parsed["title"]
+    tmdb_id = None
+
+    _se = re.search(r"[Ss](\d{1,2})[Ee]\d{1,3}", base_name)
+    season = int(_se.group(1)) if _se else None
+    try:
+        from identifier import resolve_title
+        ident = await resolve_title(base_name, parsed["title"], parsed.get("year", ""), season)
+        if ident.get("title"):
+            display_title = ident["title"]
+            parsed["year"] = ident.get("year") or parsed.get("year", "")
+            tmdb_id = ident.get("tmdb_id")
+            if ident.get("source") not in (None, "regex"):
+                logger.info(f"🤖 识别({ident['source']}): {display_title!r} ({parsed.get('year')})")
+    except Exception as e:
+        logger.warning(f"OpenAI 识别失败，使用正则结果: {e}")
     
     logger.info(
         f"📋 处理: {display_title} | 画质: {parsed['quality']} | "
@@ -326,7 +358,7 @@ async def process_link(
         if on_progress:
             await on_progress(f"✏️ 重命名: {display_title}")
         try:
-            new_name = build_folder_name(display_title, parsed.get("year", ""))
+            new_name = build_folder_name(display_title, parsed.get("year", ""), tmdb_id)
             # 获取任务目录下的文件列表
             items = await _get_dir_items(svc, to_cid)
             if items:

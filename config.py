@@ -30,6 +30,10 @@ CONFIG_SCHEMA = {
     "APP_HTTP_PROXY":        ("",     "HTTP 代理", True),
     "TMDB_API_KEY":          ("",     "TMDB API Key", True),
     "TMDB_LANG":             ("zh-CN", "TMDB 语言", False),
+    "LLM_API_BASE":          ("https://apihub.agnes-ai.com/v1", "OpenAI 兼容 API Base", False),
+    "LLM_API_KEY":           ("",     "OpenAI API Key", True),
+    "LLM_MODEL":             ("agnes-2.5-flash", "OpenAI 模型", False),
+    "LLM_PROMPT":            ("",     "自定义识别提示词（空=内置默认）", False),
     "LOG_LEVEL":             ("INFO", "日志级别", False),
     "AUTO_RENAME":           ("1",    "自动重命名 0/1", False),
 }
@@ -129,7 +133,7 @@ def format_config_list() -> str:
         if sensitive and val:
             display = f"{val[:4]}***{val[-4:]}" if len(val) > 8 else "***"
         elif val:
-            display = val
+            display = val if len(val) <= 60 else val[:57] + "..."
         else:
             display = "(未设置)"
         lines.append(f"  {desc}: {display}")

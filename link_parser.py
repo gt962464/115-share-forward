@@ -1,7 +1,8 @@
 """
-115 分享链接提取与解析
+115 分享链接 + ed2k 链接提取与解析
 """
 import re
+import urllib.parse
 from urllib.parse import parse_qs, urlsplit
 
 
@@ -14,6 +15,10 @@ LINK_RE = re.compile(
 CTRL_RE = re.compile(r"[\u200b\u200c\u200d\u2066-\u2069\ufeff]")
 # 尾部多余字符
 TRAIL_RE = re.compile(r"[^A-Za-z0-9?=&:/._-]+$")
+# ed2k://|file|文件名|文件大小|哈希|/，文件名通常已 URL 编码
+ED2K_RE = re.compile(r"ed2k://\|file\|[^|\r\n]+\|\d+\|[A-Fa-f0-9]{32}\|/", re.I)
+# ed2k 尾部标点
+_ED2K_TAIL_RE = re.compile(r"[\s。，,；;！!？?#]+$")
 
 
 def extract_115_links(text: str, entities=None) -> list[dict]:
@@ -68,3 +73,36 @@ def _parse_115_url(url: str) -> dict | None:
 def parse_115_url(url: str) -> dict | None:
     """公开接口：解析单个 URL。"""
     return _parse_115_url(url)
+
+
+# ── ed2k 链接 ──
+
+def extract_ed2k_links(text: str) -> list[str]:
+    """从文本中提取 ed2k 链接（兼容 URL 编码形式）。"""
+    clean = CTRL_RE.sub("", text or "")
+    candidates = ED2K_RE.findall(clean)
+    for encoded in re.findall(r"ed2k://[^\s<>]+", clean, re.I):
+        decoded = urllib.parse.unquote(encoded)
+        if ED2K_RE.fullmatch(decoded):
+            candidates.append(decoded)
+    seen, out = set(), []
+    for u in candidates:
+        u = _ED2K_TAIL_RE.sub("", u)
+        if u and u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def parse_ed2k(url: str) -> dict:
+    """解析 ed2k 文件链接 → {url, name, size, hash}。不下载、不连 115。"""
+    url = urllib.parse.unquote(str(url or "").strip())
+    parts = url.split("|")
+    if len(parts) != 6 or parts[0].lower() != "ed2k://" or parts[1].lower() != "file":
+        raise ValueError("ed2k 链接格式不完整")
+    name = urllib.parse.unquote(parts[2])
+    size = int(parts[3])
+    file_hash = parts[4].upper()
+    if not name or size < 0 or not re.fullmatch(r"[A-F0-9]{32}", file_hash, re.I):
+        raise ValueError("ed2k 文件名、大小或哈希无效")
+    return {"url": url, "name": name, "size": size, "hash": file_hash}

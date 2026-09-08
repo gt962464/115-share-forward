@@ -4,6 +4,7 @@ FROM listeningltg/p115-share:latest
 RUN pip install --no-cache-dir \
     python-telegram-bot[job-queue] \
     telethon \
+    aiohttp \
     aiohttp-socks \
     python-dotenv
 
@@ -18,6 +19,7 @@ COPY link_parser.py /cardbot/link_parser.py
 COPY pipeline.py /cardbot/pipeline.py
 COPY notifier.py /cardbot/notifier.py
 COPY monitor.py /cardbot/monitor.py
+COPY identifier.py /cardbot/identifier.py
 
 WORKDIR /cardbot
 ENTRYPOINT []

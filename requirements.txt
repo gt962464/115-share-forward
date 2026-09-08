@@ -1,4 +1,5 @@
 python-telegram-bot[job-queue]>=20.0
 telethon>=1.28
+aiohttp>=3.9
 aiohttp-socks>=0.8
 python-dotenv>=1.0

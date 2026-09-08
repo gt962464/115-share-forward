@@ -17,7 +17,7 @@ from config import (
     set_config, get_config, format_config_list,
     CONFIG_SCHEMA,
 )
-from link_parser import extract_115_links
+from link_parser import extract_115_links, extract_ed2k_links, parse_ed2k
 from pipeline import process_link, format_size
 from monitor import get_monitor
 
@@ -76,9 +76,10 @@ def _main_menu() -> InlineKeyboardMarkup:
          InlineKeyboardButton("📝 查看日志", callback_data="menu_log")],
         [InlineKeyboardButton("⚙️ 查看配置", callback_data="menu_config"),
          InlineKeyboardButton("📋 可配置项", callback_data="menu_setlist")],
-        [InlineKeyboardButton("🛑 取消任务", callback_data="menu_cancel"),
+        [InlineKeyboardButton("🤖 OpenAI", callback_data="menu_openai"),
          InlineKeyboardButton("🔄 重启 Bot", callback_data="menu_restart")],
-        [InlineKeyboardButton("❓ 帮助", callback_data="menu_help")],
+        [InlineKeyboardButton("🛑 取消任务", callback_data="menu_cancel"),
+         InlineKeyboardButton("❓ 帮助", callback_data="menu_help")],
     ])
 
 
@@ -178,6 +179,36 @@ def _restart_confirm_menu() -> InlineKeyboardMarkup:
     ])
 
 
+def _openai_menu() -> InlineKeyboardMarkup:
+    """OpenAI 设置二级菜单：四项可编辑。"""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ API Base", callback_data="oa_set_LLM_API_BASE"),
+         InlineKeyboardButton("✏️ API Key", callback_data="oa_set_LLM_API_KEY")],
+        [InlineKeyboardButton("✏️ 模型", callback_data="oa_set_LLM_MODEL"),
+         InlineKeyboardButton("✏️ 提示词", callback_data="oa_set_LLM_PROMPT")],
+        [InlineKeyboardButton("🔙 返回主菜单", callback_data="menu_back")],
+    ])
+
+
+def _openai_text() -> str:
+    """OpenAI 设置概览。"""
+    base = os.getenv("LLM_API_BASE") or "https://apihub.agnes-ai.com/v1"
+    key = os.getenv("LLM_API_KEY", "").strip()
+    model = os.getenv("LLM_MODEL") or "agnes-2.5-flash"
+    prompt = os.getenv("LLM_PROMPT", "").strip()
+    key_disp = f"{key[:6]}***{key[-4:]}" if len(key) > 10 else ("已设置" if key else "（未设置）")
+    prompt_disp = (prompt[:60] + "…") if len(prompt) > 60 else (prompt or "（内置默认）")
+    return (
+        "🤖 OpenAI 辅助识别设置\n\n"
+        f"状态: {'✅ 已启用' if key else '⬜ 未配置 Key（走正则识别）'}\n"
+        f"API Base: {base}\n"
+        f"API Key: {key_disp}\n"
+        f"模型: {model}\n"
+        f"提示词: {prompt_disp}\n\n"
+        "点下面按钮后直接回复新值即可修改（立即生效，无需重启）。"
+    )
+
+
 # ══════════════════════════════════════════════
 #  公共文本构建（按钮与命令共用，避免重复）
 # ══════════════════════════════════════════════
@@ -198,7 +229,8 @@ def _help_text() -> str:
         "• /status 运行状态 · /log [N] 最近 N 条日志\n"
         "• /monitor 监听状态 / 增删目标 / 切模式\n"
         "• /restart 重启 Bot（主菜单也有按钮）\n\n"
-        "🔗 支持域名: 115.com / 115cdn.com / anxia.com\n"
+        "🔗 支持: 115.com / 115cdn.com / anxia.com 分享链接 + ed2k:// 链接\n"
+        "🤖 OpenAI 识别: 主菜单「🤖 OpenAI」可换 API/Key/模型/提示词\n"
         "📡 监听: Postedia_bot 等解锁机器人的消息"
     )
 
@@ -567,6 +599,30 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         request_cancel()
         await query.edit_message_text("🛑 已请求取消，进行中的步骤会尽快停止。", reply_markup=_back())
 
+    # ── OpenAI 设置（二级：四项可编辑 → 三级回复新值）──
+    elif data == "menu_openai":
+        if not _is_admin(user_id):
+            await query.edit_message_text("⛔ 仅管理员可配置 OpenAI", reply_markup=_back())
+            return
+        await query.edit_message_text(_openai_text(), reply_markup=_openai_menu())
+
+    elif data.startswith("oa_set_"):
+        if not _is_admin(user_id):
+            await query.edit_message_text("⛔ 仅管理员可配置 OpenAI", reply_markup=_back())
+            return
+        key = data[len("oa_set_"):]
+        context.user_data["pending_action"] = f"setcfg:{key}"
+        tips = {
+            "LLM_API_BASE": "请回复新的 API Base（如 https://api.openai.com/v1）：",
+            "LLM_API_KEY": "请回复新的 API Key（sk-...）：",
+            "LLM_MODEL": "请回复新的模型名（如 agnes-2.0-flash / gpt-4o-mini）：",
+            "LLM_PROMPT": "请回复新的提示词全文（支持多行）。\n回复「默认」两个字可恢复内置提示词。",
+        }
+        await query.edit_message_text(
+            f"✏️ 修改 {key}\n\n{tips.get(key, '请回复新值：')}",
+            reply_markup=_back(),
+        )
+
     # ── 重启 Bot（二级确认 → 三级执行）──
     elif data == "menu_restart":
         if not _is_admin(user_id):
@@ -639,7 +695,9 @@ async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     key = context.args[0].upper()
-    value = " ".join(context.args[1:])
+    # 用原始消息文本取值：保留多行（提示词等场景），避免 context.args 把换行吃掉
+    raw = (update.message.text or "").split(None, 2)
+    value = raw[2] if len(raw) >= 3 else " ".join(context.args[1:])
     result = set_config(key, value)
 
     # TG_API_* / 监听相关配置：到「监听管理 → 登录/启动监听」立即生效，无需重启
@@ -794,7 +852,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("✅ 已收到，正在验证...")
         return
 
-    # 1.5) 待处理的交互动作（添加监听目标）
+    # 1.5) 待处理的交互动作（添加监听目标 / 修改 OpenAI 配置）
     pending = context.user_data.get("pending_action")
     if pending == "add_target":
         context.user_data.pop("pending_action", None)
@@ -810,10 +868,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             result + "\n\n" + mon.status_text(), reply_markup=_monitor_menu(),
         )
         return
+    if pending and pending.startswith("setcfg:"):
+        context.user_data.pop("pending_action", None)
+        if not _is_admin(user_id):
+            await update.message.reply_text("⛔ 仅管理员可操作", reply_markup=_back())
+            return
+        key = pending[len("setcfg:"):]
+        value = text.strip()
+        if key == "LLM_PROMPT" and value in ("默认", "default"):
+            value = ""
+        result = set_config(key, value)
+        await update.message.reply_text(
+            f"{result}\n\n" + _openai_text(), reply_markup=_openai_menu(),
+        )
+        return
 
-    # 2) 提取链接
+    # 2) 提取链接（115 分享 + ed2k）
     links = extract_115_links(text, update.message.entities)
-    if not links:
+    ed2k_links = extract_ed2k_links(text)
+    if not links and not ed2k_links:
         return
 
     # 3) 提交权限检查
@@ -825,8 +898,56 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if ed2k_links:
+        await _handle_ed2k(update.message, ed2k_links)
     for link in links:
         await _handle_link(update.message, link["url"])
+
+
+async def _handle_ed2k(message, ed2k_links: list):
+    """ed2k 链接：解析 → OpenAI/TMDB 识别 → 卡片回复（不进 115 转存）。"""
+    import re as _re
+    from pipeline import parse_filename, format_size, VIDEO_EXTS
+    from identifier import resolve_title
+
+    items = []
+    for url in ed2k_links:
+        try:
+            items.append(parse_ed2k(url))
+        except Exception as e:
+            await message.reply_text(f"⚠️ ed2k 链接无效: {e}", reply_markup=_back())
+            return
+
+    # 用视频文件做识别基准（没有视频就用第一个文件）
+    videos = [it for it in items if it["name"].lower().endswith(VIDEO_EXTS)]
+    base = (videos or items)[0]
+    parsed = parse_filename(base["name"])
+    _se = _re.search(r"[Ss](\d{1,2})[Ee]\d{1,3}", base["name"])
+    season = int(_se.group(1)) if _se else None
+
+    status_msg = await message.reply_text(f"🔍 识别 ed2k 资源: {base['name'][:60]}...")
+    try:
+        ident = await resolve_title(base["name"], parsed["title"], parsed.get("year", ""), season)
+    except Exception as e:
+        logger.warning(f"ed2k 识别失败: {e}")
+        ident = {"title": parsed["title"], "year": parsed.get("year", ""), "tmdb_id": None}
+
+    total = sum(it["size"] for it in items)
+    title_line = f"🎬 {ident['title']}" + (f" ({ident['year']})" if ident.get("year") else "")
+    lines = [title_line]
+    if ident.get("tmdb_id"):
+        lines.append(f"🆔 tmdbid-{ident['tmdb_id']}")
+    lines.append(f"📦 {len(items)} 个文件 · 💾 {format_size(total)}")
+    for it in items[:10]:
+        lines.append(f"  • {it['name']} ({format_size(it['size'])})")
+    lines.append("")
+    lines.append("🔗 ed2k 链接（点击复制）:")
+    for it in items[:5]:
+        lines.append(it["url"])
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:4000] + "\n...(内容过长已截断)"
+    await status_msg.edit_text(text, reply_markup=_back())
 
 
 async def _handle_link(message, url: str):
