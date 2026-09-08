@@ -186,27 +186,48 @@ async def fetch_share_info(share_url: str) -> tuple[Optional[str], Optional[int]
     return None, None
 
 
-async def fetch_share_video_files(share_url: str) -> list[str]:
-    """列出分享中的视频文件名。"""
+VIDEO_EXTS = (
+    ".mkv", ".mp4", ".ts", ".m2ts", ".avi", ".mov", ".flv", ".wmv",
+    ".rmvb", ".webm", ".m4v", ".mpg", ".mpeg", ".vob", ".3gp", ".f4v",
+    ".rm", ".asf", ".divx",
+)
+
+
+async def fetch_share_video_files(share_url: str) -> tuple[list[str], str]:
+    """列出分享中的视频文件名。返回 (视频列表, 诊断信息)。"""
     svc = await get_svc()
     code, rc = _parse_share_url(share_url)
     if not code:
-        return []
-    
+        return [], "链接解析失败"
+
     videos = []
+    total_files = 0
+    samples = []
     try:
         from p115client.util import share_extract_payload
         from p115client.tool import share_iterdir_walk
         payload = share_extract_payload(share_url)
         async for item in share_iterdir_walk(svc.client, payload, async_=True):
+            # 115 分享条目：文件带 fid，目录带 cid
+            is_dir = item.get("cid") is not None and item.get("fid") is None
+            if is_dir:
+                continue
             name = item.get("n", "") or item.get("fn", "") or item.get("name", "")
-            is_video = any(name.lower().endswith(ext) for ext in
-                          (".mkv", ".mp4", ".ts", ".m2ts", ".avi", ".mov", ".flv", ".rmvb", ".webm", ".m4v"))
-            if is_video:
+            if not name:
+                continue
+            total_files += 1
+            if len(samples) < 3:
+                samples.append(name)
+            if name.lower().endswith(VIDEO_EXTS):
                 videos.append(name)
     except Exception as e:
         logger.warning(f"fetch_share_video_files 失败: {e}")
-    return videos
+        return [], f"扫描分享文件出错: {e}"
+
+    diag = f"共扫描到 {total_files} 个文件"
+    if samples:
+        diag += f"，示例: {' / '.join(samples)}"
+    return videos, diag
 
 
 async def _save_share_with_retry(svc, url: str, metadata: dict = None, max_retries: int = 3) -> dict:
@@ -266,9 +287,9 @@ async def process_link(
     if on_progress:
         await on_progress("📂 扫描文件列表...")
     
-    video_names = await fetch_share_video_files(url)
+    video_names, scan_diag = await fetch_share_video_files(url)
     if not video_names:
-        return {"status": "error", "message": "分享中没有视频文件"}
+        return {"status": "error", "message": f"分享中没有视频文件（{scan_diag}）"}
     
     # ── 3) 解析元数据 ──
     base_name = title_override or video_names[0] or top_name

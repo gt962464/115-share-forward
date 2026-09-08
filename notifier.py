@@ -2,6 +2,7 @@
 Telegram Bot API 交互器 - 全 InlineKeyboard 面板
 """
 import os
+import asyncio
 import logging
 from typing import Optional
 from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
@@ -76,7 +77,8 @@ def _main_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("⚙️ 查看配置", callback_data="menu_config"),
          InlineKeyboardButton("📋 可配置项", callback_data="menu_setlist")],
         [InlineKeyboardButton("🛑 取消任务", callback_data="menu_cancel"),
-         InlineKeyboardButton("❓ 帮助", callback_data="menu_help")],
+         InlineKeyboardButton("🔄 重启 Bot", callback_data="menu_restart")],
+        [InlineKeyboardButton("❓ 帮助", callback_data="menu_help")],
     ])
 
 
@@ -121,12 +123,13 @@ def _log_menu() -> InlineKeyboardMarkup:
 
 
 def _monitor_menu() -> InlineKeyboardMarkup:
-    """监听管理二级菜单：模式 / 刷新 / 增删目标。"""
+    """监听管理二级菜单：登录 / 模式 / 刷新 / 增删目标。"""
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔀 切换监听模式", callback_data="mon_mode"),
+        [InlineKeyboardButton("🔐 登录/启动监听", callback_data="mon_login"),
          InlineKeyboardButton("🔄 刷新状态", callback_data="mon_refresh")],
-        [InlineKeyboardButton("➕ 添加目标", callback_data="mon_add"),
-         InlineKeyboardButton("➖ 移除目标", callback_data="mon_remove")],
+        [InlineKeyboardButton("🔀 切换监听模式", callback_data="mon_mode"),
+         InlineKeyboardButton("➕ 添加目标", callback_data="mon_add")],
+        [InlineKeyboardButton("➖ 移除目标", callback_data="mon_remove")],
         [InlineKeyboardButton("🔙 返回主菜单", callback_data="menu_back")],
     ])
 
@@ -167,6 +170,14 @@ def _cancel_confirm_menu() -> InlineKeyboardMarkup:
     ])
 
 
+def _restart_confirm_menu() -> InlineKeyboardMarkup:
+    """重启 Bot 二级菜单：确认 + 返回。"""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ 确认重启", callback_data="restart_confirm"),
+         InlineKeyboardButton("🔙 返回主菜单", callback_data="menu_back")],
+    ])
+
+
 # ══════════════════════════════════════════════
 #  公共文本构建（按钮与命令共用，避免重复）
 # ══════════════════════════════════════════════
@@ -177,11 +188,16 @@ def _help_text() -> str:
         "📋 基本用法:\n"
         "• 直接发 115 链接 → 自动转存+重命名+生成永久链接\n"
         "• 也可以点「📥 提交链接」按钮\n\n"
+        "🔐 监听登录（全程 Bot 内完成）:\n"
+        "• /set TG_API_ID <id> 和 /set TG_API_HASH <hash>\n"
+        "• 点「📡 监听管理 → 🔐 登录/启动监听」\n"
+        "• 手机号/验证码/二步验证密码直接私聊回复即可\n\n"
         "⚙️ 配置管理:\n"
         "• 点「⚙️ 查看配置」查看当前配置\n"
         "• 用 /set <KEY> <VALUE> 修改配置\n"
         "• /status 运行状态 · /log [N] 最近 N 条日志\n"
-        "• /monitor 监听状态 / 增删目标 / 切模式\n\n"
+        "• /monitor 监听状态 / 增删目标 / 切模式\n"
+        "• /restart 重启 Bot（主菜单也有按钮）\n\n"
         "🔗 支持域名: 115.com / 115cdn.com / anxia.com\n"
         "📡 监听: Postedia_bot 等解锁机器人的消息"
     )
@@ -244,14 +260,107 @@ async def _render_monitor(query):
     monitor = get_monitor()
     if not monitor:
         await query.edit_message_text(
-            "📡 监听器未启用。\n需配置 TG_API_ID / TG_API_HASH / TG_MONITOR_TARGETS 后重启。",
-            reply_markup=_back(),
+            "📡 监听器未启用。\n\n"
+            "点「🔐 登录/启动监听」可直接在 Bot 内完成登录（无需重启）。\n"
+            "或配置 TG_API_ID / TG_API_HASH / TG_MONITOR_TARGETS 后重启。",
+            reply_markup=_monitor_menu(),
         )
         return
     await query.edit_message_text(
         monitor.status_text() + "\n\n点按钮管理监听目标 / 切换模式。",
         reply_markup=_monitor_menu(),
     )
+
+
+async def _auto_process_and_notify(chat_id: int, url: str, source_name: str):
+    """监听到链接后的自动转存 + 私聊通知（Bot 内启动监听时的回调）。"""
+    await send_private(chat_id, f"🔔 监听到新链接!\n来源: {source_name}\n🔗 {url[:80]}...\n⏳ 正在自动转存...")
+    try:
+        result = await process_link(url)
+        if result["status"] == "success":
+            text = (
+                f"✅ 自动转存成功!\n"
+                f"📺 {result.get('title', '')}\n"
+                f"🎨 {result.get('quality', '')}\n"
+                f"💾 {result.get('size', '')}\n"
+                f"🔗 {result['share_link']}"
+            )
+        elif result["status"] == "pending":
+            text = f"⏳ 转存中（审核中）: {result.get('message', '')}\n🔗 {result.get('share_link', url)}"
+        else:
+            text = f"❌ 自动转存失败: {result.get('message', '未知错误')}\n🔗 {url}"
+        await send_private(chat_id, text)
+    except Exception as e:
+        logger.error(f"自动转存异常: {e}")
+        await send_private(chat_id, f"❌ 自动转存异常: {e}\n🔗 {url}")
+
+
+async def _start_login_flow(query, user_id: int):
+    """从 Bot 内发起/继续 Telethon 登录（手机号/验证码/二步验证全部私聊完成）。"""
+    if not os.getenv("TG_API_ID") or not os.getenv("TG_API_HASH"):
+        await query.edit_message_text(
+            "🔐 登录 TG 监听账号\n\n"
+            "还缺少 TG_API_ID / TG_API_HASH，请先设置：\n"
+            "/set TG_API_ID 你的api_id\n"
+            "/set TG_API_HASH 你的api_hash\n\n"
+            "（在 my.telegram.org 申请）\n设置完再点本按钮，无需重启。",
+            reply_markup=_monitor_back_menu(),
+        )
+        return
+
+    monitor = get_monitor()
+
+    if monitor and monitor.is_running:
+        await query.edit_message_text(
+            "✅ 监听器已在运行，无需重复登录。\n\n" + monitor.status_text(),
+            reply_markup=_monitor_menu(),
+        )
+        return
+
+    login_task = getattr(monitor, "_login_task", None) if monitor else None
+    if login_task and not login_task.done():
+        await query.edit_message_text(
+            "⏳ 登录流程已在进行中。\n\n请按我的私聊提示，直接回复手机号/验证码/二步验证密码。",
+            reply_markup=_monitor_back_menu(),
+        )
+        return
+
+    async def on_login_prompt(prompt: str):
+        await send_private(user_id, prompt)
+
+    if monitor is None:
+        from monitor import Monitor, set_monitor
+
+        async def on_link_found(url: str, source_name: str, event):
+            logger.info(f"🔗 监听到 115 链接: {url[:60]}... (来源: {source_name})")
+            await _auto_process_and_notify(user_id, url, source_name)
+
+        try:
+            monitor = Monitor(on_link_found=on_link_found, on_login_prompt=on_login_prompt)
+        except Exception as e:
+            await query.edit_message_text(f"❌ 初始化监听器失败: {e}", reply_markup=_monitor_back_menu())
+            return
+        set_monitor(monitor)
+    else:
+        # 复用已有实例，登录提示发给本次点击的人
+        monitor.on_login_prompt = on_login_prompt
+
+    await query.edit_message_text(
+        "🔐 已发起登录流程。\n\n"
+        "接下来如果需要手机号 / 验证码 / 二步验证密码，我会发消息问你，**直接回复内容即可**。\n\n"
+        "完成后我会通知你。",
+        reply_markup=_monitor_back_menu(),
+    )
+
+    async def _run():
+        try:
+            await monitor.start()
+            await send_private(user_id, "✅ TG 监听账号登录成功，监听器已启动。\n\n" + monitor.status_text())
+        except Exception as e:
+            logger.error(f"登录流程失败: {e}")
+            await send_private(user_id, f"❌ 登录失败: {e}\n\n可到「📡 监听管理 → 🔐 登录/启动监听」重试。")
+
+    monitor._login_task = asyncio.create_task(_run())
 
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -338,6 +447,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("⛔ 仅管理员可操作", reply_markup=_back())
             return
         await _render_monitor(query)
+
+    # 三级：登录/启动监听（Bot 内完成手机号/验证码/二步验证）
+    elif data == "mon_login":
+        if not _is_admin(user_id):
+            await query.edit_message_text("⛔ 仅管理员可操作", reply_markup=_back())
+            return
+        await _start_login_flow(query, user_id)
 
     # 三级：切换监听模式
     elif data == "mon_mode":
@@ -451,6 +567,25 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         request_cancel()
         await query.edit_message_text("🛑 已请求取消，进行中的步骤会尽快停止。", reply_markup=_back())
 
+    # ── 重启 Bot（二级确认 → 三级执行）──
+    elif data == "menu_restart":
+        if not _is_admin(user_id):
+            await query.edit_message_text("⛔ 仅管理员可重启", reply_markup=_back())
+            return
+        await query.edit_message_text(
+            "🔄 重启 Bot\n\n确定要重启吗？\n\n进程退出后容器会自动拉起，几秒内恢复。",
+            reply_markup=_restart_confirm_menu(),
+        )
+
+    elif data == "restart_confirm":
+        if not _is_admin(user_id):
+            await query.edit_message_text("⛔ 仅管理员可重启", reply_markup=_back())
+            return
+        await query.edit_message_text("🔄 正在重启，几秒后恢复...\n\n恢复后发 /start 继续使用。")
+        logger.info("收到重启按钮指令，退出进程以触发容器重启")
+        import threading
+        threading.Timer(1.5, lambda: os._exit(0)).start()
+
     else:
         await query.edit_message_text("未知操作", reply_markup=_back())
 
@@ -507,8 +642,12 @@ async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
     value = " ".join(context.args[1:])
     result = set_config(key, value)
 
-    restart_keys = {"TG_BOT_TOKEN", "TG_API_ID", "TG_API_HASH", "TG_MONITOR_TARGETS"}
-    extra = "\n\n⚠️ 此配置需要重启 Bot 才能生效。" if key in restart_keys else ""
+    # TG_API_* / 监听相关配置：到「监听管理 → 登录/启动监听」立即生效，无需重启
+    extra = ""
+    if key == "TG_BOT_TOKEN":
+        extra = "\n\n⚠️ 此配置需要重启 Bot 才能生效（主菜单有 🔄 重启按钮）。"
+    elif key in ("TG_API_ID", "TG_API_HASH", "TG_PHONE", "TG_MONITOR_TARGETS", "TG_MONITOR_MODE"):
+        extra = "\n\n💡 无需重启：到「📡 监听管理 → 🔐 登录/启动监听」即可生效。"
 
     await update.message.reply_text(f"{result}{extra}", reply_markup=_back())
 
@@ -651,7 +790,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 1) 验证码/密码填入回路（监听器等待登录输入时，直接吃掉这条消息）
     monitor = get_monitor()
     if monitor and monitor.is_waiting_login:
-        if monitor.provide_login_input(text):
+        if _is_admin(user_id) and monitor.provide_login_input(text):
             await update.message.reply_text("✅ 已收到，正在验证...")
         return
 

@@ -15,11 +15,7 @@ from telethon.errors import (
     SessionPasswordNeededError, PasswordHashInvalidError,
 )
 
-from config import (
-    TG_API_ID, TG_API_HASH, TG_PHONE, TG_SESSION,
-    TG_PROXY, TG_MONITOR_TARGETS, TG_MONITOR_MODE,
-    set_config,
-)
+from config import TG_SESSION, set_config
 from link_parser import extract_115_links
 
 logger = logging.getLogger("monitor")
@@ -29,11 +25,12 @@ _MAX_PROCESSED = 5000
 
 
 def make_proxy():
-    """解析代理配置。"""
-    if not TG_PROXY:
+    """解析代理配置（动态读环境变量，/set 后新建客户端即可生效）。"""
+    proxy_url = os.getenv("TG_PROXY", "").strip()
+    if not proxy_url:
         return None
     from urllib.parse import urlparse
-    parsed = urlparse(TG_PROXY)
+    parsed = urlparse(proxy_url)
     scheme = parsed.scheme.lower()
     if scheme not in {"socks5", "socks4", "http"}:
         raise RuntimeError(f"不支持的代理协议: {scheme}")
@@ -62,16 +59,26 @@ class Monitor:
         当发现 115 链接时调用。
 
         on_login_prompt: async callback(prompt: str)
-        需要用户输入验证码/密码时调用（用于私聊 Bot 通知管理员）。
+        需要用户输入手机号/验证码/密码时调用（用于私聊 Bot 通知管理员）。
+
+        配置全部动态读环境变量：/set 之后新建 Monitor 即可生效，无需重启。
         """
-        self.client = TelegramClient(TG_SESSION, TG_API_ID, TG_API_HASH, proxy=make_proxy())
+        self.api_id = int(os.getenv("TG_API_ID") or "0")
+        self.api_hash = os.getenv("TG_API_HASH") or ""
+        self.phone = os.getenv("TG_PHONE", "").strip()
+        if not self.api_id or not self.api_hash:
+            raise RuntimeError("缺少 TG_API_ID / TG_API_HASH，请先 /set 配置")
+
+        self.client = TelegramClient(TG_SESSION, self.api_id, self.api_hash, proxy=make_proxy())
         self.on_link_found = on_link_found
         self.on_login_prompt = on_login_prompt
         self._running = False
 
-        # 运行时状态（初始值来自 config，热切换时更新并持久化回 .env）
-        self.targets: list = list(TG_MONITOR_TARGETS)
-        self.mode: str = TG_MONITOR_MODE
+        # 运行时状态（动态读当前环境变量，热切换时更新并持久化回 .env）
+        self.targets: list = [
+            v.strip() for v in os.getenv("TG_MONITOR_TARGETS", "").split(",") if v.strip()
+        ]
+        self.mode: str = (os.getenv("TG_MONITOR_MODE", "private").strip() or "private")
 
         # 去重（持久化到磁盘，重启不丢）
         self._processed_keys: set = self._load_processed()
@@ -114,8 +121,12 @@ class Monitor:
 
     # ── 启动与登录 ──
     async def start(self):
+        if self._running:
+            return
         logger.info("🚀 Telethon 监听器启动中...")
-        await self.client.start(phone=TG_PHONE)
+        # 用 connect() 而非 client.start(phone=...)：
+        # 后者在未授权时会走 telethon 内置的 input() 交互，Docker 里直接卡死
+        await self.client.connect()
 
         if not await self.client.is_user_authorized():
             logger.warning("⚠️ Telethon 未授权，进入登录流程")
@@ -129,18 +140,48 @@ class Monitor:
         logger.info(f"👀 开始监听 {len(self.targets)} 个目标（mode={self.mode}）")
 
     async def _login_flow(self):
-        if not TG_PHONE:
-            raise RuntimeError("需要 TG_PHONE 配置才能登录")
+        # 手机号也可以走 Bot 私聊输入，实现「完全在 Bot 内登录」
+        if not self.phone:
+            self.phone = (await self._ask(
+                "请输入 Telegram 手机号（带国家区号，如 +8613812345678）",
+                env_key="TG_PHONE", input_prompt="请输入手机号: ",
+            )).strip()
+            set_config("TG_PHONE", self.phone)
 
-        logger.info(f"📱 向 {TG_PHONE} 发送验证码...")
-        result = await self.client.send_code_request(TG_PHONE)
+        logger.info(f"📱 向 {self.phone} 发送验证码...")
+        result = await self.client.send_code_request(self.phone)
 
-        code = await self._ask("请输入登录验证码", env_key="TG_LOGIN_CODE", input_prompt="请输入验证码: ")
-        try:
-            await self.client.sign_in(TG_PHONE, code, phone_code_hash=result.phone_code_hash)
-        except SessionPasswordNeededError:
-            password = await self._ask("请输入二步验证密码", env_key="TG_LOGIN_PASSWORD", input_prompt="需要二步验证密码: ")
-            await self.client.sign_in(password=password)
+        # 验证码允许错 3 次；遇到二步验证再问密码
+        last_err = None
+        for attempt in range(3):
+            code = await self._ask(
+                f"请输入登录验证码（已发送到 {self.phone} 的 Telegram，请直接回复数字）",
+                # 环境变量只在第一次尝试用，避免拿过期验证码反复撞
+                env_key="TG_LOGIN_CODE" if attempt == 0 else "__NO_ENV__",
+                input_prompt="请输入验证码: ",
+            )
+            try:
+                await self.client.sign_in(
+                    self.phone, code, phone_code_hash=result.phone_code_hash,
+                )
+                last_err = None
+                break
+            except SessionPasswordNeededError:
+                password = await self._ask(
+                    "请输入二步验证密码",
+                    env_key="TG_LOGIN_PASSWORD" if attempt == 0 else "__NO_ENV__",
+                    input_prompt="需要二步验证密码: ",
+                )
+                await self.client.sign_in(password=password)
+                last_err = None
+                break
+            except PhoneCodeInvalidError as e:
+                last_err = e
+                logger.warning(f"⚠️ 验证码错误（{attempt + 1}/3）")
+                if self.on_login_prompt and attempt < 2:
+                    await self.on_login_prompt(f"⚠️ 验证码错误（{attempt + 1}/3），请重新回复正确的验证码。")
+        if last_err is not None:
+            raise RuntimeError("验证码多次错误，登录失败，请重新发起登录")
 
         logger.info("✅ 登录成功!")
 
@@ -313,3 +354,10 @@ class Monitor:
     @property
     def is_running(self) -> bool:
         return self._running
+
+    async def check_authorized(self) -> bool:
+        """当前是否已登录授权。"""
+        try:
+            return self.client.is_connected() and await self.client.is_user_authorized()
+        except Exception:
+            return False
