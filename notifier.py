@@ -1,12 +1,12 @@
 """
-Telegram Bot API 交互器 - 用户操作 + 配置管理 + 通知
+Telegram Bot API 交互器 - InlineKeyboard 面板 + 配置管理 + 通知
 """
 import os
 import logging
 from typing import Optional
-from telegram import Update, Bot
+from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     ContextTypes, filters,
 )
 from telegram.constants import ParseMode
@@ -61,90 +61,161 @@ def _is_admin(user_id: int) -> bool:
 
 
 # ══════════════════════════════════════════════
+#  主面板 (InlineKeyboard)
+# ══════════════════════════════════════════════
+
+def _main_menu_keyboard() -> InlineKeyboardMarkup:
+    """构建主菜单按钮面板。"""
+    keyboard = [
+        [InlineKeyboardButton("📥 提交链接", callback_data="menu_link")],
+        [InlineKeyboardButton("📊 运行状态", callback_data="menu_status")],
+        [InlineKeyboardButton("⚙️ 查看配置", callback_data="menu_config")],
+        [InlineKeyboardButton("📋 可配置项", callback_data="menu_setlist")],
+        [InlineKeyboardButton("📝 查看日志", callback_data="menu_log")],
+        [InlineKeyboardButton("❓ 帮助", callback_data="menu_help")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def _back_button() -> InlineKeyboardMarkup:
+    """返回主菜单按钮。"""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔙 返回主菜单", callback_data="menu_back")]
+    ])
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """主菜单面板。"""
+    text = (
+        "🤖 115 分享转存机器人\n\n"
+        "点选下面的功能按钮："
+    )
+    await update.message.reply_text(text, reply_markup=_main_menu_keyboard())
+
+
+# ══════════════════════════════════════════════
+#  Callback Handler（按钮点击）
+# ══════════════════════════════════════════════
+
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """处理所有 InlineKeyboard 按钮点击。"""
+    query = update.callback_query
+    await query.answer()  # 关闭加载动画
+
+    data = query.data
+
+    if data == "menu_back":
+        await query.edit_message_text(
+            "🤖 115 分享转存机器人\n\n点选下面的功能按钮：",
+            reply_markup=_main_menu_keyboard(),
+        )
+
+    elif data == "menu_help":
+        text = (
+            "📖 使用说明\n\n"
+            "📋 基本用法:\n"
+            "• 直接发 115 链接 → 自动转存+重命名+生成永久链接\n"
+            "• 也可以点「📥 提交链接」按钮\n\n"
+            "⚙️ 配置管理:\n"
+            "• 点「⚙️ 查看配置」查看当前配置\n"
+            "• 用 /set <KEY> <VALUE> 修改配置\n\n"
+            "🔗 支持域名: 115.com / 115cdn.com / anxia.com\n"
+            "📡 监听: Postedia_bot 等解锁机器人的消息"
+        )
+        await query.edit_message_text(text, reply_markup=_back_button())
+
+    elif data == "menu_status":
+        from pipeline import get_svc
+        from config import TG_MONITOR_TARGETS
+        try:
+            svc = await get_svc()
+            status = "✅ 正常" if svc and svc.client else "❌ 未连接"
+            busy = "繁忙" if svc and svc.is_busy else "空闲"
+        except Exception:
+            status = "❌ 初始化失败"
+            busy = "未知"
+
+        text = (
+            f"📊 运行状态\n\n"
+            f"115 客户端: {status}\n"
+            f"处理队列: {busy}\n"
+            f"监听目标: {len(TG_MONITOR_TARGETS)} 个\n"
+            f"输出频道: {TG_CHANNEL_ID or '未配置'}"
+        )
+        await query.edit_message_text(text, reply_markup=_back_button())
+
+    elif data == "menu_config":
+        text = format_config_list()
+        await query.edit_message_text(text, reply_markup=_back_button())
+
+    elif data == "menu_setlist":
+        if not _is_admin(query.from_user.id):
+            await query.edit_message_text(
+                "⛔ 仅管理员可查看配置项",
+                reply_markup=_back_button(),
+            )
+            return
+        lines = ["📋 可配置项:\n"]
+        for k, (default, desc, sensitive) in CONFIG_SCHEMA.items():
+            val = os.environ.get(k, default)
+            mark = "✅" if val else "⬜"
+            lines.append(f"{mark} {k} — {desc}")
+        lines.append("\n用法: /set <KEY> <VALUE>")
+        await query.edit_message_text("\n".join(lines), reply_markup=_back_button())
+
+    elif data == "menu_log":
+        from pathlib import Path
+        log_file = Path("/data/bot.log")
+        if not log_file.exists():
+            await query.edit_message_text("📝 暂无日志文件", reply_markup=_back_button())
+            return
+        try:
+            lines = log_file.read_text(encoding="utf-8").splitlines()
+            recent = lines[-20:]
+            text = f"📝 最近 {len(recent)} 条日志:\n\n" + "\n".join(recent)
+            if len(text) > 3800:
+                text = text[-3800:]
+            await query.edit_message_text(f"```\n{text}\n```", parse_mode=ParseMode.MARKDOWN, reply_markup=_back_button())
+        except Exception as e:
+            await query.edit_message_text(f"读取日志失败: {e}", reply_markup=_back_button())
+
+    elif data == "menu_link":
+        await query.edit_message_text(
+            "📥 提交 115 链接\n\n"
+            "请直接发送 115 分享链接给我：\n\n"
+            "支持格式:\n"
+            "• https://115.com/s/xxxxx\n"
+            "• https://115cdn.com/s/xxxxx?password=xxx\n\n"
+            "或者直接粘贴链接到对话框，我会自动识别。",
+            reply_markup=_back_button(),
+        )
+
+    else:
+        await query.edit_message_text("未知操作", reply_markup=_back_button())
+
+
+# ══════════════════════════════════════════════
 #  命令处理器
 # ══════════════════════════════════════════════
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "👋 115 分享转存机器人\n\n"
-        "📋 基本用法:\n"
-        "• 直接发 115 链接 → 自动转存+重命名+生成永久链接\n"
-        "• /link <url> → 手动提交链接\n"
-        "• /status → 运行状态\n"
-        "• /log [N] → 最近日志\n\n"
-        "⚙️ 配置管理:\n"
-        "• /config → 查看所有配置\n"
-        "• /set <KEY> <VALUE> → 修改配置\n"
-        "• /setlist → 可配置项列表\n\n"
-        "🔗 支持域名: 115.com / 115cdn.com / anxia.com"
-    )
-    await update.message.reply_text(text)
-
-
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await cmd_start(update, context)
-
-
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    from pipeline import get_svc
-    try:
-        svc = await get_svc()
-        status = "✅ 正常" if svc and svc.client else "❌ 未连接"
-        busy = "繁忙" if svc and svc.is_busy else "空闲"
-    except Exception:
-        status = "❌ 初始化失败"
-        busy = "未知"
-
-    from config import TG_MONITOR_TARGETS
-    text = (
-        f"📊 运行状态\n\n"
-        f"115 客户端: {status}\n"
-        f"处理队列: {busy}\n"
-        f"监听目标: {len(TG_MONITOR_TARGETS)} 个\n"
-        f"输出频道: {TG_CHANNEL_ID or '未配置'}"
-    )
-    await update.message.reply_text(text)
-
-
-async def cmd_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    from pathlib import Path
-    log_file = Path("/data/bot.log")
-    if not log_file.exists():
-        await update.message.reply_text("📝 暂无日志文件")
-        return
-    try:
-        args = context.args or []
-        n = int(args[0]) if args else 20
-        n = min(n, 50)
-        lines = log_file.read_text(encoding="utf-8").splitlines()
-        recent = lines[-n:]
-        text = f"📝 最近 {len(recent)} 条日志:\n\n" + "\n".join(recent)
-        if len(text) > 4000:
-            text = text[-4000:]
-        await update.message.reply_text(f"```\n{text}\n```", parse_mode=ParseMode.MARKDOWN)
-    except Exception as e:
-        await update.message.reply_text(f"读取日志失败: {e}")
-
-
 async def cmd_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("用法: /link <115分享链接>")
+        await update.message.reply_text(
+            "用法: /link <115分享链接>",
+            reply_markup=_back_button(),
+        )
         return
     url = context.args[0]
     await _handle_link(update.message, url)
 
 
-# ══════════════════════════════════════════════
-#  配置管理命令
-# ══════════════════════════════════════════════
-
 async def cmd_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """查看所有配置。"""
+    """查看配置（命令方式，带面板）。"""
     if not _is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ 仅管理员可使用此命令")
         return
     text = format_config_list()
-    await update.message.reply_text(text)
+    await update.message.reply_text(text, reply_markup=_back_button())
 
 
 async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -161,7 +232,8 @@ async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "  /set TG_CHANNEL_ID -1001234567890\n"
             "  /set TG_MONITOR_TARGETS postedia_bot,OtherBot\n"
             "  /set AUTO_RENAME 0\n\n"
-            "发送 /setlist 查看所有可配置项"
+            "发送 /setlist 或点「📋 可配置项」查看所有配置",
+            reply_markup=_back_button(),
         )
         return
 
@@ -169,12 +241,11 @@ async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
     value = " ".join(context.args[1:])
 
     result = set_config(key, value)
-    await update.message.reply_text(result)
+    await update.message.reply_text(result, reply_markup=_back_button())
 
-    # 如果改了关键配置，提醒重启
     restart_keys = {"TG_BOT_TOKEN", "TG_API_ID", "TG_API_HASH", "TG_MONITOR_TARGETS"}
     if key in restart_keys:
-        await update.message.reply_text("⚠️ 此配置需要重启 Bot 才能生效。\n发送 /restart 重启。")
+        await update.message.reply_text("⚠️ 此配置需要重启 Bot 才能生效。")
 
 
 async def cmd_setlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -182,14 +253,13 @@ async def cmd_setlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ 仅管理员可使用此命令")
         return
-
     lines = ["📋 可配置项:\n"]
     for k, (default, desc, sensitive) in CONFIG_SCHEMA.items():
         val = os.environ.get(k, default)
         mark = "✅" if val else "⬜"
         lines.append(f"{mark} {k} — {desc}")
     lines.append("\n用法: /set <KEY> <VALUE>")
-    await update.message.reply_text("\n".join(lines))
+    await update.message.reply_text("\n".join(lines), reply_markup=_back_button())
 
 
 # ══════════════════════════════════════════════
@@ -233,7 +303,6 @@ async def _handle_link(message, url: str):
         parts.append(f"🔗 永久分享: {share_link}")
         await status_msg.edit_text("\n".join(parts))
 
-        # 发送到频道
         if TG_CHANNEL_ID:
             ch = f"📺 {title} [{quality}]\n💾 {size}\n🔗 {share_link}" if quality else f"📺 {title}\n🔗 {share_link}"
             await send_channel(ch)
@@ -257,21 +326,18 @@ def setup_bot() -> Application:
 
     app = Application.builder().token(TG_BOT_TOKEN).build()
 
-    # 基本命令
+    # 命令
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("log", cmd_log))
     app.add_handler(CommandHandler("link", cmd_link))
-
-    # 配置管理
     app.add_handler(CommandHandler("config", cmd_config))
     app.add_handler(CommandHandler("set", cmd_set))
     app.add_handler(CommandHandler("setlist", cmd_setlist))
+
+    # InlineKeyboard 按钮点击
+    app.add_handler(CallbackQueryHandler(callback_handler))
 
     # 自动识别 115 链接
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     _app = app
     return app
-
