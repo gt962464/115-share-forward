@@ -46,8 +46,235 @@ from config import (
 logger = logging.getLogger("pipeline")
 
 
-# ── 取消机制 ──
-_cancel_flag = False
+VIDEO_EXTS = (".mkv", ".mp4", ".ts", ".m2ts", ".avi", ".mov", ".flv", ".wmv", ".rmvb", ".webm", ".m4v")
+
+
+def video_ext(name: str) -> str:
+    """返回视频文件扩展名（小写），不是视频文件返回 ''。"""
+    n = str(name or "").lower()
+    for e in VIDEO_EXTS:
+        if n.endswith(e):
+            return e
+    return ""
+
+
+def extract_episode(name: str):
+    """从文件名提取 (season, ep)，拿不到返回 None。"""
+    m = re.search(r"[Ss](\d{1,2})[.\s_-]?[Ee](\d{1,3})", name)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    m = re.search(r"(?:^|[.\s_-])[Ee](\d{1,3})", name)
+    if m:
+        return 1, int(m.group(1))
+    return None
+
+
+def extract_hdr(name: str) -> str:
+    """提取 HDR/DV 标记（排除视频编码 H.264/H.265）。"""
+    toks = re.findall(r"\b(DV|HDR10\+?|HDR)\b", name, re.I)
+    out = []
+    for t in toks:
+        t = t.upper()
+        if t in ("DV", "HDR", "HDR10", "HDR10+") and t not in out:
+            out.append(t)
+    return ".".join(out)
+
+
+# 分享根名里可能的 TMDB id 标记：如 "Z 遮天{tmdbid-224839}." / "xxx{tmdb:123456}"
+_TMDBID_MARKER_RE = re.compile(r"\{\s*tmdb[-_]?id\s*[-:]\s*(\d{3,8})\s*\}", re.I)
+
+
+def parse_tmdbid_marker(name: str):
+    """从分享根名/标题提取 {tmdbid-XXXX} 标记里的 TMDB id，拿不到返回 None。"""
+    if not name:
+        return None
+    m = _TMDBID_MARKER_RE.search(name)
+    return int(m.group(1)) if m else None
+
+
+VIDEO_CODEC_RE = re.compile(
+    r"\b(H\.26[45]|HEVC|AVC|x26[45]|AV1|VC-?1|MPEG-?[24]|XviD|DivX)\b", re.I)
+
+
+def extract_video_codec(name: str) -> str:
+    """仅提取视频编码（H.265/H.264/x265/x264/HEVC/AV1…），排除音频编码。"""
+    m = VIDEO_CODEC_RE.search(name)
+    return m.group(1).upper() if m else ""
+
+
+def build_canonical_name(title_cn, season, ep_start, ep_end, year, quality,
+                         source, audio, hdr, encode, ext="", suffix=""):
+    """规范命名：{中文标题}.S{季}E{集}.{年}.{画质}.{源}.{音频}.{HDR}.{视频编码}[-suffix].{ext}"""
+    season_tag = ""
+    if season is not None:
+        season_tag = f"S{season:02d}"
+        if ep_end:
+            season_tag += f"E{ep_start:02d}-E{ep_end:02d}"
+        elif ep_start:
+            season_tag += f"E{ep_start:02d}"
+    parts = [title_cn]
+    if season_tag:
+        parts.append(season_tag)
+    if year:
+        parts.append(str(year))
+    if quality:
+        parts.append(quality)
+    if source:
+        parts.append(source)
+    if audio:
+        parts.append(audio)
+    if hdr:
+        parts.append(hdr)
+    if encode:
+        parts.append(encode)
+    name = ".".join(p for p in parts if p)
+    if suffix:
+        name += f"-{suffix}"
+    if ext:
+        name += ext if ext.startswith(".") else "." + ext
+    return name
+
+
+QUALITY_RE = re.compile(r"(2160p|1440p|1080p|720p|480p|4k|2160P|1080P)", re.I)
+SOURCE_RE = re.compile(r"(WEB[- ]?DL|WEBRip|BluRay|BDRip|HDTV|REMUX|HDRip|DVDRip|HDrip)", re.I)
+EP_RE = re.compile(r"(?:S(\d{1,2})E(\d{1,3})(?:[-~]?E?(\d{1,3}))?)|(?:第\s*(\d{1,3})\s*集)|(?:E(\d{1,3})(?:[-~]?E?(\d{1,3}))?)", re.I)
+ENC_RE = re.compile(r"\b(x264|x265|HEVC|H\.264|H\.265|AVC|AV1)\b", re.I)
+CLEAN_RE = re.compile(r"[\[\]【】()（）{}（）]|（[^）]*）|\[[^\]]*\]|【[^】]*】")
+AUDIO_RE = re.compile(r"(DDP\d+(?:\.\d+)?|DTS\d+(?:\.\d+)?|TrueHD|Atmos|AC3|AAC\d?|FLAC|LPCM)", re.I)
+
+
+def infer_audio_codec(video_names):
+    """从真实视频文件名提取音频编码（取出现次数最多的）。"""
+    cnt = {}
+    for fn in video_names:
+        m = AUDIO_RE.search(fn)
+        if m:
+            k = m.group(1).upper()
+            cnt[k] = cnt.get(k, 0) + 1
+    if not cnt:
+        return ""
+    return max(cnt, key=cnt.get)
+
+
+async def _rename_video_tree(svc, folder_id, title_cn, year, tmdb_id, suffix="Cxuan"):
+    """递归重命名目录树中的全部视频；保留 Season 等原有子目录名。"""
+    ok = fail = total = 0
+    sub = await _get_dir_items(svc, folder_id)
+    sub = list({str(x["id"]): x for x in sub}.values())
+    vids = [x for x in sub if not x.get("is_dir") and video_ext(x["name"])]
+    child_dirs = [x for x in sub if x.get("is_dir")]
+    if vids:
+        v0 = parse_filename(vids[0]["name"])
+        quality = v0.get("quality") or ""
+        source = v0.get("source") or ""
+        encode = extract_video_codec(vids[0]["name"])
+        audio = infer_audio_codec([x["name"] for x in vids])
+        hdr = extract_hdr(vids[0]["name"])
+        used = set()
+        jobs = []
+        for v in vids:
+            e = extract_episode(v["name"])
+            if e:
+                season, ep = e
+                new_name = build_canonical_name(
+                    title_cn, season, ep, None, year, quality, source, audio, hdr, encode,
+                    ext=video_ext(v["name"]), suffix=suffix,
+                )
+            else:
+                new_name = build_canonical_name(
+                    title_cn, None, None, None, year, quality, source, audio, hdr, encode,
+                    ext=video_ext(v["name"]), suffix=suffix,
+                )
+            if new_name in used:
+                stem, ext = os.path.splitext(new_name)
+                new_name = f"{stem}-{len(used) + 1}{ext}"
+            used.add(new_name)
+            jobs.append((v["id"], new_name))
+        for fid, new_name in jobs:
+            total += 1
+            try:
+                r = await svc.client.fs_rename((fid, new_name), async_=True)
+                if isinstance(r, dict) and r.get("state") is False:
+                    fail += 1
+                    logger.warning(f"⚠️ 重命名失败 {fid} -> {new_name}: {r.get('error') or r.get('message')}")
+                else:
+                    ok += 1
+            except Exception as ex:
+                fail += 1
+                logger.warning(f"⚠️ 重命名异常 {fid} -> {new_name}: {ex}")
+            await asyncio.sleep(0.12)
+    for child in child_dirs:
+        c_ok, c_fail, c_total = await _rename_video_tree(
+            svc, child["id"], title_cn, year, tmdb_id, suffix=suffix,
+        )
+        ok += c_ok
+        fail += c_fail
+        total += c_total
+    return ok, fail, total
+
+
+async def _rename_saved(svc, to_cid, title_cn: str, year: str, tmdb_id, suffix: str = "Cxuan",
+                        expected_video_count: int = 0):
+    """对已转存到 to_cid 的目录树做规范重命名：顶层文件夹 + 每个视频文件。
+
+    文件夹命名：`{名字} ({年}) (tmdb-{id})`
+    单集命名：保留全部技术元数据 + `-{suffix}` 后缀
+                 e.g. `九门.S01E01.2026.2160P.WEB-DL.DTS5.1.DV.H.265-Cxuan.mp4`
+    电影/无集数：`{名字}.{年}.{画质}.{源}.{音频}.{HDR}.{编码}-Cxuan.mkv`（不带 S/E）
+
+    若分享根没有文件夹（如单文件电影），自动建规范文件夹并把文件移入，
+    返回 (ok, fail, total, new_cid)，new_cid 非空表示新建了文件夹。
+    """
+    ok = fail = total = 0
+    new_cid = None
+    try:
+        top = await _get_dir_items(svc, to_cid)
+        top = list({str(x["id"]): x for x in top}.values())
+        dirs = [it for it in top if it.get("is_dir")]
+        files = [it for it in top if not it.get("is_dir")]
+        if not dirs and files:
+            folder_name = build_folder_name(title_cn, year, tmdb_id)
+            try:
+                mk = await svc.client.fs_mkdir(folder_name, to_cid, async_=True)
+                if isinstance(mk, dict):
+                    new_cid = int(mk.get("cid") or (mk.get("data") or {}).get("cid") or 0)
+                if new_cid:
+                    await svc.client.fs_move([f["id"] for f in files], new_cid, async_=True)
+                    logger.info(f"📁 分享根无文件夹，已自动创建并移入: {folder_name} (CID: {new_cid}, {len(files)} 个文件)")
+                    top = [{"id": new_cid, "name": folder_name, "is_dir": True}]
+                else:
+                    logger.warning(f"⚠️ 自动建文件夹失败，跳过移动: {mk}")
+            except Exception as e:
+                logger.warning(f"⚠️ 自动建文件夹异常（不影响后续）: {e}")
+        for it in top:
+            if not it.get("is_dir"):
+                continue
+            folder_id = it["id"]
+            folder_raw = it["name"]
+            fp = parse_filename(folder_raw)
+            folder_name = build_folder_name(title_cn, year, tmdb_id)
+            total += 1
+            try:
+                r = await svc.client.fs_rename((folder_id, folder_name), async_=True)
+                if isinstance(r, dict) and r.get("state") is False:
+                    fail += 1
+                    logger.warning(f"⚠️ 重命名失败 {folder_id} -> {folder_name}: {r.get('error') or r.get('message')}")
+                else:
+                    ok += 1
+            except Exception as ex:
+                fail += 1
+                logger.warning(f"⚠️ 重命名异常 {folder_id} -> {folder_name}: {ex}")
+            v_ok, v_fail, v_total = await _rename_video_tree(
+                svc, folder_id, title_cn, year, tmdb_id, suffix=suffix,
+            )
+            ok += v_ok
+            fail += v_fail
+            total += v_total
+    except Exception as e:
+        logger.warning(f"⚠️ 重命名流程异常（不影响分享）: {e}")
+    if total:
+        logger.info(f"✅ 重命名完成：成功 {ok} 项，失败 {fail} 项（共 {total} 项）")
+    return ok, fail, total, new_cid
 
 
 def request_cancel():
@@ -122,51 +349,76 @@ def format_size(size_bytes: int) -> str:
 
 
 def parse_filename(name: str) -> dict:
-    """从文件名解析标题、画质、编码、集数等信息。"""
-    result = {
-        "title": name, "quality": "", "source": "",
-        "encode": "", "episode": "", "year": "",
+    """从文件名/标题提取 画质 / 视频源 / 集数 / 编码 / 干净标题。"""
+    base = name
+    ext = video_ext(name)
+    if ext:
+        base = name[:-len(ext)]
+    quality = QUALITY_RE.search(base)
+    source = SOURCE_RE.search(base)
+    enc = ENC_RE.search(base)
+    quality = quality.group(1).upper() if quality else ""
+    source = source.group(1).replace(" ", "-").upper() if source else ""
+    enc = enc.group(1).upper() if enc else ""
+
+    ep_text = ""
+    m = EP_RE.search(base)
+    if m:
+        if m.group(1):  # S01E01
+            s, e1, e2 = m.group(1), m.group(2), m.group(3)
+            ep_text = f"S{int(s):02d}E{int(e1):02d}" + (f"-E{int(e2):02d}" if e2 else "")
+        elif m.group(4):  # 第xx集
+            ep_text = f"第{m.group(4)}集"
+        elif m.group(5):  # E01
+            e1, e2 = m.group(5), m.group(6)
+            ep_text = f"E{int(e1):02d}" + (f"-E{int(e2):02d}" if e2 else "")
+
+    # 干净标题：取画质/集数/编码之前的部分
+    cut = len(base)
+    for rgx in (QUALITY_RE, EP_RE, SOURCE_RE, ENC_RE):
+        mm = rgx.search(base)
+        if mm and mm.start() < cut:
+            cut = mm.start()
+    title_raw = base[:cut]
+    title_raw = CLEAN_RE.sub(" ", title_raw)
+    title_raw = re.sub(r"[-_.\s]+", " ", title_raw).strip(" -_.")
+    # 反复剥离尾部季标签和年份：如 `Blood.Sacrifice.2026.S01`
+    for _ in range(3):
+        before = title_raw
+        title_raw = re.sub(
+            r"[\s._-]*S\d{1,2}(?:-S?\d{1,2})?$", "", title_raw, flags=re.I
+        ).strip(" -_.")
+        title_raw = re.sub(
+            r"[\s._-]*[(（]?(19\d{2}|20\d{2})[)）]?[\s._-]*$", "", title_raw
+        ).strip(" -_.")
+        if title_raw == before:
+            break
+    # 年份：从去掉扩展名的文件名提取 4 位年份（排除 1080P/2160P 等干扰）
+    ym = re.search(r"(?<![A-Za-z0-9])(19\d{2}|20\d{2})(?![\dpPiI])", base)
+    year = ym.group(1) if ym else ""
+    # 提取 {tmbid-xxx}
+    tid = re.search(r"\{tmbid-(\d+)\}", base, re.IGNORECASE)
+    tmdb_id = int(tid.group(1)) if tid else None
+    return {
+        "title": title_raw or name,
+        "quality": quality,
+        "source": source,
+        "encode": enc,
+        "episode": ep_text,
+        "year": year,
+        "tmdb_id": tmdb_id,
     }
-    # 去除常见视频后缀，title 用去掉扩展名的干净名
-    clean = re.sub(
-        r"\.(mkv|mp4|ts|m2ts|avi|mov|flv|wmv|rmvb|webm|m4v|mpg|mpeg|vob|3gp|f4v|rm|asf|divx)$",
-        "", name, flags=re.IGNORECASE,
-    )
-    result["title"] = clean
-    # 画质
-    q = re.search(r"(2160p|1080p|720p|480p|4K|UHD)", clean, re.IGNORECASE)
-    if q:
-        result["quality"] = q.group(1).upper()
-    # 编码
-    e = re.search(r"(REMUX|BluRay|WEB-?DL|WEB-?RIP|HDTV|DVDRip|BDRip)", clean, re.IGNORECASE)
-    if e:
-        result["source"] = e.group(1)
-    # 音频
-    a = re.search(r"(DTS|TrueHD|ATMOS|DDP?5\.1|AAC|FLAC|DTS-HD)", clean, re.IGNORECASE)
-    if a:
-        result["encode"] = a.group(1)
-    # 集数
-    ep = re.search(r"(?:S\d{1,2})?E(\d{1,3})(?:[-–]E?(\d{1,3}))?", clean, re.IGNORECASE)
-    if ep:
-        result["episode"] = ep.group(0)
-    # 年份
-    yr = re.search(r"[\.\s](\d{4})[\.\s]", clean)
-    if yr:
-        result["year"] = yr.group(1)
-    # 提取 {tmbid-xxx}（文件名里已包含 TMDB ID）
-    tid = re.search(r"\{tmbid-(\d+)\}", clean, re.IGNORECASE)
-    if tid:
-        result["tmdb_id"] = int(tid.group(1))
-    return result
 
 
-def build_folder_name(title_cn: str, year: str, tmdb_id=None) -> str:
-    """构建重命名后的文件夹名。"""
-    parts = [title_cn]
+def build_folder_name(title_cn, year, tmdb_id):
+    """顶层文件夹名：`{名字} ({年}) (tmdb-{id})`，缺字段时容错。"""
+    parts = []
+    if title_cn:
+        parts.append(title_cn)
     if year:
-        parts[0] = f"{title_cn} ({year})"
+        parts.append(f"({year})")
     if tmdb_id:
-        parts.append(f"[tmdbid-{tmdb_id}]")
+        parts.append(f"(tmdb-{tmdb_id})")
     return " ".join(parts)
 
 
@@ -210,13 +462,6 @@ async def fetch_share_info(share_url: str) -> tuple[Optional[str], Optional[int]
         except Exception as e:
             logger.warning(f"fetch_share_info ({fn_name}) 失败: {e}")
     return None, None
-
-
-VIDEO_EXTS = (
-    ".mkv", ".mp4", ".ts", ".m2ts", ".avi", ".mov", ".flv", ".wmv",
-    ".rmvb", ".webm", ".m4v", ".mpg", ".mpeg", ".vob", ".3gp", ".f4v",
-    ".rm", ".asf", ".divx",
-)
 
 
 async def _walk_share_items(svc, share_url: str, receive_code: str = "") -> list:
@@ -383,18 +628,20 @@ async def process_link(
     if not to_cid:
         return {"status": "error", "message": "转存成功但未返回目标目录"}
     
-    # ── 5) 重命名 ──
+    # ── 5) 重命名：对齐 zip 版逻辑（顶层文件夹 + 每个视频文件）──
     if AUTO_RENAME:
         if on_progress:
             await on_progress(f"✏️ 重命名: {display_title}")
         try:
-            new_name = build_folder_name(display_title, parsed.get("year", ""), tmdb_id)
-            # 获取任务目录下的文件列表
-            items = await _get_dir_items(svc, to_cid)
-            if items:
-                # 重命名顶层目录
-                await svc.client.fs_rename(to_cid, new_name, async_=True)
-                logger.info(f"✅ 已重命名目录: {new_name}")
+            _, _, _, new_cid = await _rename_saved(
+                svc, to_cid, display_title, parsed.get("year", ""), tmdb_id,
+                expected_video_count=len(video_names),
+            )
+            # 分享根无文件夹时，_rename_saved 已自动创建规范文件夹
+            if new_cid:
+                save_res = dict(save_res)
+                save_res["names"] = [build_folder_name(display_title, parsed.get("year", ""), tmdb_id)]
+                to_cid = new_cid
         except Exception as e:
             logger.warning(f"重命名失败（不影响分享）: {e}")
     
@@ -452,30 +699,29 @@ async def _get_dir_items(svc, cid: int) -> list:
 
 
 async def _wait_share_audit(svc, share_url: str, timeout: int = None) -> bool:
-    """等待分享审核完成。"""
+    """等待分享审核完成。返回 True=审核通过可发布，False=超时/失效/违规。"""
     timeout = timeout or SHARE_AUDIT_WAIT_TIMEOUT
-    code, rc = _parse_share_url(share_url)
-    if not code:
-        return False
-
     start = time.time()
     while time.time() - start < timeout:
         if is_cancelled():
             return False
         try:
-            resp = await svc.client.share_snap_app(
-                {"share_code": code, "receive_code": rc or "", "cid": 0, "limit": 10, "offset": 0},
-                async_=True,
-            )
-            data = (resp or {}).get("data", {})
-            info = data.get("shareinfo", data.get("share_info", {}))
-            state = info.get("share_state", info.get("status"))
-            if state == 1:
+            status = await svc.get_share_status(share_url)
+            if status is None:
+                await asyncio.sleep(SHARE_AUDIT_POLL_INTERVAL)
+                continue
+            if status.get("is_expired"):
+                logger.warning(f"❌ 分享已失效: {share_url}")
+                return False
+            if status.get("is_prohibited"):
+                logger.warning(f"❌ 分享违规未通过: {share_url}")
+                return False
+            if not status.get("is_pending"):
+                logger.info(f"✅ 115 分享审核完成，允许推送: {share_url}")
                 return True
-            if state == 7:
-                return False  # 过期
-        except Exception:
-            pass
+            logger.info(f"⏳ 115 分享仍在系统处理中...")
+        except Exception as e:
+            logger.warning(f"⚠️ 审核状态查询异常: {e}")
         await asyncio.sleep(SHARE_AUDIT_POLL_INTERVAL)
     return False
 
