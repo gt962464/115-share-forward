@@ -86,10 +86,84 @@ def _back() -> InlineKeyboardMarkup:
     ])
 
 
-def _back_and_help() -> InlineKeyboardMarkup:
-    """返回主菜单 + 帮助 按钮。"""
+def _status_menu() -> InlineKeyboardMarkup:
+    """运行状态二级菜单：刷新 + 返回。"""
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 刷新状态", callback_data="status_refresh")],
         [InlineKeyboardButton("🔙 返回主菜单", callback_data="menu_back")],
+    ])
+
+
+def _config_menu() -> InlineKeyboardMarkup:
+    """查看配置二级菜单：跳转可配置项 + 返回。"""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📋 查看可配置项", callback_data="menu_setlist")],
+        [InlineKeyboardButton("🔙 返回主菜单", callback_data="menu_back")],
+    ])
+
+
+def _setlist_menu() -> InlineKeyboardMarkup:
+    """可配置项二级菜单：跳转当前配置 + 返回。"""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚙️ 查看当前配置", callback_data="menu_config")],
+        [InlineKeyboardButton("🔙 返回主菜单", callback_data="menu_back")],
+    ])
+
+
+def _log_menu() -> InlineKeyboardMarkup:
+    """查看日志二级菜单：选条数。"""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("近 10 条", callback_data="log_10"),
+         InlineKeyboardButton("近 50 条", callback_data="log_50"),
+         InlineKeyboardButton("近 100 条", callback_data="log_100")],
+        [InlineKeyboardButton("🔙 返回主菜单", callback_data="menu_back")],
+    ])
+
+
+def _monitor_menu() -> InlineKeyboardMarkup:
+    """监听管理二级菜单：模式 / 刷新 / 增删目标。"""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔀 切换监听模式", callback_data="mon_mode"),
+         InlineKeyboardButton("🔄 刷新状态", callback_data="mon_refresh")],
+        [InlineKeyboardButton("➕ 添加目标", callback_data="mon_add"),
+         InlineKeyboardButton("➖ 移除目标", callback_data="mon_remove")],
+        [InlineKeyboardButton("🔙 返回主菜单", callback_data="menu_back")],
+    ])
+
+
+def _monitor_back_menu() -> InlineKeyboardMarkup:
+    """监听管理的三级菜单通用「返回监听管理」按钮。"""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔙 返回监听管理", callback_data="mon_back")]
+    ])
+
+
+def _monitor_mode_menu(current_mode: str) -> InlineKeyboardMarkup:
+    """监听模式三级菜单：私聊 / 频道。"""
+    priv = "👤 私聊模式" + (" ✅" if current_mode == "private" else "")
+    chan = "📢 频道模式" + (" ✅" if current_mode == "channel" else "")
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(priv, callback_data="mon_mode_private")],
+        [InlineKeyboardButton(chan, callback_data="mon_mode_channel")],
+        [InlineKeyboardButton("🔙 返回监听管理", callback_data="mon_back")],
+    ])
+
+
+def _monitor_remove_menu(targets: list) -> InlineKeyboardMarkup:
+    """移除目标三级菜单：动态列出当前目标。"""
+    rows = [
+        [InlineKeyboardButton(f"❌ {t}", callback_data=f"mon_rm_{i}")]
+        for i, t in enumerate(targets)
+    ]
+    rows.append([InlineKeyboardButton("🔙 返回监听管理", callback_data="mon_back")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _cancel_confirm_menu() -> InlineKeyboardMarkup:
+    """取消任务二级菜单：确认 + 返回。"""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ 确认取消", callback_data="cancel_confirm"),
+         InlineKeyboardButton("🔙 返回主菜单", callback_data="menu_back")],
     ])
 
 
@@ -165,13 +239,30 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #  所有按钮点击
 # ══════════════════════════════════════════════
 
+async def _render_monitor(query):
+    """渲染监听管理二级菜单（含状态概览）。"""
+    monitor = get_monitor()
+    if not monitor:
+        await query.edit_message_text(
+            "📡 监听器未启用。\n需配置 TG_API_ID / TG_API_HASH / TG_MONITOR_TARGETS 后重启。",
+            reply_markup=_back(),
+        )
+        return
+    await query.edit_message_text(
+        monitor.status_text() + "\n\n点按钮管理监听目标 / 切换模式。",
+        reply_markup=_monitor_menu(),
+    )
+
+
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
+    user_id = query.from_user.id
 
     # ── 返回主菜单 ──
     if data == "menu_back":
+        context.user_data.pop("pending_action", None)
         await query.edit_message_text(
             "🤖 115 分享转存机器人\n\n点选下面的功能按钮：",
             reply_markup=_main_menu(),
@@ -181,20 +272,23 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "menu_help":
         await query.edit_message_text(_help_text(), reply_markup=_back())
 
-    # ── 运行状态 ──
+    # ── 运行状态（二级：刷新）──
     elif data == "menu_status":
-        await query.edit_message_text(await _status_text(), reply_markup=_back())
+        await query.edit_message_text(await _status_text(), reply_markup=_status_menu())
 
-    # ── 查看配置 ──
+    elif data == "status_refresh":
+        await query.edit_message_text(await _status_text(), reply_markup=_status_menu())
+
+    # ── 查看配置（二级：跳转可配置项）──
     elif data == "menu_config":
-        if not _is_admin(query.from_user.id):
+        if not _is_admin(user_id):
             await query.edit_message_text("⛔ 仅管理员可查看配置", reply_markup=_back())
             return
-        await query.edit_message_text(format_config_list(), reply_markup=_back())
+        await query.edit_message_text(format_config_list(), reply_markup=_config_menu())
 
-    # ── 可配置项 ──
+    # ── 可配置项（二级：跳转当前配置）──
     elif data == "menu_setlist":
-        if not _is_admin(query.from_user.id):
+        if not _is_admin(user_id):
             await query.edit_message_text("⛔ 仅管理员可查看配置项", reply_markup=_back())
             return
         lines = ["📋 可配置项:\n"]
@@ -203,32 +297,124 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             mark = "✅" if val else "⬜"
             lines.append(f"{mark} {k} — {desc}")
         lines.append("\n用法: /set <KEY> <VALUE>")
-        await query.edit_message_text("\n".join(lines), reply_markup=_back())
+        await query.edit_message_text("\n".join(lines), reply_markup=_setlist_menu())
 
-    # ── 查看日志 ──
+    # ── 查看日志（二级选条数 → 三级展示）──
     elif data == "menu_log":
-        text, is_md = _log_text()
         await query.edit_message_text(
-            text, parse_mode=ParseMode.MARKDOWN if is_md else None, reply_markup=_back(),
+            "📝 查看日志\n\n选择查看最近多少条日志：",
+            reply_markup=_log_menu(),
+        )
+
+    elif data in ("log_10", "log_50", "log_100"):
+        n = int(data.split("_")[1])
+        text, is_md = _log_text(n)
+        await query.edit_message_text(
+            text,
+            parse_mode=ParseMode.MARKDOWN if is_md else None,
+            reply_markup=_log_menu(),
         )
 
     # ── 监听管理 ──
     elif data == "menu_monitor":
-        if not _is_admin(query.from_user.id):
+        if not _is_admin(user_id):
             await query.edit_message_text("⛔ 仅管理员可查看监听管理", reply_markup=_back())
+            return
+        await _render_monitor(query)
+
+    elif data == "mon_refresh":
+        if not _is_admin(user_id):
+            await query.edit_message_text("⛔ 仅管理员可操作", reply_markup=_back())
+            return
+        await _render_monitor(query)
+
+    elif data == "mon_back":
+        context.user_data.pop("pending_action", None)
+        if not _is_admin(user_id):
+            await query.edit_message_text("⛔ 仅管理员可操作", reply_markup=_back())
+            return
+        await _render_monitor(query)
+
+    # 三级：切换监听模式
+    elif data == "mon_mode":
+        if not _is_admin(user_id):
+            await query.edit_message_text("⛔ 仅管理员可操作", reply_markup=_back())
             return
         monitor = get_monitor()
         if not monitor:
+            await query.edit_message_text("📡 监听器未启用", reply_markup=_back())
+            return
+        await query.edit_message_text(
+            f"🔀 切换监听模式\n\n当前模式: {monitor.mode}\n\n选择要切换到的模式：",
+            reply_markup=_monitor_mode_menu(monitor.mode),
+        )
+
+    elif data in ("mon_mode_private", "mon_mode_channel"):
+        if not _is_admin(user_id):
+            await query.edit_message_text("⛔ 仅管理员可操作", reply_markup=_back())
+            return
+        monitor = get_monitor()
+        if not monitor:
+            await query.edit_message_text("📡 监听器未启用", reply_markup=_back())
+            return
+        mode = "private" if data == "mon_mode_private" else "channel"
+        result = await monitor.set_mode(mode)
+        await query.edit_message_text(
+            result + "\n\n" + monitor.status_text(), reply_markup=_monitor_menu(),
+        )
+
+    # 三级：添加目标（等待用户回复目标名）
+    elif data == "mon_add":
+        if not _is_admin(user_id):
+            await query.edit_message_text("⛔ 仅管理员可操作", reply_markup=_back())
+            return
+        context.user_data["pending_action"] = "add_target"
+        await query.edit_message_text(
+            "➕ 添加监听目标\n\n"
+            "请直接回复要监听的目标用户名（可带 @，如 postedia_bot）：\n\n"
+            "我会自动添加并注册监听。点下方按钮可取消。",
+            reply_markup=_monitor_back_menu(),
+        )
+
+    # 三级：移除目标（动态列出）
+    elif data == "mon_remove":
+        if not _is_admin(user_id):
+            await query.edit_message_text("⛔ 仅管理员可操作", reply_markup=_back())
+            return
+        monitor = get_monitor()
+        if not monitor:
+            await query.edit_message_text("📡 监听器未启用", reply_markup=_back())
+            return
+        targets = monitor.targets
+        if not targets:
             await query.edit_message_text(
-                "📡 监听器未启用。\n需配置 TG_API_ID / TG_API_HASH / TG_MONITOR_TARGETS 后重启。",
-                reply_markup=_back(),
+                "📡 当前没有监听目标。\n\n可用 /monitor add <目标> 添加。",
+                reply_markup=_monitor_back_menu(),
             )
             return
-        text = (
-            monitor.status_text()
-            + "\n\n管理命令:\n/monitor add <目标>\n/monitor remove <目标>\n/monitor mode <private|channel>"
+        await query.edit_message_text(
+            "➖ 移除监听目标\n\n点击要移除的目标：",
+            reply_markup=_monitor_remove_menu(targets),
         )
-        await query.edit_message_text(text, reply_markup=_back())
+
+    elif data.startswith("mon_rm_"):
+        if not _is_admin(user_id):
+            await query.edit_message_text("⛔ 仅管理员可操作", reply_markup=_back())
+            return
+        monitor = get_monitor()
+        if not monitor:
+            await query.edit_message_text("📡 监听器未启用", reply_markup=_back())
+            return
+        try:
+            idx = int(data[len("mon_rm_"):])
+            name = monitor.targets[idx]
+        except (ValueError, IndexError):
+            await query.edit_message_text("⚠️ 目标已变更，请重新进入。", reply_markup=_monitor_back_menu())
+            return
+        result = await monitor.remove_target(name)
+        await query.edit_message_text(
+            result + "\n\n" + monitor.status_text(), reply_markup=_monitor_menu(),
+        )
 
     # ── 提交链接（提示用户发送）──
     elif data == "menu_link":
@@ -242,9 +428,19 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=_back(),
         )
 
-    # ── 取消任务 ──
+    # ── 取消任务（二级确认 → 三级执行）──
     elif data == "menu_cancel":
-        if not _can_submit(query.from_user.id):
+        if not _can_submit(user_id):
+            await query.edit_message_text("⛔ 你没有操作权限", reply_markup=_back())
+            return
+        await query.edit_message_text(
+            "🛑 取消任务\n\n确定要取消当前正在进行的转存任务吗？\n\n"
+            "注意：已完成的步骤无法回退。",
+            reply_markup=_cancel_confirm_menu(),
+        )
+
+    elif data == "cancel_confirm":
+        if not _can_submit(user_id):
             await query.edit_message_text("⛔ 你没有操作权限", reply_markup=_back())
             return
         from pipeline import request_cancel
@@ -453,6 +649,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if monitor and monitor.is_waiting_login:
         if monitor.provide_login_input(text):
             await update.message.reply_text("✅ 已收到，正在验证...")
+        return
+
+    # 1.5) 待处理的交互动作（添加监听目标）
+    pending = context.user_data.get("pending_action")
+    if pending == "add_target":
+        context.user_data.pop("pending_action", None)
+        if not _is_admin(user_id):
+            await update.message.reply_text("⛔ 仅管理员可操作", reply_markup=_back())
+            return
+        mon = get_monitor()
+        if not mon:
+            await update.message.reply_text("📡 监听器未启用", reply_markup=_back())
+            return
+        result = await mon.add_target(text.strip())
+        await update.message.reply_text(
+            result + "\n\n" + mon.status_text(), reply_markup=_monitor_menu(),
+        )
         return
 
     # 2) 提取链接
