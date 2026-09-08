@@ -1,40 +1,25 @@
-# 敏感配置
+# Data & Config
 .env
-.env.local
-.env.production
-**/.env
-
-# 凭据与密钥
-*.pem
-*.key
-id_ed25519*
+data/
 *.session
 *.session-journal
 
-# Python 运行时
+# Python
 __pycache__/
 *.pyc
 *.pyo
 *.egg-info/
 dist/
 build/
-*.whl
+.eggs/
 
-# Docker 运行时
-*.tar.gz
-state/
+# IDE
+.vscode/
+.idea/
 
-# 工作记忆与临时文件
-.workbuddy/
-.work_history/
-*.swp
-*.swo
-*~
+# OS
 .DS_Store
 Thumbs.db
 
-# 项目管理中的 workspace-delete-inventory.txt（自动生成的清单）
-workspace-delete-inventory.txt
-
-# Node
-node_modules/
+# Old project
+v2-bot/

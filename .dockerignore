@@ -1,11 +1,8 @@
 .git
-.gitignore
 .env
-**/.env
 data/
-**/__pycache__/
-**/state/
+core/
+__pycache__/
 *.pyc
 *.pyo
-*.session
-*.session-journal
+README.md
