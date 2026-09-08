@@ -51,6 +51,17 @@ async def main():
 
         await app.initialize()
         await app.start()
+
+        # 清除可能残留的 webhook（webhook 与 getUpdates 互斥，残留会吞掉所有更新）
+        try:
+            await bot.delete_webhook(drop_pending_updates=True)
+            logger.info("✅ 已确认无 webhook（纯轮询模式）")
+        except Exception as e:
+            logger.warning(f"⚠️ 清除 webhook 失败: {e}")
+
+        import telegram
+        logger.info(f"python-telegram-bot 版本: {telegram.__version__}")
+
         await app.updater.start_polling(drop_pending_updates=True)
 
         me = await bot.get_me()

@@ -256,9 +256,13 @@ async def _render_monitor(query):
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     data = query.data
     user_id = query.from_user.id
+    logger.info(f"📩 收到按钮回调: data={data!r} user={user_id}")
+    try:
+        await query.answer()
+    except Exception as e:
+        logger.warning(f"⚠️ query.answer() 失败: {e}")
 
     # ── 返回主菜单 ──
     if data == "menu_back":
@@ -733,6 +737,18 @@ async def _handle_link(message, url: str):
 # ══════════════════════════════════════════════
 #  Bot 初始化
 # ══════════════════════════════════════════════
+
+async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """全局错误处理：记录日志并尽量给用户可见反馈。"""
+    logger.error(f"❌ 处理更新出错: {context.error}", exc_info=context.error)
+    try:
+        if isinstance(update, Update) and update.callback_query:
+            await update.callback_query.edit_message_text(
+                f"❌ 操作出错: {context.error}", reply_markup=_back(),
+            )
+    except Exception:
+        pass
+
 
 def setup_bot() -> Application:
     global _app
