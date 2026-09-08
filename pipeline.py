@@ -6,6 +6,7 @@
 import os
 import re
 import sys
+import json
 import asyncio
 import time
 import logging
@@ -57,7 +58,7 @@ class _CardAccount:
         self.name = "cardbot"
         self.priority = 1
         self.enabled = True
-        self.recycle_password = ""
+        self.recycle_password = os.getenv("RECYCLE_PASSWORD", "").strip()
         self.restriction_until = 0.0
         self.last_used_at = 0.0
         self.share_file_limit = 10000
@@ -246,12 +247,20 @@ async def fetch_share_video_files(share_url: str) -> tuple[list[str], str]:
 
 
 async def _save_share_with_retry(svc, url: str, metadata: dict = None, max_retries: int = 3) -> dict:
-    """带重试的转存。"""
+    """带重试的转存（只转存，返回含 to_cid 的原始结果）。
+
+    注意必须用 save_share_link 而不是 save_and_share：
+    后者是「转存+创建分享」全套封装，成功时只返回 share_link、不含 to_cid，
+    会导致后续重命名/自建分享流程拿不到目标目录。
+    """
     for attempt in range(max_retries):
         if is_cancelled():
             return {"status": "cancelled", "message": "任务已取消"}
         try:
-            res = await svc.save_and_share(url, metadata or {})
+            if hasattr(svc, "save_share_link"):
+                res = await svc.save_share_link(url, metadata or {}, create_task_subdir=True)
+            else:
+                res = await svc._save_share_link_internal(url, metadata or {}, None, False, None, True)
             if res and res.get("status") == "success":
                 return res
             # 频控退避
@@ -389,6 +398,7 @@ async def process_link(
                 "size": format_size(total or 0),
                 "file_count": len(video_names),
                 "det": ident_det,
+                "to_cid": to_cid,
             }
         else:
             return {
@@ -426,7 +436,7 @@ async def _wait_share_audit(svc, share_url: str, timeout: int = None) -> bool:
     code, rc = _parse_share_url(share_url)
     if not code:
         return False
-    
+
     start = time.time()
     while time.time() - start < timeout:
         if is_cancelled():
@@ -447,3 +457,117 @@ async def _wait_share_audit(svc, share_url: str, timeout: int = None) -> bool:
             pass
         await asyncio.sleep(SHARE_AUDIT_POLL_INTERVAL)
     return False
+
+
+# ── 自动清理（分享+发卡成功后删除源文件 + 清空回收站）──
+# 与 NAS card-bot 的 AUTO_DELETE_AFTER/RECYCLE_PASSWORD 机制对齐：
+# 卡片发送成功后，到期把任务目录移入 115 回收站并立即用密码清空。
+_CLEANUP_STATE_FILE = Path(os.getenv("CLEANUP_STATE_FILE", "/data/cleanup_queue.json"))
+_cleanup_queue: list = []
+_cleanup_lock = asyncio.Lock()
+_cleanup_worker_task = None
+
+
+def _load_cleanup_queue():
+    global _cleanup_queue
+    try:
+        if _CLEANUP_STATE_FILE.exists():
+            data = json.loads(_CLEANUP_STATE_FILE.read_text(encoding="utf-8"))
+            _cleanup_queue = data if isinstance(data, list) else []
+    except Exception as e:
+        logger.warning(f"清理队列读取失败: {e}")
+        _cleanup_queue = []
+
+
+def _save_cleanup_queue():
+    try:
+        _CLEANUP_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = str(_CLEANUP_STATE_FILE) + ".tmp"
+        Path(tmp).write_text(
+            json.dumps(_cleanup_queue, ensure_ascii=False, indent=2), encoding="utf-8",
+        )
+        os.replace(tmp, _CLEANUP_STATE_FILE)
+    except Exception as e:
+        logger.warning(f"清理队列保存失败: {e}")
+
+
+def schedule_cleanup(cid, name: str = "", share_link: str = "", delay=None):
+    """卡片发送成功后调用：安排到期删除任务目录并清空回收站。
+
+    AUTO_DELETE_AFTER=0（默认）表示不自动清理。
+    ⚠️ 注意：删除源文件后，基于这些文件创建的分享链接会随之失效。
+    """
+    if not cid:
+        return
+    auto = int(os.getenv("AUTO_DELETE_AFTER") or "0")
+    if delay is None and auto <= 0:
+        return
+    delay = max(auto if delay is None else int(delay), 0)
+    if any(x.get("cid") == int(cid) for x in _cleanup_queue):
+        return
+    _cleanup_queue.append({
+        "cid": int(cid), "name": name or "", "share_link": share_link or "",
+        "delete_at": time.time() + delay, "created_at": time.time(),
+    })
+    _save_cleanup_queue()
+    logger.info(f"🕒 已安排自动清理（{delay} 秒后移入回收站并清空）: {name} (CID: {cid})")
+
+
+async def empty_recycle_bin() -> tuple[bool, str]:
+    """立即清空 115 回收站（用 RECYCLE_PASSWORD，/set 后立即生效）。"""
+    try:
+        svc = await get_svc()
+        pwd = os.getenv("RECYCLE_PASSWORD", "").strip()
+        resp = await svc.client.recyclebin_clean_app({}, password=pwd, async_=True)
+        state = resp.get("state") if isinstance(resp, dict) else None
+        if state is False:
+            return False, f"❌ 清空回收站失败: {resp.get('error') or resp.get('message') or resp}"
+        logger.info("✅ 回收站已清空")
+        return True, "✅ 回收站已清空"
+    except Exception as e:
+        return False, f"❌ 清空回收站出错: {e}"
+
+
+async def cleanup_worker():
+    """后台 worker：到期任务目录移入回收站并立即清空。"""
+    while True:
+        try:
+            await asyncio.sleep(30)
+            now = time.time()
+            due = [x for x in _cleanup_queue if x.get("delete_at", 0) <= now]
+            if not due:
+                continue
+            async with _cleanup_lock:
+                for item in due:
+                    try:
+                        svc = await get_svc()
+                        result = await svc.client.fs_delete(item["cid"], async_=True)
+                        state = result.get("state") if isinstance(result, dict) else None
+                        if state is False:
+                            raise RuntimeError(
+                                result.get("error") or result.get("message") or str(result)
+                            )
+                        logger.info(
+                            f"✅ 已移入 115 回收站: {item.get('name')} (CID: {item['cid']})，准备清空回收站"
+                        )
+                        ok, msg = await empty_recycle_bin()
+                        if not ok:
+                            raise RuntimeError(msg)
+                        _cleanup_queue.remove(item)
+                        _save_cleanup_queue()
+                        logger.info(f"✅ 自动清理完成: {item.get('name')} (CID: {item['cid']})")
+                    except Exception as e:
+                        logger.warning(f"⚠️ 自动清理失败，60 秒后重试: {item.get('name')} | {e}")
+                        item["delete_at"] = time.time() + 60
+                        _save_cleanup_queue()
+        except Exception as e:
+            logger.warning(f"清理 worker 异常: {e}")
+
+
+def start_cleanup_worker():
+    """启动清理 worker（幂等，重启后从持久化队列恢复）。"""
+    global _cleanup_worker_task
+    _load_cleanup_queue()
+    if _cleanup_worker_task is None or _cleanup_worker_task.done():
+        _cleanup_worker_task = asyncio.create_task(cleanup_worker())
+        logger.info(f"🧹 自动清理 worker 已启动（待清理 {len(_cleanup_queue)} 项）")

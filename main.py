@@ -130,6 +130,10 @@ async def main():
             logger.error(f"Telethon 监听器启动失败: {e}")
             logger.info("💡 请确保已配置 TG_API_ID / TG_API_HASH / TG_PHONE")
 
+    # ── 3) 自动清理 worker（发卡成功后到期删除源文件 + 清空回收站）──
+    from pipeline import start_cleanup_worker
+    start_cleanup_worker()
+
     logger.info("=" * 50)
     logger.info("✅ 启动流程完成!")
     if me:

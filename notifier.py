@@ -80,7 +80,8 @@ def _main_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🤖 OpenAI", callback_data="menu_openai"),
          InlineKeyboardButton("🔄 重启 Bot", callback_data="menu_restart")],
         [InlineKeyboardButton("🛑 取消任务", callback_data="menu_cancel"),
-         InlineKeyboardButton("❓ 帮助", callback_data="menu_help")],
+         InlineKeyboardButton("🧹 清空回收站", callback_data="menu_clean")],
+        [InlineKeyboardButton("❓ 帮助", callback_data="menu_help")],
     ])
 
 
@@ -180,6 +181,14 @@ def _restart_confirm_menu() -> InlineKeyboardMarkup:
     ])
 
 
+def _clean_confirm_menu() -> InlineKeyboardMarkup:
+    """清空回收站二级菜单：确认 + 返回。"""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ 确认清空", callback_data="clean_confirm"),
+         InlineKeyboardButton("🔙 返回主菜单", callback_data="menu_back")],
+    ])
+
+
 def _openai_menu() -> InlineKeyboardMarkup:
     """OpenAI 设置二级菜单：四项可编辑。"""
     return InlineKeyboardMarkup([
@@ -229,7 +238,9 @@ def _help_text() -> str:
         "• 用 /set <KEY> <VALUE> 修改配置\n"
         "• /status 运行状态 · /log [N] 最近 N 条日志\n"
         "• /monitor 监听状态 / 增删目标 / 切模式\n"
-        "• /restart 重启 Bot（主菜单也有按钮）\n\n"
+        "• /restart 重启 Bot（主菜单也有按钮）\n"
+        "• /set AUTO_DELETE_AFTER 秒数 — 发卡后自动删源文件+清回收站\n"
+        "• /set RECYCLE_PASSWORD xxx — 回收站密码\n\n"
         "🔗 支持: 115.com / 115cdn.com / anxia.com 分享链接 + ed2k:// 链接\n"
         "🤖 OpenAI 识别: 主菜单「🤖 OpenAI」可换 API/Key/模型/提示词\n"
         "📡 监听: Postedia_bot 等解锁机器人的消息"
@@ -642,6 +653,28 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.info("收到重启按钮指令，退出进程以触发容器重启")
         import threading
         threading.Timer(1.5, lambda: os._exit(0)).start()
+
+    # ── 清空回收站（二级确认 → 三级执行）──
+    elif data == "menu_clean":
+        if not _is_admin(user_id):
+            await query.edit_message_text("⛔ 仅管理员可操作", reply_markup=_back())
+            return
+        pwd_set = "✅ 已设置" if os.getenv("RECYCLE_PASSWORD", "").strip() else "⬜ 未设置（/set RECYCLE_PASSWORD xxx）"
+        await query.edit_message_text(
+            "🧹 清空 115 回收站\n\n"
+            "⚠️ 此操作会永久删除回收站内容，不可恢复！\n\n"
+            f"回收站密码: {pwd_set}\n\n"
+            "确定要清空吗？",
+            reply_markup=_clean_confirm_menu(),
+        )
+
+    elif data == "clean_confirm":
+        if not _is_admin(user_id):
+            await query.edit_message_text("⛔ 仅管理员可操作", reply_markup=_back())
+            return
+        from pipeline import empty_recycle_bin
+        ok, msg = await empty_recycle_bin()
+        await query.edit_message_text(msg, reply_markup=_back())
 
     else:
         await query.edit_message_text("未知操作", reply_markup=_back())
@@ -1093,10 +1126,13 @@ async def _handle_link(message, url: str):
         await status_msg.edit_text(
             f"✅ 转存成功: {title}\n🔗 永久分享: {share_link}", reply_markup=_back(),
         )
-        await _send_card_to(message.chat.id, card, poster=poster)
+        private_ok = await _send_card_to(message.chat.id, card, poster=poster)
         target = _channel_target()
-        if target:
-            await _send_card_to(target, card, poster=poster)
+        channel_ok = await _send_card_to(target, card, poster=poster) if target else private_ok
+        # 发卡成功后：AUTO_DELETE_AFTER>0 时安排自动删除源文件 + 清空回收站
+        if channel_ok:
+            from pipeline import schedule_cleanup
+            schedule_cleanup(result.get("to_cid"), title, share_link)
 
     elif result["status"] == "pending":
         await status_msg.edit_text(
