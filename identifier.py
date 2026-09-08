@@ -542,19 +542,35 @@ def _year_ok(file_year: str, tmdb_year: str) -> bool:
 
 
 async def resolve_title(raw_name: str, regex_title: str, regex_year: str = "",
-                        season: int = None) -> dict:
-    """统一识别入口。返回 {"title", "year", "tmdb_id", "source"}。
+                        season: int = None, tmdb_id: int = None) -> dict:
+    """统一识别入口。返回 {"title", "year", "tmdb_id", "source", "det"}。
 
-    source: tmdb_eng（英文名直搜命中）/ tmdb_llm（LLM 译名搜索命中）/
-            llm（LLM 片名，未搜 TMDB）/ eng_fallback（英文名兜底）/ regex（正则兜底）
+    source: tmdb_id（文件名含 {tmbid-xxx} 直接按 ID 拉详情）/
+            tmdb_eng（英文名直搜命中）/ tmdb_llm（LLM 译名搜索命中）/
+            llm（LLM 片名，未搜 TMDB）/ eng_fallback（英文原名兜底）/ regex（正则兜底）
 
     流程：
-    1. 提取文件名英文原名，直接搜 TMDB（命中率最高，不依赖 LLM 翻译）
-    2. 英文名搜不到 → LLM 解析（翻译中文名），再搜 TMDB
-    3. 都失败 → 正则结果兜底
+    1. 文件名含 {tmbid-xxx} → 直接按 ID 拉 TMDB 详情（最快最准）
+    2. 提取文件名英文原名，直接搜 TMDB（命中率最高，不依赖 LLM 翻译）
+    3. 英文名搜不到 → LLM 解析（翻译中文名），再搜 TMDB
+    4. 都失败 → 正则结果兜底
     """
     regex_title = (regex_title or "").strip()
     regex_year = str(regex_year or "").strip()
+
+    # 优先：文件名含 {tmbid-xxx}，直接用 ID 拉详情（无需搜索）
+    if tmdb_id and _tmdb_key():
+        for media_type in ("tv", "movie"):
+            det = await _tmdb_detail(media_type, tmdb_id)
+            if det:
+                logger.info(f"✅ TMDB ID 直接命中: {tmdb_id} → {det['title']!r}")
+                return {
+                    "title": det["title"],
+                    "year": det.get("year") or regex_year,
+                    "tmdb_id": tmdb_id,
+                    "source": "tmdb_id",
+                    "det": det,
+                }
 
     # 提取英文原名：Serenade.of.Peaceful.Joy.2020.S01 → "Serenade of Peaceful Joy"
     _eng_match = re.match(r"^([A-Z][a-zA-Z0-9]+(?:\.[A-Z][a-zA-Z0-9]+)+)", regex_title)

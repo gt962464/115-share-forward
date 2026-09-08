@@ -932,10 +932,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if ed2k_links:
-        await _handle_ed2k(update.message, ed2k_links)
-    for link in links:
-        await _handle_link(update.message, link["url"])
+    # 4) 处理链接 — 外层 catch 防止 handler 静默崩溃
+    try:
+        if ed2k_links:
+            await _handle_ed2k(update.message, ed2k_links)
+    except Exception as e:
+        logger.error(f"❌ ed2k 链接处理异常: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ ed2k 处理出错: {e}", reply_markup=_back())
+        except Exception:
+            pass
+
+    try:
+        for link in links:
+            await _handle_link(update.message, link["url"])
+    except Exception as e:
+        logger.error(f"❌ 115 链接处理异常: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"❌ 链接处理出错: {e}", reply_markup=_back())
+        except Exception:
+            pass
 
 
 # ══════════════════════════════════════════════
@@ -1034,7 +1050,10 @@ async def _handle_ed2k(message, ed2k_links: list):
     status_msg = await message.reply_text(f"🔍 识别 ed2k 资源: {base['name'][:60]}...")
 
     try:
-        ident = await resolve_title(base["name"], parsed["title"], parsed.get("year", ""), season)
+        ident = await resolve_title(
+            base["name"], parsed["title"], parsed.get("year", ""), season,
+            parsed.get("tmdb_id"),
+        )
     except Exception as e:
         logger.warning(f"ed2k 识别失败: {e}")
         ident = {"title": parsed["title"], "year": parsed.get("year", ""), "tmdb_id": None, "det": {}}
@@ -1042,8 +1061,19 @@ async def _handle_ed2k(message, ed2k_links: list):
     det = ident.get("det") or {}
     title = ident["title"]
     year = ident.get("year", "")
-    poster = await fetch_poster_bytes(det.get("poster_url", "")) if det else None
-    douban = await douban_rating(title) if det else ""
+
+    # 海报和评分独立 catch，不互相影响
+    poster = None
+    try:
+        poster = await fetch_poster_bytes(det.get("poster_url", "")) if det else None
+    except Exception as e:
+        logger.warning(f"⚠️ ed2k 海报下载失败: {e}")
+
+    douban = ""
+    try:
+        douban = await douban_rating(title) if det else ""
+    except Exception as e:
+        logger.warning(f"⚠️ ed2k 豆瓣评分失败: {e}")
 
     total = sum(it["size"] for it in items)
     # 多集合并：S01E01-E12
@@ -1057,17 +1087,22 @@ async def _handle_ed2k(message, ed2k_links: list):
         episode_text = f"S{int(_sm.group(1)):02d}E{episodes[0]:02d}-E{episodes[-1]:02d}" if _sm else parsed["episode"]
 
     tmdb_rating = f"{float(det['rating']):.1f}/10" if det.get("rating") else "暂无评分"
-    card = _build_card(
-        title=title, year=year,
-        genres=det.get("genres") or "暂无",
-        tmdb_rating=tmdb_rating,
-        douban_rating=douban or "暂无评分",
-        quality=parsed["quality"], source=parsed["source"],
-        size_text=format_size(total), episode=episode_text,
-        encode=parsed["encode"], audio="",
-        link_line=f"🔗 ED2K 链接：共 {len(items)} 个文件（下方发完整链接）",
-        overview=det.get("overview", ""),
-    )
+    try:
+        card = _build_card(
+            title=title, year=year,
+            genres=det.get("genres") or "暂无",
+            tmdb_rating=tmdb_rating,
+            douban_rating=douban or "暂无评分",
+            quality=parsed["quality"], source=parsed["source"],
+            size_text=format_size(total), episode=episode_text,
+            encode=parsed["encode"], audio="",
+            link_line=f"🔗 ED2K 链接：共 {len(items)} 个文件（下方发完整链接）",
+            overview=det.get("overview", ""),
+        )
+    except Exception as e:
+        logger.warning(f"⚠️ ed2k 卡片构建失败，降级为纯文本: {e}")
+        card = f"🎬 {title} ({year})\n🔗 ED2K 链接：共 {len(items)} 个文件"
+
     links_block = "\n".join(
         f"{i}. {html_escape(u, quote=False)}" for i, u in enumerate(ed2k_links, 1)
     )
@@ -1075,10 +1110,19 @@ async def _handle_ed2k(message, ed2k_links: list):
         f"📎 {title}｜完整 ED2K 链接（{len(ed2k_links)}个）：\n<pre>{links_block}</pre>"
     )
 
-    # 私聊（回复给提交者）+ 频道分别发送
-    private_ok = await _send_card_to(message.chat.id, card, links_message, poster)
-    target = _channel_target()
-    channel_ok = await _send_card_to(target, card, links_message, poster) if target else False
+    # 私聊（回复给提交者）+ 频道分别发送，各自 catch
+    try:
+        private_ok = await _send_card_to(message.chat.id, card, links_message, poster)
+    except Exception as e:
+        logger.error(f"❌ ed2k 私聊卡片发送异常: {e}", exc_info=True)
+        private_ok = False
+
+    channel_ok = False
+    try:
+        target = _channel_target()
+        channel_ok = await _send_card_to(target, card, links_message, poster) if target else False
+    except Exception as e:
+        logger.error(f"❌ ed2k 频道卡片发送异常: {e}", exc_info=True)
 
     try:
         await status_msg.edit_text(
@@ -1092,6 +1136,7 @@ async def _handle_ed2k(message, ed2k_links: list):
 
 
 async def _handle_link(message, url: str):
+    """处理 115 分享链接：转存 → 重命名 → 创建分享 → 发送卡片。全程 try/except 防止静默崩溃。"""
     status_msg = await message.reply_text(f"⏳ 收到链接，开始处理...\n🔗 {url[:60]}...")
 
     async def on_progress(text: str):
@@ -1100,53 +1145,109 @@ async def _handle_link(message, url: str):
         except Exception:
             pass
 
-    result = await process_link(url, on_progress=on_progress)
+    # ── process_link 本身也要 catch ──
+    try:
+        result = await process_link(url, on_progress=on_progress)
+    except Exception as e:
+        logger.error(f"❌ process_link 异常: {e}", exc_info=True)
+        try:
+            await status_msg.edit_text(
+                f"❌ 处理异常: {e}\n🔗 {url[:60]}...", reply_markup=_back(),
+            )
+        except Exception:
+            pass
+        return
 
     if result["status"] == "success":
         share_link = result["share_link"]
         title = result.get("title", "")
         det = result.get("det") or {}
 
-        # 海报卡片（私聊 + 频道）
-        from identifier import douban_rating, fetch_poster_bytes
-        poster = await fetch_poster_bytes(det.get("poster_url", "")) if det else None
-        douban = await douban_rating(title) if det else ""
+        # ── 海报 + 评分 + 卡片（每一步独立 catch，任一失败不影响已成功的转存）──
+        poster = None
+        douban = ""
+        try:
+            from identifier import douban_rating, fetch_poster_bytes
+            poster = await fetch_poster_bytes(det.get("poster_url", "")) if det else None
+        except Exception as e:
+            logger.warning(f"⚠️ 海报下载失败（不影响转存）: {e}")
+
+        try:
+            from identifier import douban_rating as _dr
+            douban = await _dr(title) if det else ""
+        except Exception as e:
+            logger.warning(f"⚠️ 豆瓣评分获取失败（不影响转存）: {e}")
+
         tmdb_rating = f"{float(det['rating']):.1f}/10" if det.get("rating") else "暂无评分"
-        card = _build_card(
-            title=title, year=det.get("year", ""),
-            genres=det.get("genres") or "暂无",
-            tmdb_rating=tmdb_rating,
-            douban_rating=douban or "暂无评分",
-            quality=result.get("quality", ""), source=result.get("source", ""),
-            size_text=result.get("size", ""), episode=result.get("episode", ""),
-            encode=result.get("encode", ""), audio="",
-            link_line=f'🔗 链接：<a href="{html_escape(share_link, quote=True)}">115网盘</a>',
-            overview=det.get("overview", ""),
-        )
-        await status_msg.edit_text(
-            f"✅ 转存成功: {title}\n🔗 永久分享: {share_link}", reply_markup=_back(),
-        )
-        private_ok = await _send_card_to(message.chat.id, card, poster=poster)
-        target = _channel_target()
-        channel_ok = await _send_card_to(target, card, poster=poster) if target else private_ok
+        try:
+            card = _build_card(
+                title=title, year=det.get("year", ""),
+                genres=det.get("genres") or "暂无",
+                tmdb_rating=tmdb_rating,
+                douban_rating=douban or "暂无评分",
+                quality=result.get("quality", ""), source=result.get("source", ""),
+                size_text=result.get("size", ""), episode=result.get("episode", ""),
+                encode=result.get("encode", ""), audio="",
+                link_line=f'🔗 链接：<a href="{html_escape(share_link, quote=True)}">115网盘</a>',
+                overview=det.get("overview", ""),
+            )
+        except Exception as e:
+            logger.warning(f"⚠️ 卡片构建失败，降级为纯文本: {e}")
+            card = f"✅ 转存成功: {title}\n🔗 永久分享: {share_link}"
+
+        # 先更新状态消息
+        try:
+            await status_msg.edit_text(
+                f"✅ 转存成功: {title}\n🔗 永久分享: {share_link}", reply_markup=_back(),
+            )
+        except Exception as e:
+            logger.warning(f"⚠️ 更新状态消息失败: {e}")
+
+        # 发送卡片（私聊）
+        try:
+            private_ok = await _send_card_to(message.chat.id, card, poster=poster)
+        except Exception as e:
+            logger.error(f"❌ 私聊卡片发送异常: {e}", exc_info=True)
+            private_ok = False
+
+        # 发送卡片（频道）
+        channel_ok = False
+        try:
+            target = _channel_target()
+            channel_ok = await _send_card_to(target, card, poster=poster) if target else private_ok
+        except Exception as e:
+            logger.error(f"❌ 频道卡片发送异常: {e}", exc_info=True)
+
         # 发卡成功后：AUTO_DELETE_AFTER>0 时安排自动删除源文件 + 清空回收站
-        if channel_ok:
-            from pipeline import schedule_cleanup
-            schedule_cleanup(result.get("to_cid"), title, share_link)
+        try:
+            if channel_ok:
+                from pipeline import schedule_cleanup
+                schedule_cleanup(result.get("to_cid"), title, share_link)
+        except Exception as e:
+            logger.warning(f"⚠️ 安排清理任务失败（不影响转存）: {e}")
 
     elif result["status"] == "pending":
-        await status_msg.edit_text(
-            f"⏳ {result.get('message', '处理中...')}\n"
-            f"🔗 {result.get('share_link', url)}\n完成后会自动通知。",
-            reply_markup=_back(),
-        )
+        try:
+            await status_msg.edit_text(
+                f"⏳ {result.get('message', '处理中...')}\n"
+                f"🔗 {result.get('share_link', url)}\n完成后会自动通知。",
+                reply_markup=_back(),
+            )
+        except Exception:
+            pass
     elif result["status"] == "cancelled":
-        await status_msg.edit_text("🛑 任务已取消", reply_markup=_back())
+        try:
+            await status_msg.edit_text("🛑 任务已取消", reply_markup=_back())
+        except Exception:
+            pass
     else:
-        await status_msg.edit_text(
-            f"❌ 处理失败: {result.get('message', '未知错误')}",
-            reply_markup=_back(),
-        )
+        try:
+            await status_msg.edit_text(
+                f"❌ 处理失败: {result.get('message', '未知错误')}",
+                reply_markup=_back(),
+            )
+        except Exception:
+            pass
 
 
 # ══════════════════════════════════════════════
@@ -1157,10 +1258,15 @@ async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     """全局错误处理：记录日志并尽量给用户可见反馈。"""
     logger.error(f"❌ 处理更新出错: {context.error}", exc_info=context.error)
     try:
-        if isinstance(update, Update) and update.callback_query:
-            await update.callback_query.edit_message_text(
-                f"❌ 操作出错: {context.error}", reply_markup=_back(),
-            )
+        if isinstance(update, Update):
+            if update.callback_query:
+                await update.callback_query.edit_message_text(
+                    f"❌ 操作出错: {context.error}", reply_markup=_back(),
+                )
+            elif update.message:
+                await update.message.reply_text(
+                    f"❌ 处理出错: {context.error}", reply_markup=_back(),
+                )
     except Exception:
         pass
 
@@ -1168,6 +1274,9 @@ async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 def setup_bot() -> Application:
     global _app
     app = Application.builder().token(TG_BOT_TOKEN).build()
+
+    # 全局错误处理：捕获所有 handler 未处理的异常，给用户可见反馈
+    app.add_error_handler(_error_handler)
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("link", cmd_link))

@@ -20,6 +20,23 @@ if _APP_ROOT not in sys.path:
 if "/cardbot" not in sys.path:
     sys.path.insert(0, "/cardbot")
 
+# ── P115 API 地址替换：支持 P115_API_BASE 环境变量 ──
+# 当 api.115.com 被墙时（如美国 VPS），通过此变量指定可用端点
+# 示例：P115_API_BASE=https://webapi.115.com 或 https://115cdn.com/webapi
+_P115_API_BASE = os.getenv("P115_API_BASE", "").strip()
+if _P115_API_BASE:
+    try:
+        import p115client.util as _p115_util
+        _orig_complete_url = _p115_util.complete_url
+        def _patched_complete_url(path="", base_url=None, app="", version="", force_app=False, domain="", query=()):
+            if base_url is None or base_url == "":
+                base_url = _P115_API_BASE
+            return _orig_complete_url(path, base_url=base_url, app=app, version=version, force_app=force_app, domain=domain, query=query)
+        _p115_util.complete_url = _patched_complete_url
+        logging.getLogger("pipeline").info(f"✅ P115 API 已切换到: {_P115_API_BASE}")
+    except Exception as _e:
+        logging.getLogger("pipeline").warning(f"⚠️ P115 API 切换失败（将用默认）: {_e}")
+
 from config import (
     P115_COOKIE, P115_SAVE_DIR, AUTO_RENAME,
     SHARE_AUDIT_WAIT_TIMEOUT, SHARE_AUDIT_POLL_INTERVAL,
@@ -136,6 +153,10 @@ def parse_filename(name: str) -> dict:
     yr = re.search(r"[\.\s](\d{4})[\.\s]", clean)
     if yr:
         result["year"] = yr.group(1)
+    # 提取 {tmbid-xxx}（文件名里已包含 TMDB ID）
+    tid = re.search(r"\{tmbid-(\d+)\}", clean, re.IGNORECASE)
+    if tid:
+        result["tmdb_id"] = int(tid.group(1))
     return result
 
 
@@ -326,7 +347,7 @@ async def process_link(
     ident_det = {}
     try:
         from identifier import resolve_title
-        ident = await resolve_title(base_name, parsed["title"], parsed.get("year", ""), season)
+        ident = await resolve_title(base_name, parsed["title"], parsed.get("year", ""), season, parsed.get("tmdb_id"))
         if ident.get("title"):
             display_title = ident["title"]
             parsed["year"] = ident.get("year") or parsed.get("year", "")
