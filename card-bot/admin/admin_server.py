@@ -124,7 +124,13 @@ def parse_env(path: Path) -> dict[str, str]:
 
 def write_env(path: Path, updates: dict[str, str], allowed: list[str]) -> None:
     if not path.exists():
-        raise RuntimeError(f"配置文件不存在: {path}")
+        # Auto-create .env from .env.example template if available
+        example = path.parent / ".env.example"
+        if example.exists():
+            path.write_text(example.read_text(encoding="utf-8"), encoding="utf-8")
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("", encoding="utf-8")
     allowed_set = set(allowed)
     clean = {k: str(v) for k, v in updates.items() if k in allowed_set and ENV_KEY_RE.match(k)}
     lines = path.read_text(encoding="utf-8").splitlines()
