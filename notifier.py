@@ -12,12 +12,13 @@ from telegram.ext import (
 from telegram.constants import ParseMode
 
 from config import (
-    TG_BOT_TOKEN, TG_CHANNEL_ID, TG_ADMIN_IDS,
+    TG_BOT_TOKEN, TG_CHANNEL_ID, TG_ADMIN_IDS, TG_ALLOW_SUBMIT_IDS,
     set_config, get_config, format_config_list,
     CONFIG_SCHEMA,
 )
 from link_parser import extract_115_links
 from pipeline import process_link, format_size
+from monitor import get_monitor
 
 logger = logging.getLogger("notifier")
 
@@ -55,6 +56,11 @@ async def send_channel(text: str, parse_mode: str = None):
 
 def _is_admin(user_id: int) -> bool:
     return str(user_id) in TG_ADMIN_IDS
+
+
+def _can_submit(user_id: int) -> bool:
+    """是否允许提交链接：管理员 + 白名单。"""
+    return _is_admin(user_id) or str(user_id) in TG_ALLOW_SUBMIT_IDS
 
 
 # ══════════════════════════════════════════════
@@ -98,7 +104,8 @@ def _help_text() -> str:
         "⚙️ 配置管理:\n"
         "• 点「⚙️ 查看配置」查看当前配置\n"
         "• 用 /set <KEY> <VALUE> 修改配置\n"
-        "• /status 运行状态 · /log [N] 最近 N 条日志\n\n"
+        "• /status 运行状态 · /log [N] 最近 N 条日志\n"
+        "• /monitor 监听状态 / 增删目标 / 切模式\n\n"
         "🔗 支持域名: 115.com / 115cdn.com / anxia.com\n"
         "📡 监听: Postedia_bot 等解锁机器人的消息"
     )
@@ -347,15 +354,92 @@ async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     threading.Timer(1.5, lambda: os._exit(0)).start()
 
 
+async def cmd_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ 仅管理员可使用此命令", reply_markup=_back())
+        return
+
+    monitor = get_monitor()
+    if not monitor:
+        await update.message.reply_text(
+            "📡 监听器未启用。\n需在 .env 配置 TG_API_ID / TG_API_HASH / TG_MONITOR_TARGETS 后重启。",
+            reply_markup=_back(),
+        )
+        return
+
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(monitor.status_text(), reply_markup=_back())
+        return
+
+    sub = args[0].lower()
+    if sub in ("add", "+"):
+        if len(args) < 2:
+            await update.message.reply_text("用法: /monitor add <目标用户名或频道>", reply_markup=_back())
+            return
+        result = await monitor.add_target(args[1])
+        await update.message.reply_text(result, reply_markup=_back())
+    elif sub in ("remove", "rm", "-"):
+        if len(args) < 2:
+            await update.message.reply_text("用法: /monitor remove <目标>", reply_markup=_back())
+            return
+        result = await monitor.remove_target(args[1])
+        await update.message.reply_text(result, reply_markup=_back())
+    elif sub == "mode":
+        if len(args) < 2:
+            await update.message.reply_text("用法: /monitor mode <private|channel>", reply_markup=_back())
+            return
+        result = await monitor.set_mode(args[1])
+        await update.message.reply_text(result, reply_markup=_back())
+    else:
+        await update.message.reply_text(
+            "用法:\n"
+            "/monitor — 查看监听状态\n"
+            "/monitor add <目标> — 添加监听目标\n"
+            "/monitor remove <目标> — 移除监听目标\n"
+            "/monitor mode <private|channel> — 切换监听模式",
+            reply_markup=_back(),
+        )
+
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _can_submit(update.effective_user.id):
+        await update.message.reply_text("⛔ 你没有操作权限", reply_markup=_back())
+        return
+    from pipeline import request_cancel
+    request_cancel()
+    await update.message.reply_text("🛑 已请求取消，进行中的步骤会尽快停止。", reply_markup=_back())
+
+
 # ══════════════════════════════════════════════
 #  自动识别 115 链接 + 转存结果
 # ══════════════════════════════════════════════
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
     text = update.message.text or ""
+
+    # 1) 验证码/密码填入回路（监听器等待登录输入时，直接吃掉这条消息）
+    monitor = get_monitor()
+    if monitor and monitor.is_waiting_login:
+        if monitor.provide_login_input(text):
+            await update.message.reply_text("✅ 已收到，正在验证...")
+        return
+
+    # 2) 提取链接
     links = extract_115_links(text, update.message.entities)
     if not links:
         return
+
+    # 3) 提交权限检查
+    if not _can_submit(user_id):
+        await update.message.reply_text(
+            "⛔ 你没有提交链接的权限。\n"
+            "请联系管理员把你的 ID 加入 TG_ALLOW_SUBMIT_IDS。",
+            reply_markup=_back(),
+        )
+        return
+
     for link in links:
         await _handle_link(update.message, link["url"])
 
@@ -395,6 +479,8 @@ async def _handle_link(message, url: str):
             f"🔗 {result.get('share_link', url)}\n完成后会自动通知。",
             reply_markup=_back(),
         )
+    elif result["status"] == "cancelled":
+        await status_msg.edit_text("🛑 任务已取消", reply_markup=_back())
     else:
         await status_msg.edit_text(
             f"❌ 处理失败: {result.get('message', '未知错误')}",
@@ -420,6 +506,8 @@ def setup_bot() -> Application:
     app.add_handler(CommandHandler("log", cmd_log))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("restart", cmd_restart))
+    app.add_handler(CommandHandler("monitor", cmd_monitor))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
 
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

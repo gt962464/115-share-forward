@@ -62,7 +62,7 @@ async def main():
     # ── 2) 启动 Telethon 监听器（无 Bot Token 时也可运行，只是通知发不出去）──
     monitor = None
     if TG_API_ID and TG_API_HASH and TG_MONITOR_TARGETS:
-        from monitor import Monitor
+        from monitor import Monitor, set_monitor
         from notifier import send_private
         from pipeline import process_link
 
@@ -107,7 +107,12 @@ async def main():
                 if TG_USER_ID:
                     await send_private(int(TG_USER_ID), f"❌ 自动转存异常: {e}\n🔗 {url}")
 
-        monitor = Monitor(on_link_found=on_link_found)
+        async def on_login_prompt(prompt: str):
+            if TG_USER_ID:
+                await send_private(int(TG_USER_ID), prompt)
+
+        monitor = Monitor(on_link_found=on_link_found, on_login_prompt=on_login_prompt)
+        set_monitor(monitor)
         try:
             await monitor.start()
         except Exception as e:

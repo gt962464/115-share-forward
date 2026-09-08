@@ -28,6 +28,24 @@ from config import (
 logger = logging.getLogger("pipeline")
 
 
+# ── 取消机制 ──
+_cancel_flag = False
+
+
+def request_cancel():
+    global _cancel_flag
+    _cancel_flag = True
+
+
+def reset_cancel():
+    global _cancel_flag
+    _cancel_flag = False
+
+
+def is_cancelled() -> bool:
+    return _cancel_flag
+
+
 # ── P115Service 初始化（复用 p115client）──
 
 class _CardAccount:
@@ -194,6 +212,8 @@ async def fetch_share_video_files(share_url: str) -> list[str]:
 async def _save_share_with_retry(svc, url: str, metadata: dict = None, max_retries: int = 3) -> dict:
     """带重试的转存。"""
     for attempt in range(max_retries):
+        if is_cancelled():
+            return {"status": "cancelled", "message": "任务已取消"}
         try:
             res = await svc.save_and_share(url, metadata or {})
             if res and res.get("status") == "success":
@@ -226,7 +246,10 @@ async def process_link(
         {"status": "success", "share_link": "...", "title": "...", "size": "..."}
         {"status": "error", "message": "..."}
         {"status": "pending", "message": "..."}  # 审核中
+        {"status": "cancelled", "message": "..."}  # 已取消
     """
+    reset_cancel()  # 新任务开始，清空上一次的取消标志
+
     svc = await get_svc()
     
     # ── 1) 获取分享信息 ──
@@ -238,6 +261,8 @@ async def process_link(
         return {"status": "error", "message": "无法获取分享信息，链接可能无效或已过期"}
     
     # ── 2) 获取视频文件列表 ──
+    if is_cancelled():
+        return {"status": "cancelled", "message": "任务已取消"}
     if on_progress:
         await on_progress("📂 扫描文件列表...")
     
@@ -348,6 +373,8 @@ async def _wait_share_audit(svc, share_url: str, timeout: int = None) -> bool:
     
     start = time.time()
     while time.time() - start < timeout:
+        if is_cancelled():
+            return False
         try:
             resp = await svc.client.share_snap_app(
                 {"share_code": code, "receive_code": rc or "", "cid": 0, "limit": 10, "offset": 0},

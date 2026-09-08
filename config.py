@@ -19,6 +19,8 @@ CONFIG_SCHEMA = {
     "TG_BOT_TOKEN":          ("",     "Bot Token", True),
     "TG_CHANNEL_ID":         ("",     "输出频道 ID", False),
     "TG_USER_ID":            ("",     "管理员 ID", False),
+    "TG_ADMIN_IDS":          ("",     "额外管理员 ID（逗号分隔）", False),
+    "TG_ALLOW_SUBMIT_IDS":   ("",     "提交白名单 ID（逗号分隔，空=仅管理员）", False),
     "TG_API_ID":             ("",     "Telethon API ID", False),
     "TG_API_HASH":           ("",     "Telethon API Hash", True),
     "TG_PHONE":              ("",     "手机号（登录用）", True),
@@ -170,3 +172,8 @@ TG_ADMIN_IDS = {
 }
 if TG_USER_ID:
     TG_ADMIN_IDS.add(TG_USER_ID)
+
+# 提交链接白名单（空 = 仅管理员可提交）
+TG_ALLOW_SUBMIT_IDS = {
+    v for v in os.getenv("TG_ALLOW_SUBMIT_IDS", "").replace(",", " ").split() if v.strip()
+}
