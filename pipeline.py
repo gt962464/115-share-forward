@@ -197,18 +197,20 @@ VIDEO_EXTS = (
 )
 
 
-async def _walk_share_items(svc, share_url: str, payload) -> list:
-    """遍历分享全部条目。兼容不同版本 p115client：
-    旧版 share_iterdir_walk 吃 payload dict，新版直接吃链接字符串
-    （传 dict 会报 'dict' object has no attribute 'strip'）。"""
+async def _walk_share_items(svc, share_url: str, receive_code: str = "") -> list:
+    """遍历分享全部文件条目（新版 p115client API）。
+
+    share_iterdir_walk(client, share_code或链接, receive_code, async_=True)
+    每次 yield (pid, 目录列表, 文件列表) 三元组；
+    文件为 normalize 后的 dict（name/size/id/is_dir...）。
+    """
     from p115client.tool import share_iterdir_walk
-    try:
-        return [it async for it in share_iterdir_walk(svc.client, payload, async_=True)]
-    except AttributeError as e:
-        if "strip" not in str(e):
-            raise
-        logger.info("p115client 为新版签名，改用链接字符串遍历分享")
-        return [it async for it in share_iterdir_walk(svc.client, share_url, async_=True)]
+    items = []
+    async for _pid, _dirs, files in share_iterdir_walk(
+        svc.client, share_url, receive_code, async_=True,
+    ):
+        items.extend(files)
+    return items
 
 
 async def fetch_share_video_files(share_url: str) -> tuple[list[str], str]:
@@ -222,14 +224,10 @@ async def fetch_share_video_files(share_url: str) -> tuple[list[str], str]:
     total_files = 0
     samples = []
     try:
-        from p115client.util import share_extract_payload
-        payload = share_extract_payload(share_url)
-        for item in await _walk_share_items(svc, share_url, payload):
-            # 115 分享条目：文件带 fid，目录带 cid
-            is_dir = item.get("cid") is not None and item.get("fid") is None
-            if is_dir:
+        for item in await _walk_share_items(svc, share_url, rc):
+            if item.get("is_dir"):
                 continue
-            name = item.get("n", "") or item.get("fn", "") or item.get("name", "")
+            name = item.get("name") or item.get("n", "") or item.get("fn", "")
             if not name:
                 continue
             total_files += 1
@@ -316,6 +314,7 @@ async def process_link(
 
     _se = re.search(r"[Ss](\d{1,2})[Ee]\d{1,3}", base_name)
     season = int(_se.group(1)) if _se else None
+    ident_det = {}
     try:
         from identifier import resolve_title
         ident = await resolve_title(base_name, parsed["title"], parsed.get("year", ""), season)
@@ -323,6 +322,7 @@ async def process_link(
             display_title = ident["title"]
             parsed["year"] = ident.get("year") or parsed.get("year", "")
             tmdb_id = ident.get("tmdb_id")
+            ident_det = ident.get("det") or {}
             if ident.get("source") not in (None, "regex"):
                 logger.info(f"🤖 识别({ident['source']}): {display_title!r} ({parsed.get('year')})")
     except Exception as e:
@@ -384,8 +384,11 @@ async def process_link(
                 "title": display_title,
                 "quality": parsed["quality"],
                 "source": parsed["source"],
+                "episode": parsed.get("episode", ""),
+                "encode": parsed.get("encode", ""),
                 "size": format_size(total or 0),
                 "file_count": len(video_names),
+                "det": ident_det,
             }
         else:
             return {

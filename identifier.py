@@ -388,10 +388,10 @@ async def llm_verify_match(source_name: str, info: dict) -> bool | None:
 
 # ── TMDB 搜索（含 OpenAI 校验闸）──
 
-async def _aio_get(url: str, params: dict = None) -> tuple[int, str]:
+async def _aio_get(url: str, params: dict = None, headers: dict = None) -> tuple[int, str]:
     try:
         async with _session().get(
-            url, params=params, proxy=_proxy(),
+            url, params=params, headers=headers, proxy=_proxy(),
             timeout=aiohttp.ClientTimeout(total=20),
         ) as resp:
             return resp.status, await resp.text()
@@ -421,6 +421,7 @@ async def _tmdb_detail(media_type: str, item_id, item: dict = None) -> dict | No
     year_full = (det.get("release_date") or det.get("first_air_date")
                  or item.get("release_date") or item.get("first_air_date") or "")
     genres = [g.get("name", "") for g in (det.get("genres") or [])]
+    poster_path = det.get("poster_path") or item.get("poster_path")
     return {
         "title": display_name,
         "original_name": name_orig,
@@ -429,6 +430,7 @@ async def _tmdb_detail(media_type: str, item_id, item: dict = None) -> dict | No
         "genres": "、".join([g for g in genres if g]),
         "rating": det.get("vote_average") or item.get("vote_average") or 0,
         "overview": det.get("overview") or item.get("overview") or "",
+        "poster_url": f"https://image.tmdb.org/t/p/w500{poster_path}" if poster_path else "",
     }
 
 
@@ -568,6 +570,7 @@ async def resolve_title(raw_name: str, regex_title: str, regex_year: str = "",
                     "year": det.get("year") or regex_year,
                     "tmdb_id": det.get("tmdb_id"),
                     "source": "tmdb_eng",
+                    "det": det,
                 }
             logger.warning(f"⚠️ 年份差异过大，回退英文原名: {eng_title!r}")
             return {"title": eng_title, "year": regex_year, "tmdb_id": None, "source": "eng_fallback"}
@@ -585,9 +588,55 @@ async def resolve_title(raw_name: str, regex_title: str, regex_year: str = "",
                     "year": det.get("year") or llm_year or regex_year,
                     "tmdb_id": det.get("tmdb_id"),
                     "source": "tmdb_llm",
+                    "det": det,
                 }
         logger.info(f"🤖 LLM 识别: {regex_title!r} -> {llm_name!r}")
         return {"title": llm_name, "year": llm_year or regex_year, "tmdb_id": None, "source": "llm"}
 
     logger.info(f"⚠️ LLM/TMDB 未命中，使用正则标题: {regex_title!r}")
     return {"title": regex_title, "year": regex_year, "tmdb_id": None, "source": "regex"}
+
+
+# ── 豆瓣评分 + 海报下载（卡片用，尽力而为）──
+
+async def douban_rating(title: str) -> str:
+    """豆瓣评分（无官方 API，尽力而为，失败返回 ''）。"""
+    if not title:
+        return ""
+    try:
+        from urllib.parse import quote
+        headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://movie.douban.com/"}
+        st, text = await _aio_get(
+            f"https://movie.douban.com/j/subject_suggest?q={quote(title)}", headers=headers,
+        )
+        if st != 200:
+            return ""
+        items = json.loads(text) or []
+        if not items:
+            return ""
+        url = items[0].get("url")
+        if not url:
+            return ""
+        pst, ptext = await _aio_get(url, headers=headers)
+        if pst != 200:
+            return ""
+        m = re.search(r'property="v:average"[^>]*content="([\d.]+)"', ptext)
+        return f"{float(m.group(1)):.1f}" if m else ""
+    except Exception as e:
+        logger.warning(f"豆瓣评分获取失败: {e}")
+        return ""
+
+
+async def fetch_poster_bytes(poster_url: str) -> bytes | None:
+    """下载 TMDB 海报图片字节。"""
+    if not poster_url:
+        return None
+    try:
+        async with _session().get(
+            poster_url, proxy=_proxy(), timeout=aiohttp.ClientTimeout(total=20),
+        ) as resp:
+            if resp.status == 200:
+                return await resp.read()
+    except Exception as e:
+        logger.warning(f"海报下载失败: {e}")
+    return None

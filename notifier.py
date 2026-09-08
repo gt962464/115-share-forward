@@ -5,6 +5,7 @@ import os
 import asyncio
 import logging
 from typing import Optional
+from html import escape as html_escape
 from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
@@ -904,11 +905,83 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _handle_link(update.message, link["url"])
 
 
+# ══════════════════════════════════════════════
+#  影视卡片（带海报，移植自 card-bot build_card）
+# ══════════════════════════════════════════════
+
+def _build_card(title, year, genres, tmdb_rating, douban_rating, quality,
+                source, size_text, episode, encode, audio, link_line, overview) -> str:
+    """构造 Telegram HTML 卡片文本（发图时作为 caption，上限 1024 字节）。"""
+    def H(s): return html_escape(str(s) if s is not None else "", quote=False)
+
+    t = H(title) + (f" ({H(year)})" if year else "")
+    lines = [f"🎥 {t}", ""]
+    lines.append(f"🎬 类型：{H(genres) or '暂无'}")
+    lines.append(f"⭐️ TMDB 评分：{H(tmdb_rating) or '暂无评分'}")
+    lines.append(f"🍿 豆瓣评分：{H(douban_rating) or '暂无评分'}")
+    if quality:
+        lines.append(f"📺 画质：{H(quality)}")
+    if source:
+        lines.append(f"📼 视频：{H(source)}")
+    if size_text:
+        lines.append(f"💾 大小：{H(size_text)}")
+    # extra 行：集数 + 画质 + 源 + 编码，<pre> 包裹带「复制」按钮
+    extra = " ".join(x for x in [episode, quality, source, encode, audio] if x)
+    if extra:
+        lines.append(f"<pre>{H(extra)}</pre>")
+    lines.append("")
+    lines.append(link_line)
+    if overview:
+        lines.append("")
+        lines.append("📖 简介：")
+        ov = overview.strip()
+        if len(ov) > 300:
+            ov = ov[:300] + "…"
+        lines.append(f"<pre>{H(ov)}</pre>")
+    tags = [f"#{H(title)}"]
+    if genres and genres != "暂无":
+        tags += [f"#{H(g)}" for g in genres.split("、") if g]
+    lines.append("")
+    lines.append("🏷 标签：" + " ".join(tags))
+    text = "\n".join(lines)
+    if len(text.encode("utf-8")) > 1020:
+        text = text[:1010] + "…"
+    return text
+
+
+async def _send_card_to(chat_id, card: str, links_message: str = None,
+                        poster: bytes = None) -> bool:
+    """发送影视卡片（有海报发图，无海报发文），可带重试。links_message 随后单独发。"""
+    if not _bot:
+        return False
+    for attempt, delay in enumerate((0, 3, 8), 1):
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            if poster:
+                await _bot.send_photo(chat_id, photo=poster, caption=card,
+                                      parse_mode=ParseMode.HTML)
+            else:
+                await _bot.send_message(chat_id, card, parse_mode=ParseMode.HTML)
+            if links_message:
+                await _bot.send_message(chat_id, links_message, parse_mode=ParseMode.HTML)
+            return True
+        except Exception as e:
+            logger.warning(f"卡片发送失败 chat={chat_id} 第 {attempt}/3 次: {e}")
+    return False
+
+
+def _channel_target():
+    if not TG_CHANNEL_ID:
+        return None
+    return int(TG_CHANNEL_ID) if TG_CHANNEL_ID.lstrip("-").isdigit() else TG_CHANNEL_ID
+
+
 async def _handle_ed2k(message, ed2k_links: list):
-    """ed2k 链接：解析 → OpenAI/TMDB 识别 → 卡片回复（不进 115 转存）。"""
+    """ed2k 链接：解析 → OpenAI/TMDB 识别 → 海报卡片发私聊+频道（不进 115 转存）。"""
     import re as _re
     from pipeline import parse_filename, format_size, VIDEO_EXTS
-    from identifier import resolve_title
+    from identifier import resolve_title, douban_rating, fetch_poster_bytes
 
     items = []
     for url in ed2k_links:
@@ -926,28 +999,63 @@ async def _handle_ed2k(message, ed2k_links: list):
     season = int(_se.group(1)) if _se else None
 
     status_msg = await message.reply_text(f"🔍 识别 ed2k 资源: {base['name'][:60]}...")
+
     try:
         ident = await resolve_title(base["name"], parsed["title"], parsed.get("year", ""), season)
     except Exception as e:
         logger.warning(f"ed2k 识别失败: {e}")
-        ident = {"title": parsed["title"], "year": parsed.get("year", ""), "tmdb_id": None}
+        ident = {"title": parsed["title"], "year": parsed.get("year", ""), "tmdb_id": None, "det": {}}
+
+    det = ident.get("det") or {}
+    title = ident["title"]
+    year = ident.get("year", "")
+    poster = await fetch_poster_bytes(det.get("poster_url", "")) if det else None
+    douban = await douban_rating(title) if det else ""
 
     total = sum(it["size"] for it in items)
-    title_line = f"🎬 {ident['title']}" + (f" ({ident['year']})" if ident.get("year") else "")
-    lines = [title_line]
-    if ident.get("tmdb_id"):
-        lines.append(f"🆔 tmdbid-{ident['tmdb_id']}")
-    lines.append(f"📦 {len(items)} 个文件 · 💾 {format_size(total)}")
-    for it in items[:10]:
-        lines.append(f"  • {it['name']} ({format_size(it['size'])})")
-    lines.append("")
-    lines.append("🔗 ed2k 链接（点击复制）:")
-    for it in items[:5]:
-        lines.append(it["url"])
-    text = "\n".join(lines)
-    if len(text) > 4000:
-        text = text[:4000] + "\n...(内容过长已截断)"
-    await status_msg.edit_text(text, reply_markup=_back())
+    # 多集合并：S01E01-E12
+    episodes = sorted(
+        int(m.group(1)) for x in items
+        if (m := _re.search(r"[Ss]\d{1,2}[Ee](\d{1,3})", x["name"]))
+    )
+    episode_text = parsed["episode"]
+    if len(episodes) > 1:
+        _sm = _re.search(r"[Ss](\d{1,2})[Ee]", base["name"])
+        episode_text = f"S{int(_sm.group(1)):02d}E{episodes[0]:02d}-E{episodes[-1]:02d}" if _sm else parsed["episode"]
+
+    tmdb_rating = f"{float(det['rating']):.1f}/10" if det.get("rating") else "暂无评分"
+    card = _build_card(
+        title=title, year=year,
+        genres=det.get("genres") or "暂无",
+        tmdb_rating=tmdb_rating,
+        douban_rating=douban or "暂无评分",
+        quality=parsed["quality"], source=parsed["source"],
+        size_text=format_size(total), episode=episode_text,
+        encode=parsed["encode"], audio="",
+        link_line=f"🔗 ED2K 链接：共 {len(items)} 个文件（下方发完整链接）",
+        overview=det.get("overview", ""),
+    )
+    links_block = "\n".join(
+        f"{i}. {html_escape(u, quote=False)}" for i, u in enumerate(ed2k_links, 1)
+    )
+    links_message = (
+        f"📎 {title}｜完整 ED2K 链接（{len(ed2k_links)}个）：\n<pre>{links_block}</pre>"
+    )
+
+    # 私聊（回复给提交者）+ 频道分别发送
+    private_ok = await _send_card_to(message.chat.id, card, links_message, poster)
+    target = _channel_target()
+    channel_ok = await _send_card_to(target, card, links_message, poster) if target else False
+
+    try:
+        await status_msg.edit_text(
+            f"{'✅' if private_ok else '⚠️'} ed2k 卡片发送完成（未转存）\n"
+            f"私聊：{'成功' if private_ok else '失败'}"
+            + (f"｜频道：{'成功' if channel_ok else '失败'}" if target else "｜频道：未配置"),
+            reply_markup=_back(),
+        )
+    except Exception:
+        pass
 
 
 async def _handle_link(message, url: str):
@@ -964,20 +1072,31 @@ async def _handle_link(message, url: str):
     if result["status"] == "success":
         share_link = result["share_link"]
         title = result.get("title", "")
-        quality = result.get("quality", "")
-        size = result.get("size", "")
-        parts = ["✅ 转存成功!"]
-        if title:
-            parts.append(f"📺 {title}")
-        if quality:
-            parts.append(f"🎨 {quality}")
-        if size:
-            parts.append(f"💾 {size}")
-        parts.append(f"🔗 永久分享: {share_link}")
-        await status_msg.edit_text("\n".join(parts), reply_markup=_back())
-        if TG_CHANNEL_ID:
-            ch = f"📺 {title} [{quality}]\n💾 {size}\n🔗 {share_link}" if quality else f"📺 {title}\n🔗 {share_link}"
-            await send_channel(ch)
+        det = result.get("det") or {}
+
+        # 海报卡片（私聊 + 频道）
+        from identifier import douban_rating, fetch_poster_bytes
+        poster = await fetch_poster_bytes(det.get("poster_url", "")) if det else None
+        douban = await douban_rating(title) if det else ""
+        tmdb_rating = f"{float(det['rating']):.1f}/10" if det.get("rating") else "暂无评分"
+        card = _build_card(
+            title=title, year=det.get("year", ""),
+            genres=det.get("genres") or "暂无",
+            tmdb_rating=tmdb_rating,
+            douban_rating=douban or "暂无评分",
+            quality=result.get("quality", ""), source=result.get("source", ""),
+            size_text=result.get("size", ""), episode=result.get("episode", ""),
+            encode=result.get("encode", ""), audio="",
+            link_line=f'🔗 链接：<a href="{html_escape(share_link, quote=True)}">115网盘</a>',
+            overview=det.get("overview", ""),
+        )
+        await status_msg.edit_text(
+            f"✅ 转存成功: {title}\n🔗 永久分享: {share_link}", reply_markup=_back(),
+        )
+        await _send_card_to(message.chat.id, card, poster=poster)
+        target = _channel_target()
+        if target:
+            await _send_card_to(target, card, poster=poster)
 
     elif result["status"] == "pending":
         await status_msg.edit_text(
