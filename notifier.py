@@ -69,12 +69,14 @@ def _can_submit(user_id: int) -> bool:
 
 def _main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📥 提交链接", callback_data="menu_link")],
-        [InlineKeyboardButton("📊 运行状态", callback_data="menu_status")],
-        [InlineKeyboardButton("⚙️ 查看配置", callback_data="menu_config")],
-        [InlineKeyboardButton("📋 可配置项", callback_data="menu_setlist")],
-        [InlineKeyboardButton("📝 查看日志", callback_data="menu_log")],
-        [InlineKeyboardButton("❓ 帮助", callback_data="menu_help")],
+        [InlineKeyboardButton("📥 提交链接", callback_data="menu_link"),
+         InlineKeyboardButton("📊 运行状态", callback_data="menu_status")],
+        [InlineKeyboardButton("📡 监听管理", callback_data="menu_monitor"),
+         InlineKeyboardButton("📝 查看日志", callback_data="menu_log")],
+        [InlineKeyboardButton("⚙️ 查看配置", callback_data="menu_config"),
+         InlineKeyboardButton("📋 可配置项", callback_data="menu_setlist")],
+        [InlineKeyboardButton("🛑 取消任务", callback_data="menu_cancel"),
+         InlineKeyboardButton("❓ 帮助", callback_data="menu_help")],
     ])
 
 
@@ -210,6 +212,24 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text, parse_mode=ParseMode.MARKDOWN if is_md else None, reply_markup=_back(),
         )
 
+    # ── 监听管理 ──
+    elif data == "menu_monitor":
+        if not _is_admin(query.from_user.id):
+            await query.edit_message_text("⛔ 仅管理员可查看监听管理", reply_markup=_back())
+            return
+        monitor = get_monitor()
+        if not monitor:
+            await query.edit_message_text(
+                "📡 监听器未启用。\n需配置 TG_API_ID / TG_API_HASH / TG_MONITOR_TARGETS 后重启。",
+                reply_markup=_back(),
+            )
+            return
+        text = (
+            monitor.status_text()
+            + "\n\n管理命令:\n/monitor add <目标>\n/monitor remove <目标>\n/monitor mode <private|channel>"
+        )
+        await query.edit_message_text(text, reply_markup=_back())
+
     # ── 提交链接（提示用户发送）──
     elif data == "menu_link":
         await query.edit_message_text(
@@ -221,6 +241,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "或者直接粘贴链接到对话框，我会自动识别。",
             reply_markup=_back(),
         )
+
+    # ── 取消任务 ──
+    elif data == "menu_cancel":
+        if not _can_submit(query.from_user.id):
+            await query.edit_message_text("⛔ 你没有操作权限", reply_markup=_back())
+            return
+        from pipeline import request_cancel
+        request_cancel()
+        await query.edit_message_text("🛑 已请求取消，进行中的步骤会尽快停止。", reply_markup=_back())
 
     else:
         await query.edit_message_text("未知操作", reply_markup=_back())
