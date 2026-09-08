@@ -4,6 +4,8 @@ Telegram Bot API 交互器 - 用户操作 + 配置管理 + 通知
 import os
 import logging
 from typing import Optional
+from telegram import Update, Bot
+from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     ContextTypes, filters,
 )

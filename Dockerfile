@@ -20,4 +20,6 @@ COPY notifier.py /cardbot/notifier.py
 COPY monitor.py /cardbot/monitor.py
 
 WORKDIR /cardbot
+ENTRYPOINT []
 CMD ["python", "-u", "main.py"]
+
