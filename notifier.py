@@ -86,6 +86,62 @@ def _back_and_help() -> InlineKeyboardMarkup:
 
 
 # ══════════════════════════════════════════════
+#  公共文本构建（按钮与命令共用，避免重复）
+# ══════════════════════════════════════════════
+
+def _help_text() -> str:
+    return (
+        "📖 使用说明\n\n"
+        "📋 基本用法:\n"
+        "• 直接发 115 链接 → 自动转存+重命名+生成永久链接\n"
+        "• 也可以点「📥 提交链接」按钮\n\n"
+        "⚙️ 配置管理:\n"
+        "• 点「⚙️ 查看配置」查看当前配置\n"
+        "• 用 /set <KEY> <VALUE> 修改配置\n"
+        "• /status 运行状态 · /log [N] 最近 N 条日志\n\n"
+        "🔗 支持域名: 115.com / 115cdn.com / anxia.com\n"
+        "📡 监听: Postedia_bot 等解锁机器人的消息"
+    )
+
+
+async def _status_text() -> str:
+    from pipeline import get_svc
+    from config import TG_MONITOR_TARGETS
+    try:
+        svc = await get_svc()
+        status = "✅ 正常" if svc and svc.client else "❌ 未连接"
+        busy = "繁忙" if svc and svc.is_busy else "空闲"
+    except Exception:
+        status = "❌ 初始化失败"
+        busy = "未知"
+    return (
+        "📊 运行状态\n\n"
+        f"115 客户端: {status}\n"
+        f"处理队列: {busy}\n"
+        f"监听目标: {len(TG_MONITOR_TARGETS)} 个\n"
+        f"输出频道: {TG_CHANNEL_ID or '未配置'}"
+    )
+
+
+def _log_text(n: int = 20) -> tuple:
+    """读取最近 n 条日志。返回 (text, use_markdown)。"""
+    from pathlib import Path
+    log_file = Path(os.getenv("LOG_FILE", "/data/bot.log"))
+    if not log_file.exists():
+        return "📝 暂无日志文件", False
+    try:
+        lines = log_file.read_text(encoding="utf-8").splitlines()
+        recent = lines[-n:]
+        body = "\n".join(recent).replace("```", "``")
+        text = f"📝 最近 {len(recent)} 条日志:\n\n```\n{body}\n```"
+        if len(text) > 3800:
+            text = text[-3800:]
+        return text, True
+    except Exception as e:
+        return f"读取日志失败: {e}", False
+
+
+# ══════════════════════════════════════════════
 #  /start → 主菜单
 # ══════════════════════════════════════════════
 
@@ -114,38 +170,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── 帮助 ──
     elif data == "menu_help":
-        await query.edit_message_text(
-            "📖 使用说明\n\n"
-            "📋 基本用法:\n"
-            "• 直接发 115 链接 → 自动转存+重命名+生成永久链接\n"
-            "• 也可以点「📥 提交链接」按钮\n\n"
-            "⚙️ 配置管理:\n"
-            "• 点「⚙️ 查看配置」查看当前配置\n"
-            "• 用 /set <KEY> <VALUE> 修改配置\n\n"
-            "🔗 支持域名: 115.com / 115cdn.com / anxia.com\n"
-            "📡 监听: Postedia_bot 等解锁机器人的消息",
-            reply_markup=_back(),
-        )
+        await query.edit_message_text(_help_text(), reply_markup=_back())
 
     # ── 运行状态 ──
     elif data == "menu_status":
-        from pipeline import get_svc
-        from config import TG_MONITOR_TARGETS
-        try:
-            svc = await get_svc()
-            status = "✅ 正常" if svc and svc.client else "❌ 未连接"
-            busy = "繁忙" if svc and svc.is_busy else "空闲"
-        except Exception:
-            status = "❌ 初始化失败"
-            busy = "未知"
-        await query.edit_message_text(
-            f"📊 运行状态\n\n"
-            f"115 客户端: {status}\n"
-            f"处理队列: {busy}\n"
-            f"监听目标: {len(TG_MONITOR_TARGETS)} 个\n"
-            f"输出频道: {TG_CHANNEL_ID or '未配置'}",
-            reply_markup=_back(),
-        )
+        await query.edit_message_text(await _status_text(), reply_markup=_back())
 
     # ── 查看配置 ──
     elif data == "menu_config":
@@ -169,22 +198,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── 查看日志 ──
     elif data == "menu_log":
-        from pathlib import Path
-        log_file = Path("/data/bot.log")
-        if not log_file.exists():
-            await query.edit_message_text("📝 暂无日志文件", reply_markup=_back())
-            return
-        try:
-            lines = log_file.read_text(encoding="utf-8").splitlines()
-            recent = lines[-20:]
-            text = f"📝 最近 {len(recent)} 条日志:\n\n" + "\n".join(recent)
-            if len(text) > 3800:
-                text = text[-3800:]
-            await query.edit_message_text(
-                f"```\n{text}\n```", parse_mode=ParseMode.MARKDOWN, reply_markup=_back(),
-            )
-        except Exception as e:
-            await query.edit_message_text(f"读取日志失败: {e}", reply_markup=_back())
+        text, is_md = _log_text()
+        await query.edit_message_text(
+            text, parse_mode=ParseMode.MARKDOWN if is_md else None, reply_markup=_back(),
+        )
 
     # ── 提交链接（提示用户发送）──
     elif data == "menu_link":
@@ -278,6 +295,59 @@ async def cmd_setlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ══════════════════════════════════════════════
+#  /help /status /log /stats /restart 命令
+# ══════════════════════════════════════════════
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(_help_text(), reply_markup=_back())
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(await _status_text(), reply_markup=_back())
+
+
+async def cmd_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    n = 20
+    if context.args:
+        try:
+            n = max(1, min(int(context.args[0]), 200))
+        except ValueError:
+            pass
+    text, is_md = _log_text(n)
+    await update.message.reply_text(
+        text, parse_mode=ParseMode.MARKDOWN if is_md else None, reply_markup=_back(),
+    )
+
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from config import TG_MONITOR_TARGETS, AUTO_RENAME
+    from pipeline import get_svc
+    try:
+        svc = await get_svc()
+        connected = bool(svc and svc.client)
+    except Exception:
+        connected = False
+    lines = [
+        "📈 统计信息\n",
+        f"115 客户端: {'✅ 已连接' if connected else '❌ 未连接'}",
+        f"监听目标数: {len(TG_MONITOR_TARGETS)}",
+        f"输出频道: {TG_CHANNEL_ID or '未配置'}",
+        f"自动重命名: {'开' if AUTO_RENAME else '关'}",
+    ]
+    await update.message.reply_text("\n".join(lines), reply_markup=_back())
+
+
+async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ 仅管理员可使用此命令", reply_markup=_back())
+        return
+    await update.message.reply_text("🔄 正在重启，几秒后恢复...")
+    logger.info("收到 /restart 命令，退出进程以触发容器重启")
+    import threading
+    threading.Timer(1.5, lambda: os._exit(0)).start()
+
+
+# ══════════════════════════════════════════════
 #  自动识别 115 链接 + 转存结果
 # ══════════════════════════════════════════════
 
@@ -345,6 +415,11 @@ def setup_bot() -> Application:
     app.add_handler(CommandHandler("config", cmd_config))
     app.add_handler(CommandHandler("set", cmd_set))
     app.add_handler(CommandHandler("setlist", cmd_setlist))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("log", cmd_log))
+    app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("restart", cmd_restart))
 
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

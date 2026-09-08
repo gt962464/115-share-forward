@@ -56,25 +56,48 @@ docker-compose up -d
 
 ### 3. 登录 Telethon（首次）
 
+Telethon 用**用户账号**（手机号 + 验证码）登录，用于监听目标 Bot。**注意：`docker logs -f` 是只读的，无法输入验证码。**
+
+方式一（推荐，一次性手动登录，session 会持久化）：
+
 ```bash
-docker logs -f 115-bot
-# 输入手机号和验证码完成登录
+docker exec -it 115-bot python -c "
+from telethon import TelegramClient
+from config import TG_API_ID, TG_API_HASH, TG_PHONE, TG_SESSION
+c = TelegramClient(TG_SESSION, TG_API_ID, TG_API_HASH)
+c.start(phone=TG_PHONE)
+print('登录成功')
+"
 ```
 
-登录成功后 session 会保存到 `data/user.session`，重启不需要再登录。
+方式二（脚本化，通过环境变量传验证码后重启）：在 `.env` 里临时加：
+
+```bash
+TG_LOGIN_CODE=你的验证码
+# 若开了二步验证，再加：
+TG_LOGIN_PASSWORD=你的二步密码
+```
+
+重启容器完成登录后，**记得删掉这两个变量再重启**，避免每次启动都触发登录流程。
+
+登录成功后 session 保存到 `data/user.session`，后续重启不需要再登录。
 
 ## 命令
 
 | 命令 | 说明 |
 |------|------|
-| `/start` | 帮助信息 |
+| `/start` | 显示功能按钮主菜单 |
+| `/help` | 使用说明 |
 | `/link <url>` | 手动提交 115 链接 |
 | `/status` | 运行状态 |
-| `/log [N]` | 查看最近 N 条日志 |
-| `/config` | 当前配置 |
+| `/log [N]` | 查看最近 N 条日志（默认 20） |
+| `/config` | 当前配置（仅管理员） |
+| `/set <KEY> <VALUE>` | 修改配置（仅管理员） |
+| `/setlist` | 查看可配置项（仅管理员） |
 | `/stats` | 统计信息 |
+| `/restart` | 重启 Bot（仅管理员，依赖容器 restart 策略） |
 
-直接发送 115 链接也会自动处理。
+直接发送 115 链接也会自动处理，也可以在 `/start` 后点按钮操作。
 
 ## 监听模式
 

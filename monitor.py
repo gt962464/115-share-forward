@@ -157,20 +157,44 @@ class Monitor:
                     logger.error(f"处理链接回调失败: {e}")
     
     async def _login_flow(self):
-        """交互式登录流程。"""
+        """交互式登录流程（优先读环境变量，其次 stdin，最后提示手动登录）。"""
         if not TG_PHONE:
             raise RuntimeError("需要 TG_PHONE 配置才能登录")
-        
+
         logger.info(f"📱 向 {TG_PHONE} 发送验证码...")
         result = await self.client.send_code_request(TG_PHONE)
-        
-        code = input("请输入验证码: ")
+
+        # 优先从环境变量读验证码（脚本化登录，避免 Docker 里 input() 卡死）
+        code = os.getenv("TG_LOGIN_CODE", "").strip()
+        if not code:
+            try:
+                code = input("请输入验证码: ").strip()
+            except (EOFError, OSError):
+                logger.error(
+                    "❌ 非交互环境无法读取验证码（docker logs 是只读的，无法输入）。\n"
+                    "二选一：\n"
+                    "1) 设置环境变量 TG_LOGIN_CODE=<验证码> 后重启容器；\n"
+                    "2) 手动登录一次（session 持久化到 data/user.session）：\n"
+                    '''   docker exec -it 115-bot python -c "from telethon import TelegramClient; from config import TG_API_ID, TG_API_HASH, TG_PHONE, TG_SESSION; c=TelegramClient(TG_SESSION, TG_API_ID, TG_API_HASH); c.start(phone=TG_PHONE); print('登录成功')"'''
+                )
+                raise RuntimeError("需要交互式登录（见上方指引）")
+
         try:
-            await self.client.sign_in(TG_PHONE, code.strip(), phone_code_hash=result.phone_code_hash)
+            await self.client.sign_in(TG_PHONE, code, phone_code_hash=result.phone_code_hash)
         except SessionPasswordNeededError:
-            password = input("需要二步验证密码: ")
+            password = os.getenv("TG_LOGIN_PASSWORD", "").strip()
+            if not password:
+                try:
+                    password = input("需要二步验证密码: ").strip()
+                except (EOFError, OSError):
+                    logger.error(
+                        "❌ 需要二步验证密码，但无法在非交互环境读取。\n"
+                        "请设置环境变量 TG_LOGIN_PASSWORD=<密码> 后重启，\n"
+                        "或用 docker exec -it 手动登录。"
+                    )
+                    raise RuntimeError("需要二步验证密码（见上方指引）")
             await self.client.sign_in(password=password)
-        
+
         logger.info("✅ 登录成功!")
     
     async def stop(self):

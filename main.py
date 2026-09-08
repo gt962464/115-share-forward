@@ -37,41 +37,29 @@ async def main():
     logger.info("🚀 115 分享转存机器人 v2 启动中...")
     logger.info("=" * 50)
 
-    # 检查配置，如果 TG_BOT_TOKEN 为空则进入「等待配置」模式
-    waiting_mode = not TG_BOT_TOKEN
-    if waiting_mode:
-        logger.warning("⚠️ 未配置 TG_BOT_TOKEN，进入等待配置模式...")
-        logger.warning("⚠️ 请通过其他方式设置 TG_BOT_TOKEN 后重启")
+    # ── 1) 启动 Bot API（无 token 则跳过，进入等待配置模式）──
+    app = None
+    bot = None
+    me = None
 
-    # ── 1) 启动 Bot API ──
-    from notifier import setup_bot, set_bot
+    if TG_BOT_TOKEN:
+        from notifier import setup_bot, set_bot
 
-    app = setup_bot()
-    bot = app.bot
-    set_bot(bot)
+        app = setup_bot()
+        bot = app.bot
+        set_bot(bot)
 
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling(drop_pending_updates=True)
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling(drop_pending_updates=True)
 
-    me = await bot.get_me()
-    logger.info(f"✅ Bot 启动成功: @{me.username} ({me.first_name})")
+        me = await bot.get_me()
+        logger.info(f"✅ Bot 启动成功: @{me.username} ({me.first_name})")
+    else:
+        logger.warning("⚠️ 未配置 TG_BOT_TOKEN，Bot API 未启动（等待配置模式）。")
+        logger.warning("⚠️ 请在 .env 里填好 TG_BOT_TOKEN 后重启容器。")
 
-    if waiting_mode:
-        # 通知管理员配置缺失
-        for admin_id in (TG_USER_ID or "").split():
-            if admin_id.strip():
-                try:
-                    await bot.send_message(
-                        int(admin_id.strip()),
-                        "⚠️ Bot 已启动但缺少关键配置。\n"
-                        "请发送 /set TG_BOT_TOKEN <token> 设置 Token\n"
-                        "然后发送 /restart 重启。"
-                    )
-                except Exception:
-                    pass
-
-    # ── 2) 启动 Telethon 监听器 ──
+    # ── 2) 启动 Telethon 监听器（无 Bot Token 时也可运行，只是通知发不出去）──
     monitor = None
     if TG_API_ID and TG_API_HASH and TG_MONITOR_TARGETS:
         from monitor import Monitor
@@ -127,8 +115,11 @@ async def main():
             logger.info("💡 请确保已配置 TG_API_ID / TG_API_HASH / TG_PHONE")
 
     logger.info("=" * 50)
-    logger.info("✅ 所有组件启动完成!")
-    logger.info(f"  - Bot: @{me.username}")
+    logger.info("✅ 启动流程完成!")
+    if me:
+        logger.info(f"  - Bot: @{me.username}")
+    else:
+        logger.info("  - Bot: 未启动（缺少 TG_BOT_TOKEN）")
     logger.info(f"  - 监听器: {'运行中' if monitor and monitor.is_running else '未启用'}")
     logger.info("=" * 50)
 
@@ -141,9 +132,10 @@ async def main():
         logger.info("🛑 正在关闭...")
         if monitor:
             await monitor.stop()
-        await app.updater.stop()
-        await app.stop()
-        await app.shutdown()
+        if app:
+            await app.updater.stop()
+            await app.stop()
+            await app.shutdown()
         logger.info("👋 已关闭")
 
 
