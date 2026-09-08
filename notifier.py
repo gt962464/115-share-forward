@@ -943,15 +943,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-    try:
-        for link in links:
-            await _handle_link(update.message, link["url"])
-    except Exception as e:
-        logger.error(f"❌ 115 链接处理异常: {e}", exc_info=True)
+    # 用后台任务处理链接，避免审核等待阻塞整个 bot
+    async def _process_all_links():
         try:
-            await update.message.reply_text(f"❌ 链接处理出错: {e}", reply_markup=_back())
-        except Exception:
-            pass
+            for link in links:
+                await _handle_link(message, link["url"])
+        except Exception as e:
+            logger.error(f"❌ 115 链接处理异常: {e}", exc_info=True)
+            try:
+                await message.reply_text(f"❌ 链接处理出错: {e}", reply_markup=_back())
+            except Exception:
+                pass
+    asyncio.create_task(_process_all_links())
 
 
 # ══════════════════════════════════════════════

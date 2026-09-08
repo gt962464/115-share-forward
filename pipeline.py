@@ -699,16 +699,16 @@ async def _get_dir_items(svc, cid: int) -> list:
 
 
 async def _wait_share_audit(svc, share_url: str, timeout: int = None) -> bool:
-    """等待分享审核完成。返回 True=审核通过可发布，False=超时/失效/违规。"""
-    timeout = timeout or SHARE_AUDIT_WAIT_TIMEOUT
-    start = time.time()
-    while time.time() - start < timeout:
+    """等待分享审核完成。返回 True=审核通过可发布，False=失效/违规。无超时，直到有明确结果。"""
+    poll_interval = SHARE_AUDIT_POLL_INTERVAL
+    poll_count = 0
+    while True:
         if is_cancelled():
             return False
         try:
             status = await svc.get_share_status(share_url)
             if status is None:
-                await asyncio.sleep(SHARE_AUDIT_POLL_INTERVAL)
+                await asyncio.sleep(poll_interval)
                 continue
             if status.get("is_expired"):
                 logger.warning(f"❌ 分享已失效: {share_url}")
@@ -719,11 +719,11 @@ async def _wait_share_audit(svc, share_url: str, timeout: int = None) -> bool:
             if not status.get("is_pending"):
                 logger.info(f"✅ 115 分享审核完成，允许推送: {share_url}")
                 return True
-            logger.info(f"⏳ 115 分享仍在系统处理中...")
+            poll_count += 1
+            logger.info(f"⏳ 115 分享仍在系统处理中... (第{poll_count}次轮询)")
         except Exception as e:
             logger.warning(f"⚠️ 审核状态查询异常: {e}")
-        await asyncio.sleep(SHARE_AUDIT_POLL_INTERVAL)
-    return False
+        await asyncio.sleep(poll_interval)
 
 
 # ── 自动清理（分享+发卡成功后删除源文件 + 清空回收站）──
