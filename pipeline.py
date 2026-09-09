@@ -628,7 +628,18 @@ async def process_link(
     if not to_cid:
         return {"status": "error", "message": "转存成功但未返回目标目录"}
     
-    # ── 5) 重命名：对齐 zip 版逻辑（顶层文件夹 + 每个视频文件）──
+    # ── 5) 等待目录内容就位（115 异步复制可能延迟）──
+    if AUTO_RENAME:
+        for _wait in range(60):
+            items = await _get_dir_items(svc, to_cid)
+            if items:
+                logger.info(f"✅ 目录已就位，{len(items)} 个项目 (等待 {_wait*2}s)")
+                break
+            await asyncio.sleep(2)
+        else:
+            logger.warning(f"⚠️ 等待 120s 后目录仍为空，跳过重命名")
+
+    # ── 5b) 重命名：对齐 zip 版逻辑（顶层文件夹 + 每个视频文件）──
     if AUTO_RENAME:
         if on_progress:
             await on_progress(f"✏️ 重命名: {display_title}")
@@ -655,18 +666,43 @@ async def process_link(
         # 检查审核状态
         ready = await _wait_share_audit(svc, share_res)
         if ready:
+            # ── 基于所有 video_names 统计真实集数范围 ──
+            episode = parsed.get("episode", "")
+            ep_numbers = []
+            for vn in video_names:
+                em = re.search(r"[Ss](\d{1,2})[Ee](\d{2,3})", vn)
+                if em:
+                    ep_numbers.append((int(em.group(1)), int(em.group(2))))
+            if ep_numbers:
+                seasons = set(s for s, _ in ep_numbers)
+                if len(seasons) == 1:
+                    s = list(seasons)[0]
+                    eps = sorted(set(e for _, e in ep_numbers))
+                    if len(eps) == 1:
+                        episode = f"S{s:02d}E{eps[0]:02d}"
+                    else:
+                        episode = f"S{s:02d}E{eps[0]:02d}-E{eps[-1]:02d}"
+                else:
+                    parts = []
+                    for s in sorted(seasons):
+                        eps = sorted(set(e for ss, e in ep_numbers if ss == s))
+                        parts.append(f"S{s:02d}E{eps[0]:02d}-E{eps[-1]:02d}")
+                    episode = " ".join(parts)
+            logger.info(f"📊 集数统计: {len(ep_numbers)} 集, 结果: {episode or '(电影/无集数)'}")
+
             return {
                 "status": "success",
                 "share_link": share_res,
                 "title": display_title,
                 "quality": parsed["quality"],
                 "source": parsed["source"],
-                "episode": parsed.get("episode", ""),
+                "episode": episode,
                 "encode": parsed.get("encode", ""),
                 "size": format_size(total or 0),
                 "file_count": len(video_names),
                 "det": ident_det,
                 "to_cid": to_cid,
+                "video_names": video_names,
             }
         else:
             return {
@@ -689,12 +725,18 @@ async def process_link(
 
 
 async def _get_dir_items(svc, cid: int) -> list:
-    """获取目录下的文件/文件夹列表。"""
+    """获取目录下的文件/文件夹列表，使用 p115Service 的带重试方法。"""
     try:
-        resp = await svc.client.fs_files({"cid": cid, "limit": 1000, "offset": 0}, async_=True)
+        if hasattr(svc, "_get_dir_items"):
+            items = await svc._get_dir_items(cid)
+            return [{"id": it["id"], "name": it["name"], "is_dir": it["is_dir"]} for it in items]
+        resp = await svc.client.fs_files({"cid": cid, "limit": 1000, "offset": 0, "show_dir": 1}, async_=True)
         data = (resp or {}).get("data", {})
-        return data.get("list", [])
-    except Exception:
+        if isinstance(data, dict):
+            data = data.get("list", [])
+        return data or []
+    except Exception as e:
+        logger.warning(f"⚠️ _get_dir_items 异常: {e}")
         return []
 
 

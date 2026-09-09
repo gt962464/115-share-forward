@@ -47,13 +47,19 @@ async def send_private(chat_id: int, text: str, parse_mode: str = None):
 
 
 async def send_channel(text: str, parse_mode: str = None):
-    if not _bot or not TG_CHANNEL_ID:
+    if not _bot:
+        logger.warning("⚠️ send_channel: _bot 未初始化")
+        return
+    if not TG_CHANNEL_ID:
+        logger.warning("⚠️ send_channel: TG_CHANNEL_ID 未设置")
         return
     try:
         target = int(TG_CHANNEL_ID) if TG_CHANNEL_ID.lstrip("-").isdigit() else TG_CHANNEL_ID
+        logger.info(f"📤 正在发送到频道: {target}")
         await _bot.send_message(chat_id=target, text=text, parse_mode=parse_mode)
+        logger.info(f"✅ 频道消息发送成功")
     except Exception as e:
-        logger.warning(f"发送频道消息失败: {e}")
+        logger.warning(f"❌ 发送频道消息失败: {e}")
 
 
 def _is_admin(user_id: int) -> bool:
@@ -317,25 +323,74 @@ async def _render_monitor(query):
 
 
 async def _auto_process_and_notify(chat_id: int, url: str, source_name: str):
-    """监听到链接后的自动转存 + 私聊通知（Bot 内启动监听时的回调）。"""
+    """监听到链接后的自动转存 + 卡片私聊 + 卡片频道 + 自动清理（闭环）。"""
     await send_private(chat_id, f"🔔 监听到新链接!\n来源: {source_name}\n🔗 {url[:80]}...\n⏳ 正在自动转存...")
     try:
         result = await process_link(url)
         if result["status"] == "success":
-            text = (
-                f"✅ 自动转存成功!\n"
-                f"📺 {result.get('title', '')}\n"
-                f"🎨 {result.get('quality', '')}\n"
-                f"💾 {result.get('size', '')}\n"
-                f"🔗 {result['share_link']}"
-            )
+            share_link = result["share_link"]
+            title = result.get("title", "")
+            det = result.get("det") or {}
+
+            # ── 海报 + 评分 + 卡片 ──
+            poster = None
+            douban = ""
+            try:
+                from identifier import douban_rating, fetch_poster_bytes
+                poster = await fetch_poster_bytes(det.get("poster_url", "")) if det else None
+            except Exception as e:
+                logger.warning(f"⚠️ 海报下载失败（不影响转存）: {e}")
+            try:
+                from identifier import douban_rating as _dr
+                douban = await _dr(title) if det else ""
+            except Exception:
+                pass
+
+            tmdb_rating = f"{float(det['rating']):.1f}/10" if det.get("rating") else "暂无评分"
+            try:
+                card = _build_card(
+                    title=title, year=det.get("year", ""),
+                    genres=det.get("genres") or "暂无",
+                    tmdb_rating=tmdb_rating,
+                    douban_rating=douban or "暂无评分",
+                    quality=result.get("quality", ""),
+                    source=result.get("source", ""),
+                    size_text=result.get("size", ""),
+                    episode=result.get("episode", ""),
+                    encode=result.get("encode", ""),
+                    audio="",
+                    link_line=f'🔗 链接：<a href="{html_escape(share_link, quote=True)}">115网盘</a>',
+                    overview=det.get("overview", ""),
+                )
+            except Exception as e:
+                logger.warning(f"⚠️ 卡片构建失败，降级为纯文本: {e}")
+                card = f"✅ 自动转存成功: {title}\n🔗 {share_link}"
+
+            # ── 私聊卡片 ──
+            await _send_card_to(chat_id, card, poster=poster)
+            # ── 频道卡片（闭环）──
+            target = _channel_target()
+            if target:
+                await _send_card_to(target, card, poster=poster)
+            # ── 安排自动清理源文件 ──
+            to_cid = result.get("to_cid")
+            if to_cid:
+                from pipeline import schedule_cleanup
+                schedule_cleanup(to_cid, name=title, share_link=share_link)
+            logger.info(f"✅ 自动转存成功(闭环): {title} → {share_link}")
+
         elif result["status"] == "pending":
             text = f"⏳ 转存中（审核中）: {result.get('message', '')}\n🔗 {result.get('share_link', url)}"
+            await send_private(chat_id, text)
+            target = _channel_target()
+            if target:
+                await send_channel(text)
         else:
             text = f"❌ 自动转存失败: {result.get('message', '未知错误')}\n🔗 {url}"
-        await send_private(chat_id, text)
+            await send_private(chat_id, text)
+
     except Exception as e:
-        logger.error(f"自动转存异常: {e}")
+        logger.error(f"自动转存异常: {e}", exc_info=True)
         await send_private(chat_id, f"❌ 自动转存异常: {e}\n🔗 {url}")
 
 
@@ -944,14 +999,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
     # 用后台任务处理链接，避免审核等待阻塞整个 bot
+    _msg = update.message
     async def _process_all_links():
         try:
             for link in links:
-                await _handle_link(message, link["url"])
+                await _handle_link(_msg, link["url"])
         except Exception as e:
             logger.error(f"❌ 115 链接处理异常: {e}", exc_info=True)
             try:
-                await message.reply_text(f"❌ 链接处理出错: {e}", reply_markup=_back())
+                await _msg.reply_text(f"❌ 链接处理出错: {e}", reply_markup=_back())
             except Exception:
                 pass
     asyncio.create_task(_process_all_links())
