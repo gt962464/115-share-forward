@@ -396,9 +396,9 @@ def parse_filename(name: str) -> dict:
     # 年份：从去掉扩展名的文件名提取 4 位年份（排除 1080P/2160P 等干扰）
     ym = re.search(r"(?<![A-Za-z0-9])(19\d{2}|20\d{2})(?![\dpPiI])", base)
     year = ym.group(1) if ym else ""
-    # 提取 {tmbid-xxx}
-    tid = re.search(r"\{tmbid-(\d+)\}", base, re.IGNORECASE)
-    tmdb_id = int(tid.group(1)) if tid else None
+    # 提取 {tmdbid-xxx} / {tmdb-xxx} / {tmbid-xxx}（复用已有正则）
+    _tid_m = _TMDBID_MARKER_RE.search(base)
+    tmdb_id = int(_tid_m.group(1)) if _tid_m else None
     return {
         "title": title_raw or name,
         "quality": quality,
