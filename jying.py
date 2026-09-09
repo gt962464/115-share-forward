@@ -2,6 +2,7 @@
 import os
 import logging
 import httpx
+import uuid
 
 logger = logging.getLogger("jying")
 
@@ -95,7 +96,9 @@ async def upload_resource(title: str, year: str, tmdb_id, link: str, filename: s
         payload["tmdb_id"] = str(tmdb_id)
     try:
         async with httpx.AsyncClient(timeout=30) as c:
-            r = await c.post(f"{BASE}/resources/upload/", headers=_headers(), json=payload)
+            headers = _headers()
+            headers["Idempotency-Key"] = str(uuid.uuid4())
+            r = await c.post(f"{BASE}/resources/upload/", headers=headers, json=payload)
             return r.json()
     except Exception as e:
         logger.error(f"聚影上传异常: {e}")

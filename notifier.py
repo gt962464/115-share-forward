@@ -382,6 +382,7 @@ async def _render_monitor(query):
 
 
 async def _auto_process_and_notify(chat_id: int, url: str, source_name: str):
+    print('>>> _auto_process_and_notify ENTERED', flush=True)
     """监听到链接后的自动转存 + 卡片私聊 + 卡片频道 + 自动清理（闭环）。"""
     await send_private(chat_id, f"🔔 监听到新链接!\n来源: {source_name}\n🔗 {url[:80]}...\n⏳ 正在自动转存...")
     try:
@@ -1362,6 +1363,12 @@ async def _handle_link(message, url: str):
                 schedule_cleanup(result.get("to_cid"), title, share_link)
         except Exception as e:
             logger.warning(f"⚠️ 安排清理任务失败（不影响转存）: {e}")
+
+        # auto sync to jying
+        try:
+            await sync_to_jying(result, chat_id=message.chat.id)
+        except Exception as e:
+            logger.warning(f"Jying sync error (non-fatal): {e}")
 
     elif result["status"] == "pending":
         try:
