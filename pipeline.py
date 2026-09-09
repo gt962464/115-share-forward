@@ -37,6 +37,12 @@ if _P115_API_BASE:
     except Exception as _e:
         logging.getLogger("pipeline").warning(f"⚠️ P115 API 切换失败（将用默认）: {_e}")
 
+# Apply fs_rename GET patch
+try:
+    import fix_rename  # noqa: F401
+except Exception as _e:
+    logging.getLogger("pipeline").warning(f"fix_rename import failed: {_e}")
+
 from config import (
     P115_COOKIE, P115_SAVE_DIR, AUTO_RENAME,
     SHARE_AUDIT_WAIT_TIMEOUT, SHARE_AUDIT_POLL_INTERVAL,
