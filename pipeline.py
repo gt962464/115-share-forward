@@ -81,7 +81,7 @@ def extract_hdr(name: str) -> str:
 
 
 # 分享根名里可能的 TMDB id 标记：如 "Z 遮天{tmdbid-224839}." / "xxx{tmdb:123456}"
-_TMDBID_MARKER_RE = re.compile(r"\{\s*tmdb[-_]?id\s*[-:]\s*(\d{3,8})\s*\}", re.I)
+_TMDBID_MARKER_RE = re.compile(r"\{\s*tmdb(?:[-_]?id)?\s*[-:]\s*(\d{3,8})\s*\}", re.I)
 
 
 def parse_tmdbid_marker(name: str):
@@ -457,7 +457,7 @@ async def fetch_share_info(share_url: str) -> tuple[Optional[str], Optional[int]
             # 估算总大小
             total = 0
             for item in data.get("list", []):
-                total += int(item.get("size", 0) or item.get("file_size", 0) or 0)
+                total += int(item.get("size", 0) or item.get("file_size", 0) or item.get("fs", 0) or 0)
             return title, total
         except Exception as e:
             logger.warning(f"fetch_share_info ({fn_name}) 失败: {e}")
