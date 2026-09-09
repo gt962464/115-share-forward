@@ -20,6 +20,10 @@ COPY pipeline.py /cardbot/pipeline.py
 COPY notifier.py /cardbot/notifier.py
 COPY monitor.py /cardbot/monitor.py
 COPY identifier.py /cardbot/identifier.py
+COPY jying.py /cardbot/jying.py
+COPY jying_menu.py /cardbot/jying_menu.py
+COPY _jying_cache.py /cardbot/_jying_cache.py
+COPY jying_scheduler.py /cardbot/jying_scheduler.py
 
 WORKDIR /cardbot
 ENTRYPOINT []
