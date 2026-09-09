@@ -417,7 +417,16 @@ async def _tmdb_detail(media_type: str, item_id, item: dict = None) -> dict | No
     else:
         name_local = det.get("title", "") or item.get("title", "")
         name_orig = det.get("original_title", "") or item.get("original_title", "")
-    display_name = name_orig if (orig_lang == "zh" and name_orig) else (name_local or name_orig)
+    # 优先用本地化名；如果本地化名为空，对非中文内容尝试用搜索结果的 name（通常是英文）
+    _has_latin = bool(re.search(r"[A-Za-z]{2,}", name_local or ""))
+    _has_cjk = bool(re.search(r"[\u4e00-\u9fff]", name_local or ""))
+    if name_local and (_has_cjk or _has_latin):
+        display_name = name_local
+    elif orig_lang == "zh" and name_orig:
+        display_name = name_orig
+    else:
+        # 非中文内容且无本地化名：尝试从搜索结果 item 取英文名
+        display_name = (item or {}).get("name") or name_local or name_orig
     year_full = (det.get("release_date") or det.get("first_air_date")
                  or item.get("release_date") or item.get("first_air_date") or "")
     genres = [g.get("name", "") for g in (det.get("genres") or [])]
@@ -453,7 +462,9 @@ async def _pick_tmdb_item(results: list, year: str, season, query_title: str = "
             if ys.isdigit() and abs(file_year - int(ys)) <= 2:
                 tolerant.append(it)
         if tolerant:
-            return tolerant[0]
+            # 优先选年份完全匹配的
+            exact = [it for it in tolerant if str(file_year) == ((it.get("first_air_date") or it.get("release_date") or "")[:4])]
+            return exact[0] if exact else tolerant[0]
         years = [
             int((it.get("first_air_date") or it.get("release_date") or "")[:4])
             for it in cands
