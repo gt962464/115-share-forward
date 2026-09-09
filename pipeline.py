@@ -458,10 +458,15 @@ async def fetch_share_info(share_url: str) -> tuple[Optional[str], Optional[int]
             total = 0
             for item in data.get("list", []):
                 total += int(item.get("size", 0) or item.get("file_size", 0) or item.get("fs", 0) or 0)
-            return title, total
+            # 从分享标题提取 tmdb_id（如 "这都不是事儿 (2026) {tmdb-334298}"）
+            share_tmdb_id = None
+            _tid_m = _TMDBID_MARKER_RE.search(title)
+            if _tid_m:
+                share_tmdb_id = int(_tid_m.group(1))
+            return title, total, share_tmdb_id
         except Exception as e:
             logger.warning(f"fetch_share_info ({fn_name}) 失败: {e}")
-    return None, None
+    return None, None, None
 
 
 async def _walk_share_items(svc, share_url: str, receive_code: str = "") -> list:
@@ -567,7 +572,7 @@ async def process_link(
     if on_progress:
         await on_progress("🔍 获取分享信息...")
     
-    top_name, total = await fetch_share_info(url)
+    top_name, total, share_tmdb_id = await fetch_share_info(url)
     if not top_name:
         return {"status": "error", "message": "无法获取分享信息，链接可能无效或已过期"}
     
@@ -592,7 +597,7 @@ async def process_link(
     ident_det = {}
     try:
         from identifier import resolve_title
-        ident = await resolve_title(base_name, parsed["title"], parsed.get("year", ""), season, parsed.get("tmdb_id"))
+        ident = await resolve_title(base_name, parsed["title"], parsed.get("year", ""), season, parsed.get("tmdb_id") or share_tmdb_id)
         if ident.get("title"):
             display_title = ident["title"]
             parsed["year"] = ident.get("year") or parsed.get("year", "")
