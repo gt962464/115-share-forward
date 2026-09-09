@@ -591,6 +591,22 @@ async def resolve_title(raw_name: str, regex_title: str, regex_year: str = "",
             logger.warning(f"⚠️ 年份差异过大，回退英文原名: {eng_title!r}")
             return {"title": eng_title, "year": regex_year, "tmdb_id": None, "source": "eng_fallback"}
 
+    # ── 中文名直接搜 TMDB（跳过 LLM 翻译，避免误译） ──
+    _has_chinese = re.search(r"[一-鿿]", regex_title)
+    if _has_chinese and _tmdb_key():
+        det = await tmdb_search(regex_title, regex_year, season, source_name=raw_name)
+        if det:
+            if _year_ok(regex_year, det.get("year", "")):
+                logger.info(f"✅ 中文名 TMDB 直搜命中: {regex_title!r} → {det['title']!r} ({det.get('year')})")
+                return {
+                    "title": det["title"],
+                    "year": det.get("year") or regex_year,
+                    "tmdb_id": det.get("tmdb_id"),
+                    "source": "tmdb_cn",
+                    "det": det,
+                }
+            logger.warning(f"⚠️ 中文名直搜年份差异过大: {regex_title!r} vs {det.get('year')}")
+
     llm_info = await llm_parse_filename(raw_name) if _llm_key() else None
     llm_name = ((llm_info or {}).get("name") or "").strip()
     llm_year = str((llm_info or {}).get("year") or "").strip()
