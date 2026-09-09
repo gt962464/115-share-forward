@@ -38,7 +38,7 @@ def get_bot() -> Optional[Bot]:
 
 
 async def send_private(chat_id: int, text: str, parse_mode: str = None):
-    if not _bot:
+    if not _bot or not chat_id:
         return
     try:
         await _bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode)
@@ -60,6 +60,64 @@ async def send_channel(text: str, parse_mode: str = None):
         logger.info(f"✅ 频道消息发送成功")
     except Exception as e:
         logger.warning(f"❌ 发送频道消息失败: {e}")
+
+
+
+async def sync_to_jying(result: dict, chat_id: int = None):
+    """同步成功的 115 转存结果到聚影，并记录结果。"""
+    title = result.get("title", "")
+    share_link = result.get("share_link", "")
+    det = result.get("det") or {}
+    year = det.get("year", "")
+    tmdb_id = result.get("tmdb_id") or det.get("id")
+    filename = result.get("episode", "")
+
+    try:
+        from _jying_cache import set_last_share
+        set_last_share(
+            title=title, year=year, tmdb_id=tmdb_id,
+            share_link=share_link, filename=filename,
+        )
+    except Exception as e:
+        logger.warning(f"⚠️ 聚影缓存写入失败（不影响同步）: {e}")
+
+    try:
+        import jying
+        if not jying._ok():
+            logger.info(f"⏭️ 聚影凭证未配置，跳过自动同步: {title}")
+            return {"ok": False, "skipped": True, "error": "聚影凭证未配置"}
+
+        logger.info(f"📤 开始聚影同步: {title}")
+        response = await jying.upload_resource(
+            title=title, year=year, tmdb_id=tmdb_id,
+            link=share_link, filename=filename,
+        )
+        if response.get("status") == "success":
+            submission = response.get("submission") or {}
+            status = submission.get("status", "unknown")
+            status_text = {"approved": "✅已发布", "pending": "⏳审核中"}.get(status, status)
+            logger.info(f"📤 聚影同步成功: {title} (状态: {status})")
+            if chat_id:
+                detail = (
+                    f"https://www.jying.top/profile/#/resource/{submission['id']}"
+                    if submission.get("id") else ""
+                )
+                message = f"📤 聚影同步成功\n📺 {title} ({year})\n📋 状态：{status_text}"
+                if detail:
+                    message += f"\n📄 {detail}"
+                await send_private(chat_id, message)
+            return {"ok": True, "response": response}
+
+        error = response.get("message") or response.get("error") or "未知错误"
+        logger.warning(f"📤 聚影同步失败: {title} | {error}")
+        if chat_id:
+            await send_private(chat_id, f"📤 聚影同步失败：{error}\n📺 {title}")
+        return {"ok": False, "response": response, "error": error}
+    except Exception as e:
+        logger.warning(f"⚠️ 聚影同步异常（不影响主流程）: {title} | {e}", exc_info=True)
+        if chat_id:
+            await send_private(chat_id, f"📤 聚影同步异常：{e}\n📺 {title}")
+        return {"ok": False, "error": str(e)}
 
 
 def _is_admin(user_id: int) -> bool:
@@ -383,6 +441,7 @@ async def _auto_process_and_notify(chat_id: int, url: str, source_name: str):
             if to_cid:
                 from pipeline import schedule_cleanup
                 schedule_cleanup(to_cid, name=title, share_link=share_link)
+            await sync_to_jying(result, chat_id=chat_id)
             logger.info(f"✅ 自动转存成功(闭环): {title} → {share_link}")
 
         elif result["status"] == "pending":
