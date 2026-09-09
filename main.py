@@ -74,8 +74,8 @@ async def main():
     monitor = None
     if TG_API_ID and TG_API_HASH and TG_MONITOR_TARGETS:
         from monitor import Monitor, set_monitor
-        from notifier import send_private, send_channel
-        from pipeline import process_link, schedule_cleanup
+        from notifier import send_private
+        from pipeline import process_link
 
         async def on_link_found(url: str, source_name: str, event):
             logger.info(f"🔗 监听到 115 链接: {url[:60]}... (来源: {source_name})")
@@ -87,9 +87,7 @@ async def main():
                 )
 
             try:
-                logger.info(f"📥 开始处理链接: {url[:60]}...")
                 result = await process_link(url)
-                logger.info(f"📥 process_link 返回: status={result.get('status')}")
 
                 if result["status"] == "success":
                     text = (
@@ -101,18 +99,60 @@ async def main():
                     )
                     if TG_USER_ID:
                         await send_private(int(TG_USER_ID), text)
-                    # ── 推送到输出频道（闭环）──
-                    logger.info(f"📤 准备推送到频道，text长度: {len(text)}")
-                    await send_channel(text)
-                    logger.info(f"📤 频道推送调用完成")
-                    # ── 安排自动清理源文件 ──
-                    to_cid = result.get("to_cid")
-                    if to_cid:
-                        schedule_cleanup(
-                            to_cid,
-                            name=result.get("title", ""),
-                            share_link=result.get("share_link", ""),
+                    # ── 频道卡片推送 ──
+                    try:
+                        from notifier import _channel_target, _send_card_to, _build_card
+                        from identifier import douban_rating, fetch_poster_bytes
+                        from html import escape as html_escape
+                        det = result.get("det") or {}
+                        poster = None
+                        try:
+                            poster = await fetch_poster_bytes(det.get("poster_url", "")) if det else None
+                        except Exception:
+                            pass
+                        douban = ""
+                        try:
+                            douban = await douban_rating(result.get("title", "")) if det else ""
+                        except Exception:
+                            pass
+                        tmdb_rating = f"{float(det['rating']):.1f}/10" if det.get("rating") else "暂无评分"
+                        card = _build_card(
+                            title=result.get("title", ""), year=det.get("year", ""),
+                            genres=det.get("genres") or "暂无",
+                            tmdb_rating=tmdb_rating, douban_rating=douban or "暂无评分",
+                            quality=result.get("quality", ""), source=result.get("source", ""),
+                            size_text=result.get("size", ""), episode=result.get("episode", ""),
+                            encode=result.get("encode", ""), audio="",
+                            link_line=f'🔗 链接：<a href="{html_escape(result["share_link"], quote=True)}">115网盘</a>',
+                            overview=det.get("overview", ""),
                         )
+                        target = _channel_target()
+                        if target:
+                            await _send_card_to(target, card, poster=poster)
+                            logger.info(f"✅ 频道卡片推送成功: {result.get('title')}")
+                    except Exception as e:
+                        logger.error(f"❌ 频道卡片推送异常: {e}", exc_info=True)
+                    # ── 安排自动清理源文件 + 清空回收站 ──
+                    try:
+                        to_cid = result.get("to_cid")
+                        if to_cid:
+                            from pipeline import schedule_cleanup
+                            schedule_cleanup(to_cid, name=result.get("title", ""), share_link=result["share_link"])
+                    except Exception as e:
+                        logger.warning(f"⚠️ 安排清理任务失败（不影响转存）: {e}")
+                    # ── 缓存转存信息供聚影同步 ──
+                    try:
+                        from _jying_cache import set_last_share
+                        det2 = result.get("det") or {}
+                        set_last_share(
+                            title=result.get("title", ""),
+                            year=det2.get("year", ""),
+                            tmdb_id=result.get("tmdb_id") or det2.get("id"),
+                            share_link=result["share_link"],
+                            filename=result.get("episode", ""),
+                        )
+                    except Exception:
+                        pass
                     logger.info(f"✅ 自动转存成功: {result.get('title')} → {result['share_link']}")
 
                 elif result["status"] == "pending":
@@ -128,7 +168,7 @@ async def main():
                             f"❌ 自动转存失败: {result.get('message', '未知错误')}\n🔗 {url}"
                         )
             except Exception as e:
-                logger.error(f"❌ 自动转存异常: {e}", exc_info=True)
+                logger.error(f"自动转存异常: {e}")
                 if TG_USER_ID:
                     await send_private(int(TG_USER_ID), f"❌ 自动转存异常: {e}\n🔗 {url}")
 

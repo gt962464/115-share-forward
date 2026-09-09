@@ -87,7 +87,8 @@ def _main_menu() -> InlineKeyboardMarkup:
          InlineKeyboardButton("🔄 重启 Bot", callback_data="menu_restart")],
         [InlineKeyboardButton("🛑 取消任务", callback_data="menu_cancel"),
          InlineKeyboardButton("🧹 清空回收站", callback_data="menu_clean")],
-        [InlineKeyboardButton("❓ 帮助", callback_data="menu_help")],
+        [InlineKeyboardButton("🎬 聚影", callback_data="menu_jying"),
+         InlineKeyboardButton("❓ 帮助", callback_data="menu_help")],
     ])
 
 
@@ -370,8 +371,13 @@ async def _auto_process_and_notify(chat_id: int, url: str, source_name: str):
             await _send_card_to(chat_id, card, poster=poster)
             # ── 频道卡片（闭环）──
             target = _channel_target()
+            logger.warning(f"🔧 DEBUG 频道推送: target={target}, has_poster={poster is not None}, card_len={len(card)}")
             if target:
-                await _send_card_to(target, card, poster=poster)
+                try:
+                    ch_ok = await _send_card_to(target, card, poster=poster)
+                    logger.warning(f"🔧 DEBUG 频道推送结果: {ch_ok}")
+                except Exception as ch_e:
+                    logger.error(f"❌ 频道推送异常: {ch_e}", exc_info=True)
             # ── 安排自动清理源文件 ──
             to_cid = result.get("to_cid")
             if to_cid:
@@ -471,6 +477,17 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
     except Exception as e:
         logger.warning(f"⚠️ query.answer() 失败: {e}")
+
+    # ── 聚影菜单 ──
+    if data.startswith("jy_") or data == "menu_jying":
+        try:
+            from jying_menu import handle_jying_callback
+            if await handle_jying_callback(query, data):
+                return
+        except Exception as e:
+            logger.error(f"聚影回调异常: {e}", exc_info=True)
+            await query.edit_message_text(f"❌ 聚影功能异常: {e}", reply_markup=_back())
+            return
 
     # ── 返回主菜单 ──
     if data == "menu_back":
@@ -1273,7 +1290,9 @@ async def _handle_link(message, url: str):
         channel_ok = False
         try:
             target = _channel_target()
+            logger.warning(f"🔧 DEBUG 频道推送: target={target}, has_poster={poster is not None}, card_len={len(card)}")
             channel_ok = await _send_card_to(target, card, poster=poster) if target else private_ok
+            logger.warning(f"🔧 DEBUG 频道推送结果: {channel_ok}")
         except Exception as e:
             logger.error(f"❌ 频道卡片发送异常: {e}", exc_info=True)
 
