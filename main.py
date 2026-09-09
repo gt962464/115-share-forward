@@ -153,6 +153,40 @@ async def main():
                         )
                     except Exception:
                         pass
+                    # ── 自动同步到聚影 ──
+                    try:
+                        import jying
+                        if jying._ok():
+                            det3 = result.get("det") or {}
+                            jr = await jying.upload_resource(
+                                title=result.get("title", ""),
+                                year=det3.get("year", ""),
+                                tmdb_id=result.get("tmdb_id") or det3.get("id"),
+                                link=result["share_link"],
+                                filename=result.get("episode", ""),
+                            )
+                            if jr.get("status") == "success":
+                                logger.info(f"📤 聚影同步成功: {result.get('title')}")
+                                # 通知用户
+                                try:
+                                    sub = jr.get("submission", {})
+                                    status = sub.get("status", "unknown")
+                                    st = {"approved": "✅已发布", "pending": "⏳审核中"}.get(status, status)
+                                    detail = f"https://www.jying.top/profile/#/resource/{sub['id']}" if sub.get("id") else ""
+                                    msg = f"📤 聚影同步成功\n📺 {result.get('title', '')} ({det3.get('year', '')})\n📋 状态：{st}"
+                                    if detail:
+                                        msg += f"\n📄 {detail}"
+                                    await send_private(int(TG_USER_ID), msg)
+                                except Exception:
+                                    pass
+                            else:
+                                logger.warning(f"📤 聚影同步失败: {jr.get('message', '未知错误')}")
+                                try:
+                                    await send_private(int(TG_USER_ID), f"📤 聚影同步失败：{jr.get('message', '未知错误')}\n📺 {result.get('title', '')}")
+                                except Exception:
+                                    pass
+                    except Exception as je:
+                        logger.warning(f"⚠️ 聚影同步异常（不影响主流程）: {je}")
                     logger.info(f"✅ 自动转存成功: {result.get('title')} → {result['share_link']}")
 
                 elif result["status"] == "pending":
