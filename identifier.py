@@ -553,7 +553,7 @@ def _year_ok(file_year: str, tmdb_year: str) -> bool:
 
 
 async def resolve_title(raw_name: str, regex_title: str, regex_year: str = "",
-                        season: int = None, tmdb_id: int = None) -> dict:
+                        season: int = None, tmdb_id: int = None, share_title: str = "") -> dict:
     """统一识别入口。返回 {"title", "year", "tmdb_id", "source", "det"}。
 
     source: tmdb_id（文件名含 {tmbid-xxx} 直接按 ID 拉详情）/
@@ -585,6 +585,23 @@ async def resolve_title(raw_name: str, regex_title: str, regex_year: str = "",
                 logger.info(f"TMDB ID direct hit: {tmdb_id}")
                 return {"title": det["title"], "year": det.get("year") or regex_year, "tmdb_id": tmdb_id, "source": "tmdb_id", "det": det}
 
+
+    # ── 分享标题中文名直搜（文件名是英文时，分享标题里的中文名往往更准） ──
+    _share_cn = re.search(r"[一-鿿]{2,}", share_title or "")
+    if _share_cn and _tmdb_key():
+        _share_name = _share_cn.group(0)
+        det = await tmdb_search(_share_name, regex_year, season, source_name=raw_name)
+        if det:
+            if _year_ok(regex_year, det.get("year", "")):
+                logger.info(f"✅ 分享标题中文名 TMDB 命中: {_share_name!r} → {det['title']!r} ({det.get('year')})")
+                return {
+                    "title": det["title"],
+                    "year": det.get("year") or regex_year,
+                    "tmdb_id": det.get("tmdb_id"),
+                    "source": "tmdb_share_title",
+                    "det": det,
+                }
+            logger.warning(f"⚠️ 分享标题中文名年份差异过大: {_share_name!r} vs {det.get('year')}")
 
     # 提取英文原名：Serenade.of.Peaceful.Joy.2020.S01 → "Serenade of Peaceful Joy"
     _eng_match = re.match(r"^([A-Z][a-zA-Z0-9]+(?:\.[A-Z][a-zA-Z0-9]+)+)", regex_title)

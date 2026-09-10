@@ -618,7 +618,7 @@ async def process_link(
     ident_det = {}
     try:
         from identifier import resolve_title
-        ident = await resolve_title(base_name, parsed["title"], parsed.get("year", ""), season, parsed.get("tmdb_id") or share_tmdb_id)
+        ident = await resolve_title(base_name, parsed["title"], parsed.get("year", ""), season, parsed.get("tmdb_id") or share_tmdb_id, share_title=top_name)
         if ident.get("title"):
             display_title = ident["title"]
             parsed["year"] = ident.get("year") or parsed.get("year", "")
