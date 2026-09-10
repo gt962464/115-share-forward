@@ -123,6 +123,7 @@ async def sync_to_jying(result: dict, chat_id: int = None):
             title=title, year=year, tmdb_id=tmdb_id,
             link=share_link, filename=filename,
             original_title=original_title,
+            file_size=result.get("size", ""),
         )
         if response.get("status") == "success":
             submission = response.get("submission") or {}

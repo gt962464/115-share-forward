@@ -133,7 +133,7 @@ async def _find_existing_movie(title: str, year: str, original_title: str = ""):
 
 
 # ── 上传资源 ──
-async def upload_resource(title: str, year: str, tmdb_id, link: str, filename: str, original_title: str = ""):
+async def upload_resource(title: str, year: str, tmdb_id, link: str, filename: str, original_title: str = "", file_size: str = ""):
     """POST /resources/upload/
     先搜索聚影是否有同名影片，有则补充资源（传 movie_id），无则新建。
     返回 dict: {status, submission_id, submission_status, ...}
@@ -153,6 +153,8 @@ async def upload_resource(title: str, year: str, tmdb_id, link: str, filename: s
         # description 是未公开字段，聚影用它作为资源说明（优先于链接里的文件夹名）
         "description": filename,
     }
+    if file_size:
+        payload["file_size"] = file_size
     logger.info(f"📤 聚影上传 payload: {payload}")
     if tmdb_id:
         payload["tmdb_id"] = str(tmdb_id)
