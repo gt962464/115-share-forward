@@ -618,7 +618,7 @@ async def process_link(
     ident_det = {}
     try:
         from identifier import resolve_title
-        ident = await resolve_title(base_name, parsed["title"], parsed.get("year", ""), season, parsed.get("tmdb_id") or share_tmdb_id, share_title=top_name)
+        ident = await resolve_title(base_name, parsed["title"], parsed.get("year", ""), season, parsed.get("tmdb_id") or share_tmdb_id)
         if ident.get("title"):
             display_title = ident["title"]
             parsed["year"] = ident.get("year") or parsed.get("year", "")
@@ -888,13 +888,6 @@ async def cleanup_worker():
                         ok, msg = await empty_recycle_bin()
                         if not ok:
                             raise RuntimeError(msg)
-                        # 115 的 fs_delete 只删文件不删空文件夹，需额外调用清理空目录
-                        try:
-                            svc2 = await get_svc()
-                            await svc2.client.tool_clear_empty_folder(async_=True)
-                            logger.info("🧹 已清理空文件夹")
-                        except Exception as e:
-                            logger.warning(f"⚠️ 清理空文件夹失败（不影响主流程）: {e}")
                         _cleanup_queue.remove(item)
                         _save_cleanup_queue()
                         logger.info(f"✅ 自动清理完成: {item.get('name')} (CID: {item['cid']})")

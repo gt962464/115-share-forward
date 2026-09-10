@@ -553,7 +553,7 @@ def _year_ok(file_year: str, tmdb_year: str) -> bool:
 
 
 async def resolve_title(raw_name: str, regex_title: str, regex_year: str = "",
-                        season: int = None, tmdb_id: int = None, share_title: str = "") -> dict:
+                        season: int = None, tmdb_id: int = None) -> dict:
     """统一识别入口。返回 {"title", "year", "tmdb_id", "source", "det"}。
 
     source: tmdb_id（文件名含 {tmbid-xxx} 直接按 ID 拉详情）/
@@ -569,39 +569,19 @@ async def resolve_title(raw_name: str, regex_title: str, regex_year: str = "",
     regex_title = (regex_title or "").strip()
     regex_year = str(regex_year or "").strip()
 
+    # 优先：文件名含 {tmbid-xxx}，直接用 ID 拉详情（无需搜索）
     if tmdb_id and _tmdb_key():
-        _year_int = int(regex_year) if regex_year and regex_year.isdigit() else 0
-        if _year_int and _year_int < 2005:
-            _type_order = ["movie", "tv"]
-        else:
-            _type_order = ["tv", "movie"]
-        for media_type in _type_order:
+        for media_type in ("tv", "movie"):
             det = await _tmdb_detail(media_type, tmdb_id)
             if det:
-                _det_year = int(det.get("year", "0") or "0")
-                if _year_int and _det_year and abs(_year_int - _det_year) > 3:
-                    logger.info(f"TMDB {tmdb_id} {media_type} year mismatch, skip")
-                    continue
-                logger.info(f"TMDB ID direct hit: {tmdb_id}")
-                return {"title": det["title"], "year": det.get("year") or regex_year, "tmdb_id": tmdb_id, "source": "tmdb_id", "det": det}
-
-
-    # ── 分享标题中文名直搜（文件名是英文时，分享标题里的中文名往往更准） ──
-    _share_cn = re.search(r"[一-鿿]{2,}", share_title or "")
-    if _share_cn and _tmdb_key():
-        _share_name = _share_cn.group(0)
-        det = await tmdb_search(_share_name, regex_year, season, source_name=raw_name)
-        if det:
-            if _year_ok(regex_year, det.get("year", "")):
-                logger.info(f"✅ 分享标题中文名 TMDB 命中: {_share_name!r} → {det['title']!r} ({det.get('year')})")
+                logger.info(f"✅ TMDB ID 直接命中: {tmdb_id} → {det['title']!r}")
                 return {
                     "title": det["title"],
                     "year": det.get("year") or regex_year,
-                    "tmdb_id": det.get("tmdb_id"),
-                    "source": "tmdb_share_title",
+                    "tmdb_id": tmdb_id,
+                    "source": "tmdb_id",
                     "det": det,
                 }
-            logger.warning(f"⚠️ 分享标题中文名年份差异过大: {_share_name!r} vs {det.get('year')}")
 
     # 提取英文原名：Serenade.of.Peaceful.Joy.2020.S01 → "Serenade of Peaceful Joy"
     _eng_match = re.match(r"^([A-Z][a-zA-Z0-9]+(?:\.[A-Z][a-zA-Z0-9]+)+)", regex_title)
