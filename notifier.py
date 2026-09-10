@@ -4,6 +4,7 @@ Telegram Bot API 交互器 - 全 InlineKeyboard 面板
 import os
 import asyncio
 import logging
+import time
 from typing import Optional
 from html import escape as html_escape
 from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
@@ -1057,9 +1058,53 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #  自动识别 115 链接 + 转存结果
 # ══════════════════════════════════════════════
 
+# 疑似卡片但没解析出链接 → 提示用户改用「转发」
+_HINT_COOLDOWN = 60
+_HINT_KEY = "no_link_hint_ts"
+
+
+def _looks_like_card(text: str, message) -> bool:
+    t = (text or "").lower()
+    # 正文提到网盘/链接关键字 → 基本可确定是资源卡片
+    if ("115" in t) or ("网盘" in t) or ("链接" in t) or ("ed2k" in t):
+        return True
+    # 转发来的图片/视频（影视卡片常见形态）
+    has_media = getattr(message, "photo", None) is not None or getattr(message, "video", None) is not None
+    if has_media and getattr(message, "forward_origin", None) is not None:
+        return True
+    return False
+
+
+async def _maybe_hint_no_link(update, context, text: str) -> None:
+    """消息像影视卡片但没提取到链接时，私聊提示一次（带冷却）。"""
+    try:
+        msg = update.message
+        if not _looks_like_card(text, msg):
+            return
+        now = time.time()
+        last = context.user_data.get(_HINT_KEY, 0) if context.user_data is not None else 0
+        if now - last < _HINT_COOLDOWN:
+            return
+        if context.user_data is not None:
+            context.user_data[_HINT_KEY] = now
+        await msg.reply_text(
+            "⚠️ 这条消息里没有解析到 115 链接。\n\n"
+            "如果是别人的影视卡片，请用「转发」发给我，"
+            "不要用「复制文字」——复制会丢掉蓝色文字里藏着的链接。",
+            reply_markup=_back(),
+        )
+        logger.info(f"💡 已提示无链接卡片: id={getattr(msg, 'message_id', '?')}")
+    except Exception as e:
+        logger.warning(f"无链接提示失败（忽略）: {e}")
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    text = update.message.text or ""
+    # 兼容「图片/视频卡片」：正文可能在 caption 里，实体也分 text/caption 两套
+    _m = update.message
+    text = (_m.text or _m.caption or "")
+    _entities = _m.entities if _m.text else _m.caption_entities
+    _entities = _entities or []
 
     # 1) 验证码/密码填入回路（监听器等待登录输入时，直接吃掉这条消息）
     monitor = get_monitor()
@@ -1100,9 +1145,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # 2) 提取链接（115 分享 + ed2k）
-    links = extract_115_links(text, update.message.entities)
+    links = extract_115_links(text, _entities)
     ed2k_links = extract_ed2k_links(text)
     if not links and not ed2k_links:
+        await _maybe_hint_no_link(update, context, text)
         return
 
     # 3) 提交权限检查
@@ -1486,7 +1532,7 @@ def setup_bot() -> Application:
     app.add_handler(CommandHandler("cancel", cmd_cancel))
 
     app.add_handler(CallbackQueryHandler(callback_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & ~filters.COMMAND, handle_message))
 
     _app = app
     return app
