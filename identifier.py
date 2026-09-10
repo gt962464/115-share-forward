@@ -569,19 +569,22 @@ async def resolve_title(raw_name: str, regex_title: str, regex_year: str = "",
     regex_title = (regex_title or "").strip()
     regex_year = str(regex_year or "").strip()
 
-    # 优先：文件名含 {tmbid-xxx}，直接用 ID 拉详情（无需搜索）
     if tmdb_id and _tmdb_key():
-        for media_type in ("tv", "movie"):
+        _year_int = int(regex_year) if regex_year and regex_year.isdigit() else 0
+        if _year_int and _year_int < 2005:
+            _type_order = ["movie", "tv"]
+        else:
+            _type_order = ["tv", "movie"]
+        for media_type in _type_order:
             det = await _tmdb_detail(media_type, tmdb_id)
             if det:
-                logger.info(f"✅ TMDB ID 直接命中: {tmdb_id} → {det['title']!r}")
-                return {
-                    "title": det["title"],
-                    "year": det.get("year") or regex_year,
-                    "tmdb_id": tmdb_id,
-                    "source": "tmdb_id",
-                    "det": det,
-                }
+                _det_year = int(det.get("year", "0") or "0")
+                if _year_int and _det_year and abs(_year_int - _det_year) > 3:
+                    logger.info(f"TMDB {tmdb_id} {media_type} year mismatch, skip")
+                    continue
+                logger.info(f"TMDB ID direct hit: {tmdb_id}")
+                return {"title": det["title"], "year": det.get("year") or regex_year, "tmdb_id": tmdb_id, "source": "tmdb_id", "det": det}
+
 
     # 提取英文原名：Serenade.of.Peaceful.Joy.2020.S01 → "Serenade of Peaceful Joy"
     _eng_match = re.match(r"^([A-Z][a-zA-Z0-9]+(?:\.[A-Z][a-zA-Z0-9]+)+)", regex_title)
