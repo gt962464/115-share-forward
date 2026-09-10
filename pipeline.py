@@ -233,7 +233,22 @@ async def _rename_saved(svc, to_cid, title_cn: str, year: str, tmdb_id, suffix: 
     """
     ok = fail = total = 0
     new_cid = None
+    folder_name = build_folder_name(title_cn, year, tmdb_id)
     try:
+        # ── 先重命名 to_cid 自身（去掉时间戳后缀）──
+        total += 1
+        try:
+            r = await svc.client.fs_rename((to_cid, folder_name), async_=True)
+            if isinstance(r, dict) and r.get("state") is False:
+                fail += 1
+                logger.warning(f"⚠️ 重命名顶层目录失败 to_cid={to_cid} -> {folder_name}: {r.get('error') or r.get('message')}")
+            else:
+                ok += 1
+                logger.info(f"✏️ 已重命名顶层目录: {folder_name} (CID: {to_cid})")
+        except Exception as ex:
+            fail += 1
+            logger.warning(f"⚠️ 重命名顶层目录异常 to_cid={to_cid}: {ex}")
+
         top = await _get_dir_items(svc, to_cid)
         top = list({str(x["id"]): x for x in top}.values())
         dirs = [it for it in top if it.get("is_dir")]
@@ -873,6 +888,13 @@ async def cleanup_worker():
                         ok, msg = await empty_recycle_bin()
                         if not ok:
                             raise RuntimeError(msg)
+                        # 115 的 fs_delete 只删文件不删空文件夹，需额外调用清理空目录
+                        try:
+                            svc2 = await get_svc()
+                            await svc2.client.tool_clear_empty_folder(async_=True)
+                            logger.info("🧹 已清理空文件夹")
+                        except Exception as e:
+                            logger.warning(f"⚠️ 清理空文件夹失败（不影响主流程）: {e}")
                         _cleanup_queue.remove(item)
                         _save_cleanup_queue()
                         logger.info(f"✅ 自动清理完成: {item.get('name')} (CID: {item['cid']})")
