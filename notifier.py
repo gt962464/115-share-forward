@@ -70,7 +70,37 @@ async def sync_to_jying(result: dict, chat_id: int = None):
     det = result.get("det") or {}
     year = det.get("year", "")
     tmdb_id = result.get("tmdb_id") or det.get("id")
-    filename = result.get("episode", "")
+    original_title = det.get("original_title", "") or result.get("original_title", "")
+
+    # 打印完整 result 排除大对象
+    _dbg = {k: v for k, v in result.items() if k not in ("det", "video_names")}
+    logger.info(f"🔧 sync_to_jying result: {_dbg}")
+
+    # ── 构建 filename：优先从 result 字段取 ──
+    filename = " ".join(x for x in [
+        result.get("episode", ""),
+        result.get("quality", ""),
+        result.get("source", ""),
+        result.get("encode", ""),
+        result.get("audio", ""),
+    ] if x)
+
+    # ── filename 兜底：如果为空，从 video_names 重新解析 ──
+    if not filename:
+        video_names = result.get("video_names") or []
+        if video_names:
+            from pipeline import parse_filename
+            parsed = parse_filename(video_names[0] if video_names else "")
+            filename = " ".join(x for x in [
+                result.get("episode", ""),
+                parsed.get("quality", ""),
+                parsed.get("source", ""),
+                parsed.get("encode", ""),
+                parsed.get("audio", ""),
+            ] if x)
+            logger.info(f"🔧 filename 兜底解析: {video_names[0] if video_names else ''} -> '{filename}'")
+
+    logger.info(f"🔧 聚影 filename 最终: '{filename}' (original_title={original_title})")
 
     try:
         from _jying_cache import set_last_share
@@ -91,22 +121,43 @@ async def sync_to_jying(result: dict, chat_id: int = None):
         response = await jying.upload_resource(
             title=title, year=year, tmdb_id=tmdb_id,
             link=share_link, filename=filename,
+            original_title=original_title,
         )
         if response.get("status") == "success":
             submission = response.get("submission") or {}
             status = submission.get("status", "unknown")
-            status_text = {"approved": "✅已发布", "pending": "⏳审核中"}.get(status, status)
-            logger.info(f"📤 聚影同步成功: {title} (状态: {status})")
+            submission_id = response.get("submission_id") or submission.get("id")
+
+            # ── 审核轮询：pending_review 时等待审核结果 ──
+            if status in ("pending_review", "pending") and submission_id:
+                logger.info(f"⏳ 聚影审核中，开始轮询... ({title})")
+                if chat_id:
+                    await send_private(chat_id, f"⏳ 聚影审核中，等待结果...\n📺 {title} ({year})")
+                poll_result = await jying.poll_until_reviewed(submission_id, max_wait=300, interval=15)
+                status = poll_result.get("status", status)
+                timed_out = poll_result.get("timed_out", False)
+                if timed_out:
+                    status_text = "⏳ 审核中（超时未完成）"
+                elif status == "published":
+                    status_text = "✅ 已发布"
+                elif status == "rejected":
+                    status_text = "❌ 审核拒绝"
+                else:
+                    status_text = status
+            else:
+                status_text = {"published": "✅已发布", "approved": "✅已发布"}.get(status, status)
+
+            logger.info(f"📤 聚影同步完成: {title} (状态: {status_text})")
             if chat_id:
                 detail = (
-                    f"https://www.jying.top/profile/#/resource/{submission['id']}"
-                    if submission.get("id") else ""
+                    f"https://www.jying.top/profile/#/resource/{submission_id}"
+                    if submission_id else ""
                 )
-                message = f"📤 聚影同步成功\n📺 {title} ({year})\n📋 状态：{status_text}"
+                message = f"📤 聚影同步完成\n📺 {title} ({year})\n📋 状态：{status_text}"
                 if detail:
                     message += f"\n📄 {detail}"
                 await send_private(chat_id, message)
-            return {"ok": True, "response": response}
+            return {"ok": True, "response": response, "final_status": status}
 
         error = response.get("message") or response.get("error") or "未知错误"
         logger.warning(f"📤 聚影同步失败: {title} | {error}")
@@ -446,11 +497,10 @@ async def _auto_process_and_notify(chat_id: int, url: str, source_name: str):
             logger.info(f"✅ 自动转存成功(闭环): {title} → {share_link}")
 
         elif result["status"] == "pending":
-            text = f"⏳ 转存中（审核中）: {result.get('message', '')}\n🔗 {result.get('share_link', url)}"
+            # 审核中：只私聊通知，不推频道（等审核通过后再推）
+            share_link = result.get("share_link", url)
+            text = f"⏳ 115审核中，已加入轮询队列（通过后自动处理）\n🔗 {share_link}"
             await send_private(chat_id, text)
-            target = _channel_target()
-            if target:
-                await send_channel(text)
         else:
             text = f"❌ 自动转存失败: {result.get('message', '未知错误')}\n🔗 {url}"
             await send_private(chat_id, text)
@@ -1440,3 +1490,162 @@ def setup_bot() -> Application:
 
     _app = app
     return app
+
+
+# ── 恢复审核中的链接轮询（启动时调用）──
+async def _recover_pending_tasks():
+    """从数据库恢复审核中的链接，启动无限期轮询"""
+    import sys
+    sys.path.insert(0, "/app")
+    try:
+        from app.core.database import async_session
+        from app.models.schema import PendingLink
+        from sqlalchemy import select
+    except ImportError:
+        logger.warning("⚠️ 无法导入 pending_links 模型，跳过恢复")
+        return
+
+    try:
+        async with async_session() as session:
+            result = await session.execute(
+                select(PendingLink).where(
+                    PendingLink.status.in_(["auditing", "snapshotting", "restricted", "no_space"])
+                )
+            )
+            tasks = result.scalars().all()
+            if not tasks:
+                logger.info("📭 无待恢复的审核链接")
+                return
+
+            logger.info(f"📋 发现 {len(tasks)} 条待恢复的审核链接")
+            for task in tasks:
+                pending_info = {
+                    "share_url": task.share_url,
+                    "metadata": task.metadata_json,
+                    "db_id": task.id,
+                    "reason": task.status,
+                }
+                logger.info(f"  ↳ {task.share_url} (状态: {task.status})")
+                # 创建 MockMessage 用于回复
+                import asyncio
+                asyncio.create_task(_recovered_poll_task(pending_info))
+    except Exception as e:
+        logger.error(f"❌ 恢复 pending tasks 异常: {e}", exc_info=True)
+
+
+async def _recovered_poll_task(pending_info: dict):
+    """恢复轮询任务（静默模式，不发消息给用户）"""
+    import asyncio
+    import sys
+    sys.path.insert(0, "/app")
+    try:
+        from app.services.p115 import P115Service
+        from app.core.config import settings
+    except ImportError:
+        logger.warning("⚠️ 无法导入 p115 服务，跳过恢复")
+        return
+
+    share_url = pending_info["share_url"]
+    metadata = pending_info.get("metadata", {})
+    reason = pending_info.get("reason", "auditing")
+
+    logger.info(f"🔄 开始恢复轮询: {share_url} (原因: {reason})")
+
+    # 间隔：审核中 5 分钟，其他 30 分钟
+    if reason == "auditing":
+        interval = 300
+    elif reason == "snapshotting":
+        interval = 1800
+    elif reason == "restricted":
+        interval = 3600
+    else:
+        interval = 300
+
+    attempt = 0
+    while True:
+        attempt += 1
+        await asyncio.sleep(interval)
+
+        try:
+            # 获取 share status
+            from app.services.p115 import p115_service
+            status_info = await p115_service.get_share_status(share_url)
+
+            if status_info is None:
+                logger.warning(f"⚠️ 无法获取状态，继续轮询: {share_url}")
+                continue
+
+            logger.info(f"🔄 恢复轮询第 {attempt} 次: {share_url} -> state={status_info.get('share_state')}, auditing={status_info.get('is_auditing')}, pending={status_info.get('is_pending')}")
+
+            if status_info.get("is_prohibited"):
+                logger.warning(f"⚠️ 链接违规: {share_url}")
+                continue
+
+            if status_info.get("is_expired"):
+                logger.warning(f"⏰ 链接过期: {share_url}")
+                # 删除 pending 记录
+                try:
+                    from app.core.database import async_session
+                    from app.models.schema import PendingLink
+                    from sqlalchemy import delete as sql_delete
+                    async with async_session() as session:
+                        await session.execute(sql_delete(PendingLink).where(PendingLink.id == pending_info.get("db_id")))
+                        await session.commit()
+                except Exception:
+                    pass
+                return
+
+            if status_info.get("is_prohibited"):
+                # 链接违规，停止轮询
+                logger.warning(f"⚠️ 链接违规，停止轮询: {share_url}")
+                try:
+                    from app.core.database import async_session
+                    from app.models.schema import PendingLink
+                    from sqlalchemy import delete as sql_delete
+                    async with async_session() as session:
+                        await session.execute(sql_delete(PendingLink).where(PendingLink.id == pending_info.get("db_id")))
+                        await session.commit()
+                except Exception:
+                    pass
+                # 通知用户
+                tg_user_id = settings.TG_USER_ID
+                if tg_user_id:
+                    from notifier import send_private
+                    await send_private(int(tg_user_id), f"❌ 链接违规，已停止轮询\n🔗 {share_url}")
+                return
+
+            if not status_info.get("is_pending"):
+                # 审核通过！开始处理
+                logger.info(f"🎉 审核通过，开始处理: {share_url}")
+
+                # 获取 TG_USER_ID 来发送通知
+                tg_user_id = settings.TG_USER_ID
+                if tg_user_id:
+                    from notifier import send_private
+                    await send_private(int(tg_user_id), f"✅ 115审核通过！开始处理...\n🔗 {share_url}")
+
+                # 调用完整的处理流程
+                try:
+                    from notifier import _auto_process_and_notify
+                    chat_id = int(tg_user_id) if tg_user_id else None
+                    await _auto_process_and_notify(chat_id, share_url, "恢复轮询")
+                except Exception as e:
+                    logger.error(f"❌ 恢复后处理异常: {e}", exc_info=True)
+                    if tg_user_id:
+                        from notifier import send_private
+                        await send_private(int(tg_user_id), f"❌ 处理失败: {e}\n🔗 {share_url}")
+
+                # 删除 pending 记录
+                try:
+                    from app.core.database import async_session
+                    from app.models.schema import PendingLink
+                    from sqlalchemy import delete as sql_delete
+                    async with async_session() as session:
+                        await session.execute(sql_delete(PendingLink).where(PendingLink.id == pending_info.get("db_id")))
+                        await session.commit()
+                except Exception:
+                    pass
+                return
+
+        except Exception as e:
+            logger.error(f"❌ 恢复轮询异常: {e}", exc_info=True)
