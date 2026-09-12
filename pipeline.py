@@ -690,8 +690,25 @@ async def process_link(
     
     if isinstance(share_res, str) and share_res.startswith("http"):
         # 检查审核状态
-        ready = await _wait_share_audit(svc, share_res)
-        if ready:
+        audit = await _wait_share_audit(svc, share_res)
+        if isinstance(audit, dict) and not audit.get("ok"):
+            reason = audit.get("reason", "unknown")
+            logger.warning(f"🗑️ 分享审核{reason}，清理本地文件: CID={to_cid}")
+            try:
+                await svc.client.fs_delete(to_cid, async_=True)
+                logger.info(f"✅ 已删除违规/失效的本地目录 (CID: {to_cid})")
+                try:
+                    await empty_recycle_bin()
+                except Exception:
+                    pass
+            except Exception as e:
+                logger.warning(f"⚠️ 清理失败: {e}")
+            return {
+                "status": "error",
+                "message": f"分享审核{'违规' if reason=='prohibited' else '失效'}，已清理本地文件",
+                "share_link": share_res,
+            }
+        if audit and audit.get("ok"):
             # ── 基于所有 video_names 统计真实集数范围 ──
             episode = parsed.get("episode", "")
             ep_numbers = []
@@ -716,6 +733,11 @@ async def process_link(
                     episode = " ".join(parts)
             logger.info(f"📊 集数统计: {len(ep_numbers)} 集, 结果: {episode or '(电影/无集数)'}")
 
+            # 分享成功后自动去重
+            try:
+                await auto_dedup(svc)
+            except Exception:
+                pass
             return {
                 "status": "success",
                 "share_link": share_res,
@@ -731,6 +753,9 @@ async def process_link(
                 "video_names": video_names,
             }
         else:
+            # 审核未完成但仍挂起 → 安排延迟清理兜底
+            if to_cid:
+                schedule_cleanup(to_cid, display_title, share_res, delay=3600)
             return {
                 "status": "pending",
                 "share_link": share_res,
@@ -780,13 +805,13 @@ async def _wait_share_audit(svc, share_url: str, timeout: int = None) -> bool:
                 continue
             if status.get("is_expired"):
                 logger.warning(f"❌ 分享已失效: {share_url}")
-                return False
+                return {"ok": False, "reason": "expired"}
             if status.get("is_prohibited"):
                 logger.warning(f"❌ 分享违规未通过: {share_url}")
-                return False
+                return {"ok": False, "reason": "prohibited"}
             if not status.get("is_pending"):
                 logger.info(f"✅ 115 分享审核完成，允许推送: {share_url}")
-                return True
+                return {"ok": True}
             poll_count += 1
             logger.info(f"⏳ 115 分享仍在系统处理中... (第{poll_count}次轮询)")
         except Exception as e:
@@ -899,6 +924,61 @@ async def cleanup_worker():
             logger.warning(f"清理 worker 异常: {e}")
 
 
+
+
+# ── 自动去重：清理带 (N) 后缀的重复文件夹 ──
+async def auto_dedup(svc=None):
+    """扫描自动转存目录，删除带 (N) 后缀的重复文件夹，保留无后缀的版本。"""
+    try:
+        if svc is None:
+            svc = await get_svc()
+        save_cid = await _get_save_cid(svc)
+        if not save_cid:
+            return
+        items = await _get_dir_items(svc, save_cid)
+        # Group by base name (strip (N) suffix)
+        groups: dict[str, list] = {}
+        for it in items:
+            name = it.get("name", "")
+            is_dir = it.get("is_dir", False)
+            if not is_dir:
+                continue
+            # Match "Name (tmdb-XXX)(N)" pattern
+            m = re.match(r"^(.+?)\((\d+)\)$", name)
+            if m:
+                base = m.group(1)
+                groups.setdefault(base, []).append({
+                    "id": it["id"], "name": name,
+                    "is_dup": True, "num": int(m.group(2)),
+                })
+            else:
+                groups.setdefault(name, []).append({
+                    "id": it["id"], "name": name,
+                    "is_dup": False, "num": 0,
+                })
+        
+        deleted = 0
+        for base, files in groups.items():
+            dups = [f for f in files if f.get("is_dup")]
+            if not dups:
+                continue
+            # Delete all duplicates with (N) suffix
+            for dup in dups:
+                try:
+                    await svc.client.fs_delete(dup["id"], async_=True)
+                    logger.info(f"🗑️ 自动去重: 删除重复副本 {dup["name"]} (CID: {dup["id"]})")
+                    deleted += 1
+                except Exception as e:
+                    logger.warning(f"⚠️ 去重删除失败: {dup["name"]} | {e}")
+        
+        if deleted:
+            try:
+                await empty_recycle_bin()
+            except Exception:
+                pass
+            logger.info(f"🧹 自动去重完成: 删除 {deleted} 个重复副本")
+    except Exception as e:
+        logger.warning(f"⚠️ 自动去重异常: {e}")
 def start_cleanup_worker():
     """启动清理 worker（幂等，重启后从持久化队列恢复）。"""
     global _cleanup_worker_task
