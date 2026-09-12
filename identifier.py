@@ -493,13 +493,13 @@ async def tmdb_search(title: str, year: str = "", season: int = None,
     if not _tmdb_key() or not title:
         return None
 
-    async def _do_search(q: str, media_type: str = None):
+    async def _do_search(q: str, media_type: str = None, lang: str = None):
         endpoint = (f"https://api.themoviedb.org/3/search/{media_type}" if media_type
                     else "https://api.themoviedb.org/3/search/multi")
-        st, text = await _aio_get(
-            endpoint,
-            params={"api_key": _tmdb_key(), "query": q, "language": _tmdb_lang(), "page": 1},
-        )
+        params = {"api_key": _tmdb_key(), "query": q, "page": 1}
+        if lang is not None:
+            params["language"] = lang
+        st, text = await _aio_get(endpoint, params=params)
         if st != 200:
             return [], None
         results = json.loads(text).get("results") or []
@@ -517,6 +517,14 @@ async def tmdb_search(title: str, year: str = "", season: int = None,
             if stripped and stripped != title:
                 logger.info(f"🔍 TMDB 前缀剥离重试: {title!r} -> {stripped!r}")
                 results, item = await _do_search(stripped)
+
+        # If year specified but no year-matched item found, retry without language filter
+        # (language=zh-CN can filter out results whose original title differs from query)
+        if year and (not results or not item):
+            logger.info(f"🔍 TMDB 年份匹配失败，去掉语言参数重试: {title!r} year={year}")
+            results2, item2 = await _do_search(title, lang="")
+            if results2 and item2:
+                results, item = results2, item2
 
         if not results or not item:
             return None
