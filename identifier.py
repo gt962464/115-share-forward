@@ -278,9 +278,14 @@ async def llm_verify_match(source_name: str, info: dict) -> bool | None:
         "你是影视资源校验员。判断【TMDB 候选条目】是否就是【源文件名】所指的那部作品。\n"
         "只返回 JSON：{\"match\": true 或 false, \"reason\": \"一句话理由\"}\n"
         "\n"
+        "【核心原则】\n"
+        "TMDB 搜索结果是权威来源。如果 TMDB 搜索英文名返回了某个中文标题，\n"
+        "说明该英文名确实是这部作品的官方或常用英文名。不要用你的外部知识否定 TMDB 的搜索结果！\n"
+        "\n"
         "【重要规则】\n"
         "1. 英文原名和中文译名对照是正常情况，不要因此否决！\n"
         "   例如：\"Remnants of Gold\" 对应 \"金色\" 是正确的，应该返回 true。\n"
+        "   例如：\"The Spirealm\" 对应 \"致命游戏\" 是正确的，应该返回 true。\n"
         "\n"
         "2. 只有以下情况才返回 false：\n"
         "   - 年份差异超过 5 年（如 2026 年的资源匹配到 2016 年的作品）\n"
@@ -623,7 +628,11 @@ async def resolve_title(raw_name: str, regex_title: str, regex_year: str = "",
             logger.warning(f"⚠️ 分享标题中文名年份差异过大: {_share_name!r} vs {det.get('year')}")
 
     # 提取英文原名：Serenade.of.Peaceful.Joy.2020.S01 → "Serenade of Peaceful Joy"
+    # 也匹配无点号的标题如 "The Spirealm"
     _eng_match = re.match(r"^([A-Z][a-zA-Z0-9]+(?:\.[a-zA-Z][a-zA-Z0-9]+)+)", regex_title)
+    if not _eng_match:
+        # 尝试匹配空格分隔的英文标题（如 "The Spirealm"）
+        _eng_match = re.match(r"^([A-Z][a-zA-Z]+(?:\s+[A-Za-z][a-zA-Z]+)+)", regex_title)
     eng_title = _eng_match.group(1).replace(".", " ") if _eng_match else ""
 
     if eng_title and _tmdb_key():
@@ -728,13 +737,21 @@ async def resolve_title(raw_name: str, regex_title: str, regex_year: str = "",
                             "source": "tmdb_llm",
                             "det": det,
                         }
-                    # 英文搜索词：检查原始标题是否匹配（避免"Smugglers"匹配到"The Smugglers"）
+                    # 英文搜索词：检查标题是否匹配
                     _orig = (det.get("original_title") or det.get("original_name") or "").lower()
+                    _localized = (det.get("title") or det.get("name") or "").lower()
                     _q = llm_name.lower()
-                    _exact = (_orig == _q)
-                    if _orig and not _exact:
+                    # 匹配条件：原始标题完全匹配 OR 本地化标题完全匹配
+                    _exact = (_orig == _q) or (_localized == _q)
+                    if not _exact:
+                        # 额外检查：如果本地化标题包含搜索词（如 "The Spirealm" 在 "致命游戏 (The Spirealm)" 中）
+                        _title_str = (det.get("title") or det.get("name") or "")
+                        if _q in _title_str.lower() or _title_str.lower() in _q:
+                            _exact = True
+                    if not _exact:
                         _orig_name = det.get("original_name") or det.get("original_title") or ""
-                        logger.warning(f"⚠️ LLM TMDB 原始标题不匹配: {llm_name!r} vs orig={_orig_name!r}，跳过")
+                        _loc_name = det.get("title") or det.get("name") or ""
+                        logger.warning(f"⚠️ LLM TMDB 标题不匹配: {llm_name!r} vs orig={_orig_name!r} loc={_loc_name!r}，跳过")
                     else:
                         logger.info(f"✅ LLM 译名 TMDB 命中: {llm_name!r} → {det['title']!r}")
                         return {
