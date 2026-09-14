@@ -562,11 +562,11 @@ async def tmdb_search(title: str, year: str = "", season: int = None,
 # ── 统一识别入口（方案 A+C）──
 
 def _year_ok(file_year: str, tmdb_year: str) -> bool:
-    """年份差异 <= 5 年视为合理。"""
+    """年份差异 <= 2 年视为合理。"""
     if not file_year or not tmdb_year:
         return True
     try:
-        return abs(int(file_year) - int(tmdb_year)) <= 5
+        return abs(int(file_year) - int(tmdb_year)) <= 2
     except (ValueError, TypeError):
         return True
 
@@ -638,8 +638,8 @@ async def resolve_title(raw_name: str, regex_title: str, regex_year: str = "",
                     "source": "tmdb_eng",
                     "det": det,
                 }
-            logger.warning(f"⚠️ 年份差异过大，回退英文原名: {eng_title!r}")
-            return {"title": eng_title, "year": regex_year, "tmdb_id": None, "source": "eng_fallback"}
+            logger.warning(f"⚠️ 年份差异过大，回退 LLM 翻译搜索: {eng_title!r}")
+            # 不 return，继续走 LLM 翻译路径
 
     # ── 中文名直接搜 TMDB（跳过 LLM 翻译，避免误译） ──
     _has_chinese = re.search(r"[一-鿿]", regex_title)
@@ -664,14 +664,75 @@ async def resolve_title(raw_name: str, regex_title: str, regex_year: str = "",
         if _tmdb_key():
             det = await tmdb_search(llm_name, llm_year or regex_year, season, source_name=raw_name)
             if det:
-                logger.info(f"✅ LLM 译名 TMDB 命中: {llm_name!r} → {det['title']!r}")
-                return {
-                    "title": det["title"],
-                    "year": det.get("year") or llm_year or regex_year,
-                    "tmdb_id": det.get("tmdb_id"),
-                    "source": "tmdb_llm",
-                    "det": det,
-                }
+                # 如果 LLM 返回英文且年份不匹配，尝试用中文名重搜
+                _llm_has_cn = bool(re.search(r"[一-鿿]", llm_name))
+                # 检查原始标题是否匹配（避免 "Smugglers" 匹配到 "The Smugglers"）
+                _orig_name = (det.get("original_name") or det.get("original_title") or "").lower()
+                _title_match = (_orig_name == llm_name.lower())
+                if not _llm_has_cn and (not _title_match or not _year_ok(llm_year or regex_year, det.get("year", ""))):
+                    logger.info(f"⚠️ LLM 英文名年份不匹配，尝试中文翻译搜索: {llm_name!r}")
+                    # 用 LLM 翻译成中文
+                    try:
+                        _cn_payload = json.dumps({
+                            "model": _llm_model(),
+                            "messages": [
+                                {"role": "system", "content": "将英文影视名翻译成简体中文，只返回中文名。"},
+                                {"role": "user", "content": llm_name},
+                            ],
+                            "temperature": 0.3,
+                            "max_tokens": 500,
+                        }, ensure_ascii=False)
+                        _cn_headers = {"Authorization": f"Bearer {_llm_key()}", "Content-Type": "application/json"}
+                        _cn_url = f"{_llm_base()}/chat/completions"
+                        async with _session().post(
+                            _cn_url, data=_cn_payload.encode("utf-8"), headers=_cn_headers,
+                            proxy=_proxy(), timeout=aiohttp.ClientTimeout(total=10),
+                        ) as _cn_resp:
+                            _cn_data = json.loads(await _cn_resp.text())
+                            _cn_name = (_cn_data.get("choices", [{}])[0].get("message", {}).get("content", "")).strip()
+                            # 去除书名号、引号、换行等
+                            for _ch in "《》「」『』""''" + chr(10) + chr(13):
+                                _cn_name = _cn_name.replace(_ch, "")
+                            _cn_name = _cn_name.strip()
+                        if _cn_name and _cn_name != llm_name:
+                            # 尝试搜索翻译结果
+                            _cn_candidates = [_cn_name]
+                            # 去除常见后缀（走私者→走私）
+                            for _sfx in ("者", "人", "师", "们"):
+                                if _cn_name.endswith(_sfx) and len(_cn_name) > 2:
+                                    _cn_candidates.append(_cn_name[:-1])
+                            for _cn_try in _cn_candidates:
+                                det_cn = await tmdb_search(_cn_try, llm_year or regex_year, season, source_name=raw_name)
+                                if det_cn and _year_ok(llm_year or regex_year, det_cn.get("year", "")):
+                                    logger.info(f"✅ 中文翻译 TMDB 命中: {_cn_try!r} → {det_cn['title']!r}")
+                                    return {
+                                        "title": det_cn["title"],
+                                        "year": det_cn.get("year") or llm_year or regex_year,
+                                        "tmdb_id": det_cn.get("tmdb_id"),
+                                        "source": "tmdb_llm_cn",
+                                        "det": det_cn,
+                                    }
+                    except Exception as e:
+                        import traceback
+                        logger.warning(f"⚠️ 中文翻译搜索异常: {e}")
+                        logger.debug(f"Traceback: {traceback.format_exc()}")
+                else:
+                    # 额外检查：原始标题是否包含搜索词（避免"Smugglers"匹配到"The Smugglers"）
+                    _orig = (det.get("original_title") or det.get("original_name") or "").lower()
+                    _q = llm_name.lower()
+                    _exact = (_orig == _q)
+                    if _orig and not _exact:
+                        _orig_name = det.get("original_name") or det.get("original_title") or ""
+                        logger.warning(f"⚠️ LLM TMDB 原始标题不匹配: {llm_name!r} vs orig={_orig_name!r}，跳过")
+                    else:
+                        logger.info(f"✅ LLM 译名 TMDB 命中: {llm_name!r} → {det['title']!r}")
+                        return {
+                            "title": det["title"],
+                            "year": det.get("year") or llm_year or regex_year,
+                            "tmdb_id": det.get("tmdb_id"),
+                            "source": "tmdb_llm",
+                            "det": det,
+                        }
         logger.info(f"🤖 LLM 识别: {regex_title!r} -> {llm_name!r}")
         return {"title": llm_name, "year": llm_year or regex_year, "tmdb_id": None, "source": "llm"}
 
