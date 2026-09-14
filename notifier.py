@@ -1545,12 +1545,24 @@ async def _recover_pending_tasks():
     import sys
     sys.path.insert(0, "/app")
     try:
-        from app.core.database import async_session
+        from app.core.database import async_session, engine, Base
         from app.models.schema import PendingLink
-        from sqlalchemy import select
+        from sqlalchemy import select, text
     except ImportError:
         logger.warning("⚠️ 无法导入 pending_links 模型，跳过恢复")
         return
+
+    # 安全网：确保表存在
+    try:
+        async with engine.begin() as conn:
+            def _check(conn):
+                tables = conn.execute(text("SELECT name FROM sqlite_master WHERE type='table' AND name='pending_links'")).fetchall()
+                if not tables:
+                    logger.info("🔧 pending_links 表不存在，自动创建...")
+                    conn.run_sync(Base.metadata.create_all)
+            await conn.run_sync(_check)
+    except Exception as e:
+        logger.warning(f"⚠️ 建表检查异常: {e}")
 
     try:
         async with async_session() as session:

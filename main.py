@@ -37,6 +37,18 @@ async def main():
     logger.info("🚀 115 分享转存机器人 v2 启动中...")
     logger.info("=" * 50)
 
+    # ── 0) 初始化数据库表（确保 pending_links 等表存在）──
+    try:
+        import sys
+        sys.path.insert(0, "/app")
+        os.chdir("/cardbot")  # 确保相对路径 data/p115share.db 正确
+        from app.core.database import engine, Base
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        logger.info("✅ 数据库表初始化完成")
+    except Exception as e:
+        logger.warning(f"⚠️ 数据库表初始化异常（不影响启动）: {e}")
+
     # ── 1) 启动 Bot API（无 token 则跳过，进入等待配置模式）──
     app = None
     bot = None
