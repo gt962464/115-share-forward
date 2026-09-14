@@ -717,7 +717,18 @@ async def resolve_title(raw_name: str, regex_title: str, regex_year: str = "",
                         logger.warning(f"⚠️ 中文翻译搜索异常: {e}")
                         logger.debug(f"Traceback: {traceback.format_exc()}")
                 else:
-                    # 额外检查：原始标题是否包含搜索词（避免"Smugglers"匹配到"The Smugglers"）
+                    # 中文搜索词直接放行（日/韩剧 original_title 是日/韩文，不应拒绝）
+                    _has_cn_q = bool(__import__("re").search(r"[一-鿿]", llm_name))
+                    if _has_cn_q:
+                        logger.info(f"✅ LLM 译名 TMDB 命中(中文): {llm_name!r} → {det['title']!r}")
+                        return {
+                            "title": det["title"],
+                            "year": det.get("year") or llm_year or regex_year,
+                            "tmdb_id": det.get("tmdb_id"),
+                            "source": "tmdb_llm",
+                            "det": det,
+                        }
+                    # 英文搜索词：检查原始标题是否匹配（避免"Smugglers"匹配到"The Smugglers"）
                     _orig = (det.get("original_title") or det.get("original_name") or "").lower()
                     _q = llm_name.lower()
                     _exact = (_orig == _q)
