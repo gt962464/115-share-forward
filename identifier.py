@@ -477,6 +477,14 @@ async def _pick_tmdb_item(results: list, year: str, season, query_title: str = "
                     f"⚠️ TMDB 年份差异过大（文件:{file_year} vs TMDB最近:{closest}），拒绝误匹配: {query_title!r}"
                 )
                 return {}
+    # 优先选标题完全匹配的条目（避免"航海王"匹配到"航海王：和之国总集篇"）
+    if query_title:
+        _q = query_title.strip().lower()
+        for it in cands:
+            _name = (it.get("name") or it.get("title") or "").strip().lower()
+            _orig = (it.get("original_name") or it.get("original_title") or "").strip().lower()
+            if _name == _q or _orig == _q:
+                return it
     return cands[0]
 
 
@@ -497,7 +505,10 @@ async def tmdb_search(title: str, year: str = "", season: int = None,
         endpoint = (f"https://api.themoviedb.org/3/search/{media_type}" if media_type
                     else "https://api.themoviedb.org/3/search/multi")
         params = {"api_key": _tmdb_key(), "query": q, "page": 1}
-        if lang is not None:
+        # Default to zh-CN; pass "" to explicitly skip language filter
+        if lang is None:
+            params["language"] = _tmdb_lang()
+        elif lang:
             params["language"] = lang
         st, text = await _aio_get(endpoint, params=params)
         if st != 200:

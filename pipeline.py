@@ -713,7 +713,7 @@ async def process_link(
             episode = parsed.get("episode", "")
             ep_numbers = []
             for vn in video_names:
-                em = re.search(r"[Ss](\d{1,2})[Ee](\d{2,3})", vn)
+                em = re.search(r"[Ss](\d{1,2})[Ee](\d{2,4})", vn)
                 if em:
                     ep_numbers.append((int(em.group(1)), int(em.group(2))))
             if ep_numbers:
