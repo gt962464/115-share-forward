@@ -183,6 +183,9 @@ async def llm_parse_filename(raw_filename: str) -> dict | None:
             {"role": "user", "content": (
                 f"请解析以下文件名，严格按 JSON 格式输出：\n{raw_filename}\n\n"
                 f"格式要求：{{\"name\":\"英文原名或中文剧名\",\"year\":\"年份\"或null,\"season\":季数或null,\"episode\":\"集数\"或null,\"resolution\":\"分辨率\"或null}}\n"
+                f"【重要】name 字段必须是剧名/片名，不能是角色名！\n"
+                f"例如：文件名含 \"梅花十三\"（角色名），应识别为 \"刺客伍六七\"（剧名）。\n"
+                f"例如：文件名含 \"Magic Matin\"，应识别为 \"百变马丁\" 或 \"马丁的早晨\"。\n"
                 f"如果文件名已有英文原名，name 字段保留英文；只有无法确定时才翻译成中文。\n"
                 f"不要输出任何解释，直接返回 JSON。"
             )},
@@ -662,6 +665,17 @@ async def resolve_title(raw_name: str, regex_title: str, regex_year: str = "",
                     "year": det.get("year") or regex_year,
                     "tmdb_id": det.get("tmdb_id"),
                     "source": "tmdb_cn",
+                    "det": det,
+                }
+            # 中文名精确匹配时放宽年份限制（如百变马丁：文件名2003是原版年份，TMDB 2015是中文配音版）
+            _title_match = (det.get("title") or "").strip() == regex_title.strip()
+            if _title_match:
+                logger.info(f"✅ 中文名精确匹配(年份放宽): {regex_title!r} → {det['title']!r} ({det.get('year')})")
+                return {
+                    "title": det["title"],
+                    "year": det.get("year") or regex_year,
+                    "tmdb_id": det.get("tmdb_id"),
+                    "source": "tmdb_cn_relaxed",
                     "det": det,
                 }
             logger.warning(f"⚠️ 中文名直搜年份差异过大: {regex_title!r} vs {det.get('year')}")
