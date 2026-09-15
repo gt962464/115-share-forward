@@ -72,6 +72,10 @@ def extract_episode(name: str):
     m = re.search(r"(?:^|[.\s_-])[Ee](\d{1,3})", name)
     if m:
         return 1, int(m.group(1))
+    # 匹配后缀数字格式：如 -Cxuan-2.mkv 或 -FLAC.HEVC-Cxuan-12.mkv
+    m = re.search(r"-[A-Za-z]+-(\d{1,3})\.[a-zA-Z]{2,4}$", name)
+    if m:
+        return 1, int(m.group(1))
     return None
 
 
@@ -178,10 +182,36 @@ async def _rename_video_tree(svc, folder_id, title_cn, year, tmdb_id, suffix="Cx
         hdr = extract_hdr(vids[0]["name"])
         used = set()
         jobs = []
-        for v in vids:
+        # First pass: extract episode numbers, track which files have them
+        ep_info = []  # (index, season, ep or None)
+        for i, v in enumerate(vids):
             e = extract_episode(v["name"])
             if e:
-                season, ep = e
+                ep_info.append((i, e[0], e[1]))
+            else:
+                ep_info.append((i, None, None))
+        
+        # If some files have episode numbers and others don't, fill gaps
+        if any(ep is None for _, _, ep in ep_info) and any(ep is not None for _, _, ep in ep_info):
+            existing_eps = set(ep for _, _, ep in ep_info if ep is not None)
+            max_ep = max(existing_eps) if existing_eps else 0
+            # Find missing episode numbers (starting from 1)
+            missing_eps = []
+            for i in range(1, max_ep + 1):
+                if i not in existing_eps:
+                    missing_eps.append(i)
+            
+            # Assign missing episodes to unnumbered files (in order of appearance)
+            missing_idx = 0
+            for i, (idx, season, ep) in enumerate(ep_info):
+                if ep is None and missing_idx < len(missing_eps):
+                    ep_info[i] = (idx, 1, missing_eps[missing_idx])
+                    missing_idx += 1
+        
+        # Second pass: build new names
+        for i, (idx, season, ep) in enumerate(ep_info):
+            v = vids[idx]
+            if season is not None and ep is not None:
                 new_name = build_canonical_name(
                     title_cn, season, ep, None, year, quality, source, audio, hdr, encode,
                     ext=video_ext(v["name"]), suffix=suffix,
