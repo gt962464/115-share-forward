@@ -607,9 +607,13 @@ async def resolve_title(raw_name: str, regex_title: str, regex_year: str = "",
             if det:
                 _det_year = int(det.get("year", "0") or "0")
                 if _year_int and _det_year and abs(_year_int - _det_year) > 3:
-                    logger.info(f"TMDB {tmdb_id} {media_type} year mismatch, skip")
+                    logger.info(f"TMDB {tmdb_id} {media_type} year mismatch ({_det_year} vs {_year_int}), skip")
                     continue
-                logger.info(f"TMDB ID direct hit: {tmdb_id}")
+                # 如果文件有年份但 TMDB 条目无年份，跳过（避免 TV 无年份条目抢跑）
+                if _year_int and not _det_year:
+                    logger.info(f"TMDB {tmdb_id} {media_type} has no year, skip (file year={_year_int})")
+                    continue
+                logger.info(f"TMDB ID direct hit: {tmdb_id} ({media_type})")
                 return {"title": det["title"], "year": det.get("year") or regex_year, "tmdb_id": tmdb_id, "source": "tmdb_id", "det": det}
 
 
