@@ -460,33 +460,47 @@ def _parse_share_url(url: str):
 
 async def fetch_share_info(share_url: str) -> tuple[Optional[str], Optional[int]]:
     """获取分享链接的根名和总大小。"""
+    import asyncio as _aio
     svc = await get_svc()
     code, rc = _parse_share_url(share_url)
     if not code:
         return None, None
     
-    for fn_name in ("share_snap_app", "share_snap"):
-        try:
-            method = getattr(svc.client, fn_name, None)
-            if not method:
-                continue
-            payload = {"share_code": code, "receive_code": rc or "", "cid": 0, "limit": 1000, "offset": 0}
-            resp = await method(payload, async_=True)
-            data = (resp or {}).get("data", {})
-            info = data.get("shareinfo", data.get("share_info", {}))
-            title = info.get("share_title", "")
-            # 估算总大小
-            total = 0
-            for item in data.get("list", []):
-                total += int(item.get("size", 0) or item.get("file_size", 0) or item.get("fs", 0) or 0)
-            # 从分享标题提取 tmdb_id（如 "这都不是事儿 (2026) {tmdb-334298}"）
-            share_tmdb_id = None
-            _tid_m = _TMDBID_MARKER_RE.search(title)
-            if _tid_m:
-                share_tmdb_id = int(_tid_m.group(1))
-            return title, total, share_tmdb_id
-        except Exception as e:
-            logger.warning(f"fetch_share_info ({fn_name}) 失败: {e}")
+    for _retry in range(3):  # 最多重试3次（快照生成中时等待重试）
+        for fn_name in ("share_snap_app", "share_snap"):
+            try:
+                method = getattr(svc.client, fn_name, None)
+                if not method:
+                    continue
+                payload = {"share_code": code, "receive_code": rc or "", "cid": 0, "limit": 1000, "offset": 0}
+                resp = await method(payload, async_=True)
+                data = (resp or {}).get("data", {})
+                # 检查是否正在生成快照 (errno 4100021)
+                errno = (resp or {}).get("errno", "")
+                error_msg = (resp or {}).get("error", "")
+                if errno == 4100021 or "正在生成文件快照" in str(error_msg):
+                    if _retry < 2:
+                        logger.info(f"⏳ 分享快照生成中，等待5秒后重试 ({_retry+1}/3)")
+                        await _aio.sleep(5)
+                        continue
+                    else:
+                        logger.warning(f"⚠️ 分享快照生成超时: {code}")
+                info = data.get("shareinfo", data.get("share_info", {}))
+                title = info.get("share_title", "")
+                # 估算总大小
+                total = 0
+                for item in data.get("list", []):
+                    total += int(item.get("size", 0) or item.get("file_size", 0) or item.get("fs", 0) or 0)
+                # 从分享标题提取 tmdb_id（如 "这都不是事儿 (2026) {tmdb-334298}"）
+                share_tmdb_id = None
+                _tid_m = _TMDBID_MARKER_RE.search(title)
+                if _tid_m:
+                    share_tmdb_id = int(_tid_m.group(1))
+                return title, total, share_tmdb_id
+            except Exception as e:
+                logger.warning(f"fetch_share_info ({fn_name}) 失败: {e}")
+        # 如果所有端点都失败且不是快照生成中，退出重试循环
+        break
     return None, None, None
 
 
