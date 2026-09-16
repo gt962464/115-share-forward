@@ -72,6 +72,10 @@ def extract_episode(name: str):
     m = re.search(r"(?:^|[.\s_-])[Ee](\d{1,3})", name)
     if m:
         return 1, int(m.group(1))
+    # 匹配 第N集 格式（中文剧集）
+    m = re.search(r"第\s*(\d{1,3})\s*集", name)
+    if m:
+        return 1, int(m.group(1))
     # 匹配后缀数字格式：如 -Cxuan-2.mkv 或 -FLAC.HEVC-Cxuan-12.mkv
     m = re.search(r"-[A-Za-z]+-(\d{1,3})\.[a-zA-Z]{2,4}$", name)
     if m:
