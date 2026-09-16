@@ -91,7 +91,7 @@ def extract_hdr(name: str) -> str:
 
 
 # 分享根名里可能的 TMDB id 标记：如 "Z 遮天{tmdbid-224839}." / "xxx{tmdb:123456}"
-_TMDBID_MARKER_RE = re.compile(r"\{\s*tmdb(?:[-_]?id)?\s*[-:]\s*(\d{3,8})\s*\}", re.I)
+_TMDBID_MARKER_RE = re.compile(r"(?:\{|\[)\s*tmdb(?:[-_]?id)?\s*[-:=]\s*(\d{3,8})\s*(?:\}|\])", re.I)
 
 
 def parse_tmdbid_marker(name: str):
