@@ -43,6 +43,12 @@ try:
 except Exception as _e:
     logging.getLogger("pipeline").warning(f"fix_rename import failed: {_e}")
 
+# Apply create_share_link 深度规模匹配兜底 patch
+try:
+    import fix_share_link  # noqa: F401
+except Exception as _e2:
+    logging.getLogger("pipeline").warning(f"fix_share_link import failed: {_e2}")
+
 from config import (
     P115_COOKIE, P115_SAVE_DIR, AUTO_RENAME,
     SHARE_AUDIT_WAIT_TIMEOUT, SHARE_AUDIT_POLL_INTERVAL,

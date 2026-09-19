@@ -24,6 +24,7 @@ COPY jying.py /cardbot/jying.py
 COPY jying_menu.py /cardbot/jying_menu.py
 COPY _jying_cache.py /cardbot/_jying_cache.py
 COPY jying_scheduler.py /cardbot/jying_scheduler.py
+COPY fix_share_link.py /cardbot/fix_share_link.py
 
 WORKDIR /cardbot
 ENTRYPOINT []
