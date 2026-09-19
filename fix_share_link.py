@@ -1,24 +1,20 @@
 """
-create_share_link monkey patch:
-修复 fs_files 列目录被 405 风控截断时轮询耗尽返回 None，
-导致 pipeline 报「创建分享失败：未知响应」的问题。
+create_share_link monkey patch（补丁源文件）
 
-新增完成判定：深度规模匹配(stats_match) + 体积停滞 → 直接用任务子目录 CID 分享。
+背景：fs_files 列目录接口被 115 风控截断时只返回部分条目（如 28 项只回 5 项），
+导致 create_share_link 轮询耗尽后返回 None，pipeline 便报「创建分享失败：未知响应」。
+
+修复：新增完成判定——深度规模属性(fs_category_get)已匹配源分享基准且体积停滞时，
+直接用任务子目录 CID 创建分享；轮询耗尽时若曾观察到规模匹配，同样兜底分享。
+
+实现：把补丁函数 exec 进 app.services.p115 模块命名空间，
+以复用其 logger / check_response / parse_size_to_bytes 等全局符号。
 """
 import logging
+
 _log = logging.getLogger("pipeline")
 
-
-def _apply_patch():
-    try:
-        from app.services.p115 import P115Service
-    except Exception as e:
-        _log.warning(f"fix_share_link import P115Service failed: {e}")
-        return
-    P115Service.create_share_link = _patched_create_share_link
-    _log.info("✅ create_share_link 已补丁：深度规模匹配兜底分享")
-
-async def _patched_create_share_link(self, save_result: dict):
+_FUNC_SRC = r'''async def _patched_create_share_link(self, save_result: dict):
         if not self.client or not save_result:
             return None
 
@@ -440,7 +436,27 @@ async def _patched_create_share_link(self, save_result: dict):
                 "error_type": "share_failed",
                 "message": f"创建分享失败: {error_msg}"
             }
+'''
 
+
+def _apply_patch():
+    try:
+        import app.services.p115 as _p115
+    except Exception as e:
+        _log.warning(f"fix_share_link import p115 failed: {e}")
+        return
+    ns = _p115.__dict__
+    try:
+        exec(compile(_FUNC_SRC, "<fix_share_link>", "exec"), ns)
+    except Exception as e:
+        _log.warning(f"fix_share_link exec failed: {e}")
+        return
+    fn = ns.get("_patched_create_share_link")
+    if fn is None:
+        _log.warning("fix_share_link: patched function not found")
+        return
+    _p115.P115Service.create_share_link = fn
+    _log.info("✅ create_share_link 已补丁：深度规模匹配兜底分享")
 
 
 _apply_patch()
