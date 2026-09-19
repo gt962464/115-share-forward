@@ -545,19 +545,33 @@ async def fetch_share_info(share_url: str) -> tuple[Optional[str], Optional[int]
 
 
 async def _walk_share_items(svc, share_url: str, receive_code: str = "") -> list:
-    """遍历分享全部文件条目（新版 p115client API）。
+    """遍历分享全部文件条目（新版 p115client API），读超时自动退避重试。
 
     share_iterdir_walk(client, share_code或链接, receive_code, async_=True)
     每次 yield (pid, 目录列表, 文件列表) 三元组；
     文件为 normalize 后的 dict（name/size/id/is_dir...）。
     """
     from p115client.tool import share_iterdir_walk
-    items = []
-    async for _pid, _dirs, files in share_iterdir_walk(
-        svc.client, share_url, receive_code, async_=True,
-    ):
-        items.extend(files)
-    return items
+    max_attempts = 4
+    last_err = None
+    for attempt in range(1, max_attempts + 1):
+        items = []
+        try:
+            async for _pid, _dirs, files in share_iterdir_walk(
+                svc.client, share_url, receive_code, async_=True,
+            ):
+                items.extend(files)
+            return items
+        except Exception as e:
+            last_err = e
+            es = str(e).lower()
+            is_timeout = "timed out" in es or "read timeout" in es or "timeout" in es
+            if is_timeout and attempt < max_attempts:
+                logger.warning(f"⏳ 遍历分享读超时（第 {attempt}/{max_attempts} 次），{attempt * 2}s 后重试: {e}")
+                await asyncio.sleep(attempt * 2)
+                continue
+            raise
+    raise last_err
 
 
 async def fetch_share_video_files(share_url: str) -> tuple[list[str], str]:
@@ -584,6 +598,9 @@ async def fetch_share_video_files(share_url: str) -> tuple[list[str], str]:
                 videos.append(name)
     except Exception as e:
         logger.warning(f"fetch_share_video_files 失败: {e}")
+        es = str(e).lower()
+        if "timed out" in es or "read timeout" in es or "timeout" in es:
+            return [], f"扫描分享文件超时: {e}"
         return [], f"扫描分享文件出错: {e}"
 
     diag = f"共扫描到 {total_files} 个文件"
@@ -659,6 +676,8 @@ async def process_link(
     
     video_names, scan_diag = await fetch_share_video_files(url)
     if not video_names:
+        if "超时" in scan_diag:
+            return {"status": "error", "message": f"扫描分享文件超时，请稍后自动重试（{scan_diag}）"}
         return {"status": "error", "message": f"分享中没有视频文件（{scan_diag}）"}
     
     # ── 3) 解析元数据（正则 → OpenAI+TMDB 辅助识别）──
