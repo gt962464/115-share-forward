@@ -1497,6 +1497,11 @@ async def _handle_link(message, url: str):
 
 async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     """全局错误处理：记录日志并尽量给用户可见反馈。"""
+    # 无害错误：编辑菜单时内容未变化（重复点击同按钮），TG 返回 400 但无需打扰用户
+    _err_str = str(context.error)
+    if "Message is not modified" in _err_str or "message is not modified" in _err_str:
+        logger.info(f"ℹ️ 忽略无害错误(菜单重复点击): {_err_str[:120]}")
+        return
     logger.error(f"❌ 处理更新出错: {context.error}", exc_info=context.error)
     try:
         if isinstance(update, Update):
