@@ -1040,7 +1040,7 @@ async def auto_dedup(svc=None, dry_run: bool = False):
             if not it.get("is_dir", False):
                 continue
             name = it.get("name", "")
-            m = re.match(r"^(.+?)\((\d+)\)$", name)
+            m = re.match(r"^(.+?)\((\d{1,2})\)$", name)
             base = m.group(1) if m else name
             num = int(m.group(2)) if m else 0
             groups.setdefault(base, []).append({"id": it["id"], "name": name, "num": num})
