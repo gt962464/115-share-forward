@@ -23,3 +23,4 @@ Thumbs.db
 
 # Old project
 v2-bot/
+*.bak-*
