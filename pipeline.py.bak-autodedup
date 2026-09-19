@@ -999,127 +999,59 @@ async def cleanup_worker():
 
 
 
-# ── 自动去重：清理重复副本 + 空壳目录 ──
-_DEDUP_EMPTY_SHELL_AGE = 1800  # 秒：0 文件 0 子目录且闲置超过该时长才判为空壳（防误删转存中的目录）
-
-
-def _size_text_to_bytes(text) -> int:
-    """把 115 返回的 '213.05GB' 之类体积字符串换算成字节数。"""
-    try:
-        s = str(text).strip().upper()
-        for unit, mul in (("TB", 1024 ** 4), ("GB", 1024 ** 3), ("MB", 1024 ** 2), ("KB", 1024), ("B", 1)):
-            if s.endswith(unit):
-                return int(float(s[: -len(unit)].strip() or 0) * mul)
-    except Exception:
-        pass
-    return 0
-
-
-async def auto_dedup(svc=None, dry_run: bool = False):
-    """扫描自动转存目录，清理重复副本与空壳目录。
-
-    规则（按组，组名 = 去掉结尾 (N) 后的名字；组内只有 1 项且无 (N) 后缀时跳过）：
-      1. 空壳判定：深度属性 count==0 且 folder_count==0，**再用目录列举二次确认**，
-         并且闲置超过 _DEDUP_EMPTY_SHELL_AGE 秒 → 删除；
-      2. 组内仍有内容的副本超过 1 个 → 只保留一个（优先无 (N) 后缀，否则体积最大），其余删除；
-      3. 任何情况下都不会删掉组内最后一个有内容的副本；深度属性读取失败时按"有内容"处理，绝不误删。
-
-    dry_run=True 时只打印计划、不执行删除。
-    """
+# ── 自动去重：清理带 (N) 后缀的重复文件夹 ──
+async def auto_dedup(svc=None):
+    """扫描自动转存目录，删除带 (N) 后缀的重复文件夹，保留无后缀的版本。"""
     try:
         if svc is None:
             svc = await get_svc()
-        save_cid = await svc.get_save_dir_cid()
+        save_cid = await _get_save_cid(svc)
         if not save_cid:
-            logger.warning("⚠️ 自动去重: 未取到保存目录 CID，跳过")
             return
         items = await _get_dir_items(svc, save_cid)
-
+        # Group by base name (strip (N) suffix)
         groups: dict[str, list] = {}
         for it in items:
-            if not it.get("is_dir", False):
-                continue
             name = it.get("name", "")
+            is_dir = it.get("is_dir", False)
+            if not is_dir:
+                continue
+            # Match "Name (tmdb-XXX)(N)" pattern
             m = re.match(r"^(.+?)\((\d+)\)$", name)
-            base = m.group(1) if m else name
-            num = int(m.group(2)) if m else 0
-            groups.setdefault(base, []).append({"id": it["id"], "name": name, "num": num})
-
-        now = time.time()
-        plan: list[dict] = []
-        for base, files in groups.items():
-            if len(files) == 1 and files[0]["num"] == 0:
-                continue  # 独苗且无 (N) 后缀，不是去重对象
-            for f in files:
-                try:
-                    cat = await svc.client.fs_category_get(int(f["id"]), async_=True)
-                    if isinstance(cat, dict) and isinstance(cat.get("data"), dict):
-                        cat = cat["data"]
-                    if not isinstance(cat, dict) or cat.get("state") is False:
-                        raise RuntimeError(str(cat)[:120])
-                    f["count"] = int(cat.get("count") or 0)
-                    f["folder_count"] = int(cat.get("folder_count") or 0)
-                    f["size_text"] = str(cat.get("size") or "0B")
-                    f["size_bytes"] = _size_text_to_bytes(f["size_text"])
-                    f["idle"] = now - float(cat.get("utime") or cat.get("ptime") or 0)
-                    looks_empty = (
-                        f["count"] == 0
-                        and f["folder_count"] == 0
-                        and f["idle"] >= _DEDUP_EMPTY_SHELL_AGE
-                    )
-                    # 二次确认：换个端点直接列目录，两份证据都为空才判空壳
-                    if looks_empty:
-                        sub = await _get_dir_items(svc, int(f["id"]))
-                        looks_empty = (len(sub) == 0)
-                    f["empty"] = looks_empty
-                except Exception as e:
-                    logger.warning(f"⚠️ 去重: 读取 {f['name']} 属性失败，按有内容处理 | {e}")
-                    f.update(count=-1, folder_count=-1, size_text="未知", size_bytes=0, idle=0, empty=False)
-
-            empty = [f for f in files if f["empty"]]
-            non_empty = [f for f in files if not f["empty"]]
-            for f in empty:
-                plan.append({**f, "reason": f"空壳(0 文件, 闲置 {int(f['idle'] / 60)} 分钟)"})
-            if len(non_empty) > 1:
-                keeper = sorted(non_empty, key=lambda x: (x["num"] != 0, -x["size_bytes"]))[0]
-                for f in non_empty:
-                    if f["name"] == keeper["name"]:
-                        continue
-                    plan.append({**f, "reason": f"重复副本(保留 {keeper['name']})"})
-
-        if not plan:
-            logger.info("🧹 自动去重: 无重复副本/空壳需要清理")
-            return
-        for f in plan:
-            logger.info(
-                f"🧹 自动去重{'[试运行]' if dry_run else ''}: "
-                f"{f['name']} (CID: {f['id']}, {f['size_text']}) — {f['reason']}"
-            )
-        if dry_run:
-            logger.info(f"🧹 自动去重试运行结束: 计划删除 {len(plan)} 个，未执行")
-            return
-
+            if m:
+                base = m.group(1)
+                groups.setdefault(base, []).append({
+                    "id": it["id"], "name": name,
+                    "is_dup": True, "num": int(m.group(2)),
+                })
+            else:
+                groups.setdefault(name, []).append({
+                    "id": it["id"], "name": name,
+                    "is_dup": False, "num": 0,
+                })
+        
         deleted = 0
-        for f in plan:
-            try:
-                res = await svc.client.fs_delete(f["id"], async_=True)
-                state = res.get("state") if isinstance(res, dict) else None
-                if state is False:
-                    raise RuntimeError(res.get("error") or res.get("message") or str(res))
-                logger.info(f"🗑️ 自动去重: 已删除 {f['name']} (CID: {f['id']}, {f['size_text']}) — {f['reason']}")
-                deleted += 1
-            except Exception as e:
-                logger.warning(f"⚠️ 去重删除失败: {f['name']} | {e}")
+        for base, files in groups.items():
+            dups = [f for f in files if f.get("is_dup")]
+            if not dups:
+                continue
+            # Delete all duplicates with (N) suffix
+            for dup in dups:
+                try:
+                    await svc.client.fs_delete(dup["id"], async_=True)
+                    logger.info(f"🗑️ 自动去重: 删除重复副本 {dup["name"]} (CID: {dup["id"]})")
+                    deleted += 1
+                except Exception as e:
+                    logger.warning(f"⚠️ 去重删除失败: {dup["name"]} | {e}")
+        
         if deleted:
             try:
                 await empty_recycle_bin()
             except Exception:
                 pass
-            logger.info(f"🧹 自动去重完成: 删除 {deleted} 个目录")
+            logger.info(f"🧹 自动去重完成: 删除 {deleted} 个重复副本")
     except Exception as e:
         logger.warning(f"⚠️ 自动去重异常: {e}")
-
-
 def start_cleanup_worker():
     """启动清理 worker（幂等，重启后从持久化队列恢复）。"""
     global _cleanup_worker_task
