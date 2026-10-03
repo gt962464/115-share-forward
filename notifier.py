@@ -187,11 +187,17 @@ def _can_submit(user_id: int) -> bool:
 # ══════════════════════════════════════════════
 
 def _main_menu() -> InlineKeyboardMarkup:
+    from config import DIRECT_SHARE_MODE
+    _mode_btn = InlineKeyboardButton(
+        "⚡ 直发模式 ✅" if DIRECT_SHARE_MODE else "📥 转存模式 ✅",
+        callback_data="menu_pushmode",
+    )
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📥 提交链接", callback_data="menu_link"),
          InlineKeyboardButton("📊 运行状态", callback_data="menu_status")],
-        [InlineKeyboardButton("📡 监听管理", callback_data="menu_monitor"),
-         InlineKeyboardButton("📝 查看日志", callback_data="menu_log")],
+        [_mode_btn,
+         InlineKeyboardButton("📡 监听管理", callback_data="menu_monitor")],
+        [InlineKeyboardButton("📝 查看日志", callback_data="menu_log")],
         [InlineKeyboardButton("⚙️ 查看配置", callback_data="menu_config"),
          InlineKeyboardButton("📋 可配置项", callback_data="menu_setlist")],
         [InlineKeyboardButton("🤖 OpenAI", callback_data="menu_openai"),
@@ -201,6 +207,36 @@ def _main_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🎬 聚影", callback_data="menu_jying"),
          InlineKeyboardButton("❓ 帮助", callback_data="menu_help")],
     ])
+
+
+def _pushmode_menu() -> InlineKeyboardMarkup:
+    """推送模式二级菜单：一键切换 原链接直发 / 转存再发。"""
+    from config import DIRECT_SHARE_MODE
+    cur = DIRECT_SHARE_MODE
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            ("⚡ 原链接直发（不转存）" if not cur else "⚡ 原链接直发（不转存） ✅"),
+            callback_data="pushmode_set_1")],
+        [InlineKeyboardButton(
+            ("📥 转存并重命名后分享" if not cur else "📥 转存并重命名后分享 ✅"),
+            callback_data="pushmode_set_0")],
+        [InlineKeyboardButton("🔙 返回主菜单", callback_data="menu_back")],
+    ])
+
+
+def _pushmode_text() -> str:
+    from config import DIRECT_SHARE_MODE
+    cur = DIRECT_SHARE_MODE
+    if cur:
+        return ("⚡ 当前模式：原链接直发\n\n"
+                "✅ 读取原链接信息识别后，**直接用原链接**发频道\n"
+                "✅ 不转存、不重命名、不新建分享\n"
+                "✅ 对 115 零写操作，不会触发风控限流\n"
+                "⛔ 临时分享链接会被跳过不发布")
+    return ("📥 当前模式：转存并重命名后分享\n\n"
+            "✅ 转存到网盘 → 规范重命名 → 创建新分享 → 发频道\n"
+            "⚠️ 占用 115 转存与分享配额，频繁操作可能触发限流\n"
+            "ℹ️ 不受分享有效期限制")
 
 
 def _back() -> InlineKeyboardMarkup:
@@ -851,6 +887,34 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         from pipeline import request_cancel
         request_cancel()
         await query.edit_message_text("🛑 已请求取消，进行中的步骤会尽快停止。", reply_markup=_back())
+
+    # ── 推送模式（二级：查看 / 一键切换）──
+    elif data == "menu_pushmode":
+        if not _can_submit(user_id):
+            await query.edit_message_text("⛔ 你没有操作权限", reply_markup=_back())
+            return
+        await query.edit_message_text(_pushmode_text(), reply_markup=_pushmode_menu())
+
+    elif data.startswith("pushmode_set_"):
+        if not _can_submit(user_id):
+            await query.edit_message_text("⛔ 你没有操作权限", reply_markup=_back())
+            return
+        _val = data[len("pushmode_set_"):]
+        if _val not in ("0", "1"):
+            await query.edit_message_text("⛔ 参数错误", reply_markup=_back())
+            return
+        from config import set_config
+        import config as _cfg
+        msg = set_config("DIRECT_SHARE_MODE", _val)
+        # config.py 里 DIRECT_SHARE_MODE 是模块级常量（导入时求值一次），
+        # 只改 os.environ 不会热生效 —— 必须同步刷新 config 模块属性。
+        _cfg.DIRECT_SHARE_MODE = (_val == "1")
+        _after = ("已切换到 **⚡ 原链接直发**（不转存）" if _val == "1"
+                  else "已切换到 **📥 转存并重命名后分享**")
+        _eff = "✅ 已即时生效" if _cfg.DIRECT_SHARE_MODE else "✅ 已即时生效"
+        logger.info(f"🔀 推送模式切换: DIRECT_SHARE_MODE={_val} by {user_id}")
+        await query.edit_message_text(f"{_after}\n{_eff}\n\n{msg}",
+                                      reply_markup=_pushmode_menu())
 
     # ── OpenAI 设置（二级：四项可编辑 → 三级回复新值）──
     elif data == "menu_openai":
