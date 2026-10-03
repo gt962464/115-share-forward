@@ -489,17 +489,26 @@ def _dup_gate(url: str) -> tuple:
         return True, ""
 
 
-async def _auto_process_and_notify(chat_id: int, url: str, source_name: str):
-    """监听到链接后的自动转存 + 卡片私聊 + 卡片频道 + 自动清理（闭环）。"""
+async def _auto_process_and_notify(chat_id: int, url: str, source_name: str,
+                                  force: bool = False):
+    """监听到链接后的自动转存 + 卡片私聊 + 卡片频道 + 自动清理（闭环）。
+
+    force=True 用于「审核通过后重试」：跳过投递去重闸门。
+    第一次投递时已记过账并返回 pending，重试若再走去重会被自己拦下，
+    导致审核通过的链接永远发不出去。
+    """
     # ── 闸门一：投递去重（跨消息 / 跨重启，同链接只处理第一次）──
-    _ok, _why = _dup_gate(url)
-    if not _ok:
-        logger.info(f"⏭️ 跳过重复投递（{_why}）: {url[:60]}...")
-        try:
-            await send_private(chat_id, f"⏭️ 重复链接已跳过（{_why}）\n🔗 {url}")
-        except Exception:
-            pass
-        return
+    if force:
+        logger.info("🔁 审核通过重试：跳过投递去重闸门")
+    else:
+        _ok, _why = _dup_gate(url)
+        if not _ok:
+            logger.info(f"⏭️ 跳过重复投递（{_why}）: {url[:60]}...")
+            try:
+                await send_private(chat_id, f"⏭️ 重复链接已跳过（{_why}）\n🔗 {url}")
+            except Exception:
+                pass
+            return
 
     # ── 闸门二：并发去重（同一链接正在处理中）──
     _url_key = url.split('?')[0]  # 去掉 password 参数，只比路径
@@ -592,31 +601,39 @@ async def _auto_process_and_notify_inner(chat_id: int, url: str, source_name: st
             # 审核中：只私聊通知，不推频道（等审核通过后再推）
             share_link = result.get("share_link", url)
             _reason = result.get("reason") or "auditing"
+            _is_direct = bool(result.get("direct_share"))
             if _reason == "restricted":
                 text = ("🚫 115 接收受限（账号被风控），已转入长间隔重试队列。\n"
                         "⏳ 每 6 小时重试一次，连续失败会逐步拉长间隔，避免加重风控。\n"
                         f"🔗 {share_link}")
             elif _reason == "snapshotting":
                 text = f"⏳ 115 正在生成快照，稍后自动处理\n🔗 {share_link}"
+            elif _is_direct:
+                text = ("⏳ 115 审核中，已加入轮询队列。\n"
+                        "✅ 审核通过后会自动按原链接直接发送到频道（不转存）。\n"
+                        f"🔗 {share_link}")
             else:
                 text = f"⏳ 115 审核中，已加入轮询队列（通过后自动处理）\n🔗 {share_link}"
             await send_private(chat_id, text)
             # 🔧 立即启动审核轮询：p115 只把链接写进 pending_links 表，
             # 但没人 create_task 去跑轮询循环 → 链接永远挂着直到重启。
-            # 复用启动时的 _recovered_poll_task（间隔规则一致）。
+            # 直发模式(db_id=None)的链接不会落库，只有这条路径能救它，
+            # 因此用 force=True 让审核通过后的重试跳过投递去重闸门。
             try:
                 _pending_url = result.get("share_url") or url
                 _pending_task = asyncio.create_task(_recovered_poll_task({
                     "share_url": _pending_url,
                     "metadata": result.get("metadata") or {},
                     "db_id": result.get("db_id"),
-                    "reason": result.get("reason") or "auditing",
+                    "reason": _reason,
                     "attempts": result.get("attempts") or 0,
+                    "direct_share": _is_direct,
                 }))
                 _PENDING_TASKS.add(_pending_task)
                 _pending_task.add_done_callback(_PENDING_TASKS.discard)
                 logger.info(f"🔄 已启动审核轮询任务: {_pending_url} "
-                             f"(reason={result.get('reason')}, db_id={result.get('db_id')})")
+                             f"(reason={_reason}, db_id={result.get('db_id')}, "
+                             f"direct={_is_direct})")
             except Exception as _pe:
                 logger.error(f"❌ 启动审核轮询失败: {_pe}", exc_info=True)
         else:
@@ -1740,7 +1757,9 @@ async def _recover_pending_tasks():
                 logger.info(f"  ↳ {task.share_url} (状态: {task.status})")
                 # 创建 MockMessage 用于回复
                 import asyncio
-                asyncio.create_task(_recovered_poll_task(pending_info))
+                _t = asyncio.create_task(_recovered_poll_task(pending_info))
+                _PENDING_TASKS.add(_t)
+                _t.add_done_callback(_PENDING_TASKS.discard)
     except Exception as e:
         logger.error(f"❌ 恢复 pending tasks 异常: {e}", exc_info=True)
 
@@ -1849,7 +1868,14 @@ async def _recovered_poll_task(pending_info: dict):
                 try:
                     from notifier import _auto_process_and_notify
                     chat_id = int(tg_user_id) if tg_user_id else None
-                    await _auto_process_and_notify(chat_id, share_url, "恢复轮询")
+                    # 直发模式入队的链接：审核通过后必须仍走直发流程，
+                    # 否则会因 db_id=None 无法落库而再次卡住。
+                    _was_direct = bool(pending_info.get("direct_share"))
+                    if _was_direct:
+                        logger.info("🔁 审核通过，按直发模式重试（原链接不转存）")
+                    await _auto_process_and_notify(
+                        chat_id, share_url, "审核通过重试", force=_was_direct,
+                    )
                 except Exception as e:
                     logger.error(f"❌ 恢复后处理异常: {e}", exc_info=True)
                     if tg_user_id:

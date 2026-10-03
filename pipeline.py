@@ -765,6 +765,49 @@ def summarize_episode(video_names, fallback: str = "") -> str:
     return " ".join(parts)
 
 
+# ── 审核状态探测（只读）──
+# 115 share_state 语义：0=审核中 / 1=正常 / 7=违规 等
+AUDIT_PENDING_STATES = {0}
+
+
+async def probe_audit_state(share_url: str):
+    """返回 (state, info_dict)。state 为 None 表示接口不可用。"""
+    svc = await get_svc()
+    code, rc = _parse_share_url(share_url)
+    if not code:
+        return None, {}
+    for fn_name in ("share_snap_app", "share_snap"):
+        try:
+            method = getattr(svc.client, fn_name, None)
+            if not method:
+                continue
+            resp = await method(
+                {"share_code": code, "receive_code": rc or "", "cid": 0, "limit": 1, "offset": 0},
+                async_=True,
+            )
+            data = (resp or {}).get("data", {})
+            info = data.get("shareinfo", data.get("share_info", {})) or {}
+            if not info:
+                continue
+            try:
+                state = int(info.get("share_state"))
+            except (TypeError, ValueError):
+                state = None
+            return state, {
+                "share_state": state,
+                "share_title": info.get("share_title", ""),
+                "file_size": info.get("file_size"),
+                "auto_renewal": str(info.get("auto_renewal", "0")),
+                "share_duration": info.get("share_duration"),
+                "have_vio_file": info.get("have_vio_file"),
+                "share_code": code,
+                "receive_code": rc or "",
+            }
+        except Exception as e:
+            logger.warning(f"probe_audit_state ({fn_name}) 失败: {e}")
+    return None, {}
+
+
 async def _process_link_direct_share(url: str) -> dict:
     """原链接直转分享模式。
 
@@ -780,6 +823,21 @@ async def _process_link_direct_share(url: str) -> dict:
         {"status": "skipped_temporary", "message": ...}      → 临时链接，notifier 需处理
         {"status": "error", "message": ...}
     """
+    # ── 审核闸门：审核中的链接交给 notifier 轮询，通过后再发频道 ──
+    _state, _info = await probe_audit_state(url)
+    if _state in AUDIT_PENDING_STATES:
+        _title = _info.get("share_title", "")
+        logger.info(f"⏳ 直发模式：链接审核中（share_state={_state}），加入轮询: {_title[:50]}")
+        return {
+            "status": "pending",
+            "reason": "auditing",
+            "message": f"115 审核中: {_title}",
+            "share_url": url,
+            "db_id": None,
+            "metadata": {},
+            "direct_share": True,
+        }
+
     top_name, total, share_tmdb_id = await fetch_share_info(url)
     if not top_name:
         return {"status": "error", "message": "无法获取分享信息，链接可能无效或已过期"}
