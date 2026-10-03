@@ -26,6 +26,7 @@ COPY _jying_cache.py /cardbot/_jying_cache.py
 COPY jying_scheduler.py /cardbot/jying_scheduler.py
 COPY fix_share_link.py /cardbot/
 COPY fix_en_share.py /cardbot/
+COPY dup_link.py /cardbot/
 COPY app/ /app/
 
 WORKDIR /cardbot

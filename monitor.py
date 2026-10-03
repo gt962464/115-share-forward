@@ -325,8 +325,12 @@ class Monitor:
             return
 
         for link_info in links:
-            key = f"{event.id}:{link_info['url']}"
+            # 去重 key 只用链接本身（不含 event.id）。
+            # 原先带 event.id 前缀 → 同一条链接出现在不同消息里 key 不同 → 去重完全失效
+            # （实测 link_history / processed_keys 挡不住任何重复投递）。
+            key = link_info["url"].split("?")[0]
             if key in self._processed_keys:
+                logger.info(f"⏭️ 监听去重：链接已投递过，跳过 {key[:60]}...")
                 continue
             self._mark_processed(key)
 

@@ -37,6 +37,7 @@ CONFIG_SCHEMA = {
     "LOG_LEVEL":             ("INFO", "日志级别", False),
     "AUTO_RENAME":           ("1",    "自动重命名 0/1", False),
     "DIRECT_SHARE_MODE":     ("0",    "原链接直转分享 0=转存重命名/1=原链接直接分享(不转存)", False),
+    "DUP_LINK_MAX":          ("3",    "同一链接重复投递几次后不再记录(1=只处理首次)", False),
     "AUTO_DELETE_AFTER":     ("0",    "发卡成功后自动删除源文件延迟秒数（0=不删除）", False),
     "JYING_APP_ID":              ("",      "聚影开发者 AppID", False),
     "JYING_APP_KEY":             ("",      "聚影 API Key", False),

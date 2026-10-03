@@ -474,14 +474,37 @@ async def _render_monitor(query):
 # 正在处理的链接集合（去重：同一链接同时只处理一次）
 _processing_urls: set = set()
 
+
+def _dup_gate(url: str) -> tuple:
+    """链接投递去重闸门。返回 (是否处理, 说明)。"""
+    try:
+        import dup_link
+        should, count = dup_link.check_and_mark(url)
+        if should:
+            return True, ""
+        return False, (f"第 {count} 次投递" if count else "重复投递")
+    except Exception as e:
+        # 去重模块异常时**放行**，绝不能因为去重故障而卡死正常流程
+        logger.warning(f"⚠️ 去重检查异常(放行): {e}")
+        return True, ""
+
+
 async def _auto_process_and_notify(chat_id: int, url: str, source_name: str):
-    print('>>> _auto_process_and_notify ENTERED', flush=True)
     """监听到链接后的自动转存 + 卡片私聊 + 卡片频道 + 自动清理（闭环）。"""
-    # 去重：同一链接正在处理时直接跳过
+    # ── 闸门一：投递去重（跨消息 / 跨重启，同链接只处理第一次）──
+    _ok, _why = _dup_gate(url)
+    if not _ok:
+        logger.info(f"⏭️ 跳过重复投递（{_why}）: {url[:60]}...")
+        try:
+            await send_private(chat_id, f"⏭️ 重复链接已跳过（{_why}）\n🔗 {url}")
+        except Exception:
+            pass
+        return
+
+    # ── 闸门二：并发去重（同一链接正在处理中）──
     _url_key = url.split('?')[0]  # 去掉 password 参数，只比路径
     if _url_key in _processing_urls:
-        import logging as _lg
-        _lg.getLogger("notifier").info(f"⏭️ 跳过重复链接（正在处理中）: {url[:60]}...")
+        logger.info(f"⏭️ 跳过重复链接（正在处理中）: {url[:60]}...")
         return
     _processing_urls.add(_url_key)
     try:
