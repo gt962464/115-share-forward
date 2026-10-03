@@ -1,0 +1,1477 @@
+import asyncio
+import random
+import io
+import pandas as pd
+from datetime import datetime
+from typing import Union, Optional, Any
+from loguru import logger
+from sqlalchemy import select, update, delete, func
+from app.core.database import async_session
+from app.models.schema import ExcelTask, ExcelTaskItem
+from app.services.p115 import p115_service
+from app.services.tg_bot import tg_service
+from app.core.config import settings
+
+def _get_svc():
+    """获取当前最优 P115Service，降级到全局单例"""
+    try:
+        from app.services.account_manager import account_manager
+        svc = account_manager.get_primary_service()
+        if svc:
+            return svc, account_manager
+    except Exception:
+        pass
+    return p115_service, None
+
+# 审核中条目重试配置
+AUDIT_MAX_RETRIES = 3         # 最大重试轮次
+AUDIT_RETRY_INTERVAL = 300    # 每轮重试前等待秒数（5分钟）
+
+class ExcelBatchService:
+    def __init__(self):
+        self.worker_task = None
+        self.active_task_id = None
+        self.active_task_strategy = None  # 当前活跃任务的策略: 'transfer' | 'push'
+        self._lock = asyncio.Lock()
+        self._audit_retry_rounds: dict[int, int] = {}  # task_id -> 已重试轮次
+
+    @staticmethod
+    def _clean_val(val: Any) -> Optional[str]:
+        """Clean and validate cell values, handling NaN, None, null, undefined"""
+        if val is None:
+            return None
+        try:
+            if pd.isna(val):
+                return None
+        except Exception:
+            pass
+        s = str(val).strip()
+        if not s or s.lower() in ('nan', 'none', 'null', 'nat', '<na>', 'undefined'):
+            return None
+        return s
+
+    def _detect_excel_header_row(self, content: bytes) -> int:
+        """Detect true header row index from first 15 rows of Excel"""
+        try:
+            preview_df = pd.read_excel(io.BytesIO(content), header=None, nrows=15)
+        except Exception:
+            return 0
+        header_keywords = {'链接', 'url', 'link', 'share', '标题', '名称', 'name', 'title', '访问码', '提取码', '密码', 'code', 'pwd', 'password', '备注', '类型', 'id', '记录', '时间', 'slug'}
+        best_row = 0
+        best_score = -1
+        for idx, row in preview_df.iterrows():
+            row_vals = [str(x).strip() for x in row.values if pd.notnull(x) and str(x).strip()]
+            if not row_vals or len(row_vals) < 2:
+                continue
+            if len(set(row_vals)) == 1:
+                continue
+            avg_len = sum(len(v) for v in row_vals) / len(row_vals)
+            if avg_len > 30:
+                continue
+            score = 0
+            for val in row_vals:
+                val_lower = val.lower()
+                if any(k in val_lower for k in header_keywords):
+                    score += 3
+                if len(val) <= 15:
+                    score += 1
+            unique_ratio = len(set(row_vals)) / len(row_vals)
+            score = score * unique_ratio
+            if score > best_score:
+                best_score = score
+                best_row = int(idx)
+        return best_row
+
+    def _read_excel_smart(self, content: bytes) -> pd.DataFrame:
+        """Read Excel smartly skipping preamble notes/empty banners"""
+        header_row = self._detect_excel_header_row(content)
+        df = pd.read_excel(io.BytesIO(content), skiprows=header_row)
+        # Drop columns that are completely unnamed and empty
+        df = df.dropna(how='all', axis=1)
+        # Clean column names
+        df.columns = [str(c).strip() for c in df.columns]
+        return df
+
+    def _read_csv(self, content: bytes):
+        """Try reading CSV with multiple encodings"""
+        for encoding in ['utf-8', 'utf-8-sig', 'gbk', 'gb18030']:
+            try:
+                return pd.read_csv(io.BytesIO(content), encoding=encoding)
+            except UnicodeDecodeError:
+                continue
+            except Exception as e:
+                raise e
+        raise Exception("无法识别CSV文件编码，请确保文件是 UTF-8 或 GBK 格式")
+
+    async def parse_file(self, content: bytes, filename: str):
+        """Parse Excel/CSV/JSON file and return headers, sample data and 115 link statistics"""
+        try:
+            import re
+            p115_pattern = re.compile(r'https?://(?:115\.com|115cdn\.com|anxia\.com)/s/([a-zA-Z0-9]+)', re.IGNORECASE)
+            
+            if filename.endswith('.json'):
+                data = self._parse_telegram_json(content)
+                df = pd.DataFrame(data)
+            elif filename.endswith('.csv'):
+                df = self._read_csv(content)
+            else:
+                df = self._read_excel_smart(content)
+            
+            headers = df.columns.tolist()
+            # Convert NaN to None for JSON serialization
+            df_cleaned = df.where(pd.notnull(df), None)
+            
+            # Count 115 links across the dataframe
+            p115_count = 0
+            p115_sample_indices = []
+            for idx, row in df_cleaned.iterrows():
+                row_str = " ".join([str(v) for v in row.values if v is not None])
+                if p115_pattern.search(row_str):
+                    p115_count += 1
+                    if len(p115_sample_indices) < 5:
+                        p115_sample_indices.append(idx)
+            
+            # Preview rows: prefer 115 sample rows if available, else first 5 rows
+            if p115_sample_indices:
+                preview_data = df_cleaned.loc[p115_sample_indices].to_dict(orient='records')
+            else:
+                preview_data = df_cleaned.head(5).to_dict(orient='records')
+            
+            return {
+                "headers": headers,
+                "preview": preview_data,
+                "total_rows": len(df),
+                "p115_count": p115_count
+            }
+        except Exception as e:
+            logger.error(f"解析文件失败 {filename}: {e}")
+            raise Exception(f"解析文件失败: {str(e)}")
+
+    builder_functions = {
+        'bold': lambda t: t,
+        'italic': lambda t: t,
+        'underline': lambda t: t,
+        'strikethrough': lambda t: t,
+        'code': lambda t: t,
+        'pre': lambda t: t,
+        'text_link': lambda t: t,
+        'mention': lambda t: t,
+        'hashtag': lambda t: t,
+        'cashtag': lambda t: t,
+        'bot_command': lambda t: t,
+        'email': lambda t: t,
+        'phone_number': lambda t: t,
+        'blockquote': lambda t: t,
+        'spoiler': lambda t: t,
+    }
+
+    def _parse_telegram_json(self, content: bytes):
+        """Parse Telegram export JSON and extract links, titles, and original message format"""
+        import json
+        import re
+        
+        try:
+            data = json.loads(content)
+            messages = data.get('messages', [])
+            extracted_data = []
+            
+            # Regex patterns for links
+            link_pattern = re.compile(r'https?://(?:115\.com|115cdn\.com)/s/([a-zA-Z0-9]+)(?:\?password=([a-zA-Z0-9]+))?', re.IGNORECASE)
+            ali_pattern = re.compile(r'https?://(?:www\.)?(?:alipan\.com|aliyundrive\.com)/s/([a-zA-Z0-9_-]+)(?:\?password=([a-zA-Z0-9]+))?', re.IGNORECASE)
+            quark_pattern = re.compile(r'https?://pan\.quark\.cn/s/([a-zA-Z0-9_-]+)(?:\?pwd=([a-zA-Z0-9]+))?', re.IGNORECASE)
+            baidu_pattern = re.compile(r'https?://pan\.baidu\.com/s/([a-zA-Z0-9_-]+)(?:\?pwd=([a-zA-Z0-9]+))?', re.IGNORECASE)
+            xunlei_pattern = re.compile(r'https?://pan\.xunlei\.com/s/([a-zA-Z0-9_-]+)(?:\?pwd=([a-zA-Z0-9]+))?', re.IGNORECASE)
+            uc_pattern = re.compile(r'https?://drive\.uc\.cn/s/([a-zA-Z0-9_-]+)(?:\?pwd=([a-zA-Z0-9]+))?', re.IGNORECASE)
+            ed2k_pattern = re.compile(r'(ed2k://\|file\|[^\s]+)', re.IGNORECASE)
+            magnet_pattern = re.compile(r'(magnet:\?[^\s]+)', re.IGNORECASE)
+            telegra_pattern = re.compile(r'(https?://telegra\.ph/[^\s]+)', re.IGNORECASE)
+            
+            for msg in messages:
+                text_entities = msg.get('text_entities', [])
+                if not text_entities:
+                    continue
+                    
+                # 1. Reconstruct full_text and entities for the message
+                full_text = ""
+                entities = []
+                
+                # We need to track the current offset in UTF-16 code units
+                def get_u16_len(s):
+                    return len(s.encode('utf-16-le')) // 2
+
+                current_offset = 0
+                links_info = [] # [(start_u16, end_u16, url, password, link_type)]
+
+                for entity in text_entities:
+                    entity_text = entity.get('text', '')
+                    entity_type = entity.get('type')
+                    
+                    if not entity_text:
+                        continue
+                        
+                    length = get_u16_len(entity_text)
+                    
+                    # 1. Scan for any links in the text or href regardless of entity type
+                    urls_to_test = []
+                    if entity_type == 'text_link' and entity.get('href'):
+                        urls_to_test.append(entity.get('href'))
+                    urls_to_test.append(entity_text)
+                    
+                    for url_val in urls_to_test:
+                        # Check 115
+                        match = link_pattern.search(url_val)
+                        if match:
+                            links_info.append((current_offset, current_offset + length, url_val, match.group(2), '115'))
+                            break
+                        # Check Alipan / Aliyundrive
+                        match_ali = ali_pattern.search(url_val)
+                        if match_ali:
+                            links_info.append((current_offset, current_offset + length, url_val, match_ali.group(2), 'ali'))
+                            break
+                        # Check Quark
+                        match_quark = quark_pattern.search(url_val)
+                        if match_quark:
+                            links_info.append((current_offset, current_offset + length, url_val, match_quark.group(2), 'quark'))
+                            break
+                        # Check Baidu
+                        match_baidu = baidu_pattern.search(url_val)
+                        if match_baidu:
+                            links_info.append((current_offset, current_offset + length, url_val, match_baidu.group(2), 'baidu'))
+                            break
+                        # Check Xunlei
+                        match_xl = xunlei_pattern.search(url_val)
+                        if match_xl:
+                            links_info.append((current_offset, current_offset + length, url_val, match_xl.group(2), 'xunlei'))
+                            break
+                        # Check UC
+                        match_uc = uc_pattern.search(url_val)
+                        if match_uc:
+                            links_info.append((current_offset, current_offset + length, url_val, match_uc.group(2), 'uc'))
+                            break
+                        # Check ed2k
+                        match_ed2k = ed2k_pattern.search(url_val)
+                        if match_ed2k:
+                            links_info.append((current_offset, current_offset + length, match_ed2k.group(1), None, 'ed2k'))
+                            break
+                        # Check magnet
+                        match_mag = magnet_pattern.search(url_val)
+                        if match_mag:
+                            links_info.append((current_offset, current_offset + length, match_mag.group(1), None, 'magnet'))
+                            break
+                        # Check telegraph
+                        match_tel = telegra_pattern.search(url_val)
+                        if match_tel:
+                            links_info.append((current_offset, current_offset + length, match_tel.group(1), None, 'telegra'))
+                            break
+                    
+                    # 2. Reconstruct entities for Telegram message format
+                    # Mapping Telegram types to Aiogram types
+                    tg_to_aio = {
+                        'bold': 'bold',
+                        'italic': 'italic',
+                        'underline': 'underline',
+                        'strikethrough': 'strikethrough',
+                        'code': 'code',
+                        'pre': 'pre',
+                        'text_link': 'text_link',
+                        'mention': 'mention',
+                        'hashtag': 'hashtag',
+                        'cashtag': 'cashtag',
+                        'bot_command': 'bot_command',
+                        'email': 'email',
+                        'phone_number': 'phone_number',
+                        'blockquote': 'blockquote',
+                        'spoiler': 'spoiler',
+                        'link': 'url',
+                    }
+                    
+                    if entity_type in tg_to_aio:
+                        ent_data = {
+                            "type": tg_to_aio[entity_type],
+                            "offset": current_offset,
+                            "length": length
+                        }
+                        if entity_type == 'text_link':
+                            ent_data["url"] = entity.get('href')
+                        entities.append(ent_data)
+                    
+                    full_text += entity_text
+                    current_offset += length
+
+                if not links_info:
+                    continue
+
+                # Extract message date and format it as [MM-DD HH:MM]
+                date_suffix = ""
+                msg_date = msg.get('date')
+                if msg_date:
+                    try:
+                        dt = datetime.fromisoformat(msg_date)
+                        date_suffix = f" [{dt.strftime('%m-%d %H:%M')}]"
+                    except Exception:
+                        pass
+                
+                # Check whether links belong to separate sections (\n\n separated) or the same post
+                def get_link_priority(item):
+                    type_priority = {'115': 1, 'ali': 2, 'quark': 3, 'baidu': 4, 'xunlei': 5, 'uc': 6, 'magnet': 7, 'ed2k': 8, 'telegra': 9}
+                    return type_priority.get(item[4], 99)
+
+                has_double_newline_split = False
+                for idx in range(len(links_info) - 1):
+                    end_u16 = links_info[idx][1]
+                    next_start_u16 = links_info[idx + 1][0]
+                    try:
+                        between_start_char = len(full_text.encode('utf-16-le')[:end_u16*2].decode('utf-16-le', errors='ignore'))
+                        between_end_char = len(full_text.encode('utf-16-le')[:next_start_u16*2].decode('utf-16-le', errors='ignore'))
+                        between_text = full_text[between_start_char:between_end_char]
+                        if '\n\n' in between_text and len(between_text.strip()) > 10:
+                            has_double_newline_split = True
+                            break
+                    except Exception:
+                        pass
+
+                segments = []
+                if not has_double_newline_split:
+                    # Single message with 1 or multiple links for the same resource
+                    sorted_links = sorted(links_info, key=get_link_priority)
+                    primary_link = sorted_links[0]
+                    segments.append({
+                        "text": full_text,
+                        "entities": entities,
+                        "url": primary_link[2],
+                        "password": primary_link[3]
+                    })
+                else:
+                    # 2. Smart Segmentation logic for multi-resource digests
+                    text_utf16_len = get_u16_len(full_text)
+                    last_boundary = 0
+                    
+                    for idx, pos in enumerate(links_info):
+                        start_u16, end_u16, url, password, ltype = pos
+                        seg_end = end_u16
+                        
+                        if idx < len(links_info) - 1:
+                            next_start_u16 = links_info[idx + 1][0]
+                            try:
+                                between_start_char = len(full_text.encode('utf-16-le')[:end_u16*2].decode('utf-16-le', errors='ignore'))
+                                between_end_char = len(full_text.encode('utf-16-le')[:next_start_u16*2].decode('utf-16-le', errors='ignore'))
+                                between_text = full_text[between_start_char:between_end_char]
+                                
+                                double_newline_pos = between_text.find('\n\n')
+                                if double_newline_pos != -1:
+                                    split_char = between_start_char + double_newline_pos + 2
+                                    seg_end = get_u16_len(full_text[:split_char])
+                                else:
+                                    if len(between_text.strip()) > 10:
+                                        seg_end = next_start_u16
+                            except Exception:
+                                seg_end = next_start_u16
+                        else:
+                            seg_end = text_utf16_len
+                            
+                        # Slice text and entities
+                        try:
+                            u16_text = full_text.encode('utf-16-le')
+                            slice_u16 = u16_text[last_boundary*2:seg_end*2]
+                            seg_text = slice_u16.decode('utf-16-le', errors='ignore')
+                            
+                            seg_entities = []
+                            for e in entities:
+                                offset = e["offset"]
+                                length = e["length"]
+                                if offset >= last_boundary and (offset + length) <= seg_end:
+                                    e_copy = e.copy()
+                                    e_copy["offset"] = offset - last_boundary
+                                    seg_entities.append(e_copy)
+                                elif offset < seg_end and (offset + length) > last_boundary:
+                                    o_start = max(offset, last_boundary)
+                                    o_end = min(offset + length, seg_end)
+                                    e_copy = e.copy()
+                                    e_copy["offset"] = o_start - last_boundary
+                                    e_copy["length"] = o_end - o_start
+                                    seg_entities.append(e_copy)
+                                    
+                            segments.append({
+                                "text": seg_text,
+                                "entities": seg_entities,
+                                "url": url,
+                                "password": password
+                            })
+                        except Exception as sl_e:
+                            logger.error(f"Slice message failed: {sl_e}")
+                            segments.append({
+                                "text": full_text,
+                                "entities": entities,
+                                "url": url,
+                                "password": password
+                            })
+
+                        last_boundary = seg_end
+                    
+                # 3. Process each segment and extract title
+                for seg in segments:
+                    seg_text = seg["text"]
+                    seg_entities = seg["entities"]
+                    url = seg["url"]
+                    password = seg["password"]
+                    title = None
+                    if seg_text:
+                        first_line = seg_text.split('\n')[0].strip()
+                        if first_line:
+                            if any(first_line.startswith(prefix) for prefix in ['📺', '🎬', '🎥', '🎞️', '📁', '【', '[']) or \
+                               any(keyword in first_line for keyword in ['电视剧', '电影', '剧集', '名称', '资源']):
+                                clean_title = re.sub(r'^[🎬🎥🎞️📀📁📺\s]*(剧集|电影|名称|内容|资源)?[:：]?\s*', '', first_line)
+                                if clean_title:
+                                    title = clean_title.strip()
+                    
+                    if not title:
+                        try:
+                            for e in seg_entities:
+                                if e.get('type') == 'bold':
+                                    e_offset = e.get('offset')
+                                    e_length = e.get('length')
+                                    extracted = seg_text.encode('utf-16-le')[e_offset*2:(e_offset+e_length)*2].decode('utf-16-le', errors='ignore').strip()
+                                    if len(extracted) > 3 and extracted not in ["名称", "剧集", "电影", "资源", "标 签", "标签", "分 类", "分类", "体 积", "体积", "链接"]:
+                                        title = extracted
+                                        break
+                        except Exception:
+                            pass
+                            
+                    if not title and seg_text:
+                        first_line = seg_text.split('\n')[0].strip()
+                        if first_line and len(first_line) > 1 and "http" not in first_line:
+                            if "链接" not in first_line and "网盘" not in first_line:
+                                title = first_line
+                            elif len(first_line) > 10:
+                                title = first_line
+
+                    if title:
+                        title = re.sub(r'^[🎬🎥🎞️📀📁📺\s]*', '', title).strip()
+                        
+                    current_title = (title or f"Message_{msg.get('id')}") + date_suffix
+
+                    extracted_data.append({
+                        "链接": url,
+                        "标题": current_title,
+                        "消息时间": date_suffix.strip(' []') if date_suffix else "",
+                        "提取码": password or "",
+                        "item_metadata": {
+                            "full_text": seg_text,
+                            "entities": seg_entities,
+                            "msg_date": date_suffix.strip(' []') if date_suffix else ""
+                        }
+                    })
+            
+            if not extracted_data:
+                raise Exception("未在 JSON 文件中找到有效的网盘分享链接")
+            
+            return extracted_data
+        except Exception as e:
+            logger.exception(f"解析 Telegram JSON 失败")
+            raise Exception(f"解析 Telegram JSON 失败: {str(e)}")
+
+    async def create_task(self, filename: str, mapping: dict, content: bytes):
+        """Create task and items based on mapping"""
+        try:
+            import re
+            p115_pattern = re.compile(r'https?://(?:115\.com|115cdn\.com|anxia\.com)/s/([a-zA-Z0-9]+)(?:[?&]password=([a-zA-Z0-9]+))?', re.IGNORECASE)
+            pwd_pattern = re.compile(r'(?:访问码|提取码|密码|pwd|code)[:：\s]*([a-zA-Z0-9]{4,6})', re.IGNORECASE)
+
+            if filename.endswith('.json'):
+                data = self._parse_telegram_json(content)
+                df = pd.DataFrame(data)
+            elif filename.endswith('.csv'):
+                df = self._read_csv(content)
+            else:
+                df = self._read_excel_smart(content)
+            
+            df = df.where(pd.notnull(df), None)
+            
+            link_col = mapping.get('link')
+            title_col = mapping.get('title')
+            code_col = mapping.get('code')
+            remark_col = mapping.get('remark')
+            filter_p115_only = mapping.get('filter_p115_only', True)
+            
+            if not link_col:
+                raise Exception("未指定链接列")
+
+            async with async_session() as session:
+                task = ExcelTask(
+                    name=filename,
+                    status="wait",
+                    total_count=0
+                )
+                session.add(task)
+                await session.flush()
+                
+                # Add items
+                saved_count = 0
+                for idx, row in df.iterrows():
+                    raw_link = self._clean_val(row.get(link_col))
+                    if not raw_link:
+                        continue
+                    
+                    p115_match = p115_pattern.search(raw_link)
+                    
+                    if filter_p115_only and not p115_match:
+                        # If link_col didn't match, check other cells as fallback
+                        for c_name, c_val in row.items():
+                            clean_c = self._clean_val(c_val)
+                            if clean_c and c_name != link_col:
+                                fallback_m = p115_pattern.search(clean_c)
+                                if fallback_m:
+                                    p115_match = fallback_m
+                                    raw_link = clean_c
+                                    break
+                        if not p115_match:
+                            continue
+
+                    if p115_match:
+                        clean_url = f"https://115.com/s/{p115_match.group(1)}"
+                        url_pwd = self._clean_val(p115_match.group(2))
+                    else:
+                        clean_url = raw_link
+                        url_pwd = None
+
+                    # Extraction code: check code_col first, then url_pwd, then regex in raw_link
+                    code_val = self._clean_val(row.get(code_col)) if code_col else None
+                    if not code_val:
+                        code_val = url_pwd
+                    if not code_val:
+                        code_m = pwd_pattern.search(raw_link)
+                        if code_m:
+                            code_val = self._clean_val(code_m.group(1))
+
+                    # Title and Remark
+                    title_val = self._clean_val(row.get(title_col)) if title_col else None
+                    remark_val = self._clean_val(row.get(remark_col)) if remark_col else (self._clean_val(row.get('备注')) if '备注' in row else None)
+                    
+                    if title_val and remark_val and remark_val not in title_val:
+                        full_title = f"{title_val} {remark_val}"
+                    else:
+                        full_title = title_val or remark_val or f"Item_{saved_count + 1}"
+
+                    metadata = row.get('item_metadata') if 'item_metadata' in row and row.get('item_metadata') is not None else {
+                        "description": full_title,
+                        "title": title_val or full_title,
+                        "remark": remark_val or "",
+                        "full_text": f"云盘分享\n资源名称：{full_title}\n分享链接：{{{{share_link}}}}"
+                    }
+
+                    saved_count += 1
+                    item = ExcelTaskItem(
+                        task_id=task.id,
+                        row_index=saved_count,
+                        original_url=clean_url,
+                        title=full_title,
+                        extraction_code=code_val if code_val else None,
+                        item_metadata=metadata,
+                        status="待处理"
+                    )
+                    session.add(item)
+                
+                if saved_count == 0:
+                    raise Exception("未在文件中找到有效的分享链接")
+                    
+                task.total_count = saved_count
+                await session.commit()
+                return task.id
+        except Exception as e:
+            logger.error(f"创建任务失败: {e}")
+            raise e
+
+    async def start_worker(self):
+        if self.worker_task and not self.worker_task.done():
+            return
+        self.worker_task = asyncio.create_task(self._worker())
+        logger.info("Excel 批量转存服务工作线程启动")
+
+    async def _worker(self):
+        while True:
+            try:
+                item_id = None
+                is_processed = False
+                # Check for tasks that are "running"
+                async with async_session() as session:
+                    result = await session.execute(
+                        select(ExcelTask).where(ExcelTask.status == "running").limit(1)
+                    )
+                    task = result.scalar_one_or_none()
+                    
+                    if not task:
+                        # If no running task, check for "queued" tasks
+                        result = await session.execute(
+                            select(ExcelTask).where(ExcelTask.status == "queued").order_by(ExcelTask.created_at).limit(1)
+                        )
+                        task = result.scalar_one_or_none()
+                        if task:
+                            # Start the queued task
+                            task.status = "running"
+                            await session.commit()
+                            logger.info(f"队列任务 {task.id} ({task.name}) 开始运行")
+                
+                    if not task:
+                        # If no running taskFound, exit worker
+                        logger.info("Excel 批量转存服务工作线程退出（无运行中的任务）")
+                        self.worker_task = None
+                        break
+                    
+                    self.active_task_id = task.id
+                    self.active_task_strategy = task.strategy
+                    interval_min = task.interval_min
+                    interval_max = task.interval_max
+                    
+                    try:
+                        # Get one pending item
+                        async with async_session() as session:
+                            result = await session.execute(
+                                select(ExcelTaskItem).where(
+                                    ExcelTaskItem.task_id == task.id,
+                                    ExcelTaskItem.status == "待处理"
+                                ).order_by(ExcelTaskItem.row_index).limit(1)
+                            )
+                            item = result.scalar_one_or_none()
+                            
+                            if item:
+                                item.status = "处理中"
+                                item_id = item.id
+                                # Update current_row in ExcelTask and set is_waiting to False
+                                await session.execute(
+                                    update(ExcelTask).where(ExcelTask.id == task.id).values(
+                                        current_row=item.row_index,
+                                        is_waiting=False
+                                    )
+                                )
+                                await session.commit()
+                            else:
+                                # 主流程条目全部处理完 — 检查是否有「待审核」条目需要重试
+                                auditing_count = await session.scalar(
+                                    select(func.count(ExcelTaskItem.id)).where(
+                                        ExcelTaskItem.task_id == task.id,
+                                        ExcelTaskItem.status == "待审核"
+                                    )
+                                )
+
+                                if auditing_count > 0:
+                                    retry_round = self._audit_retry_rounds.get(task.id, 0) + 1
+                                    if retry_round > AUDIT_MAX_RETRIES:
+                                        logger.info(f"⏭️ 任务 {task.id} 中 {auditing_count} 个审核中条目已达最大重试轮次 ({AUDIT_MAX_RETRIES})，标记为跳过")
+                                        await session.execute(
+                                            update(ExcelTaskItem).where(
+                                                ExcelTaskItem.task_id == task.id,
+                                                ExcelTaskItem.status == "待审核"
+                                            ).values(status="跳过", error_msg=f"审核中超时，已达最大重试次数({AUDIT_MAX_RETRIES}轮)")
+                                        )
+                                        await session.commit()
+                                        await self._finish_task_and_flush_sub_batch(task.id)
+                                        continue
+                                    else:
+                                        self._audit_retry_rounds[task.id] = retry_round
+                                        logger.info(f"🔄 任务 {task.id} 主流程完成，第 {retry_round}/{AUDIT_MAX_RETRIES} 轮重试 {auditing_count} 个审核中条目，等待 {AUDIT_RETRY_INTERVAL}s...")
+                                        await session.execute(
+                                            update(ExcelTaskItem).where(
+                                                ExcelTaskItem.task_id == task.id,
+                                                ExcelTaskItem.status == "待审核"
+                                            ).values(status="待处理", error_msg=f"审核中，第 {retry_round} 轮重试")
+                                        )
+                                        await session.execute(
+                                            update(ExcelTask).where(ExcelTask.id == task.id).values(
+                                                current_row=0, is_waiting=True
+                                            )
+                                        )
+                                        await session.commit()
+                                        self.active_task_id = None
+                                        await asyncio.sleep(AUDIT_RETRY_INTERVAL)
+                                        continue
+                                else:
+                                    # 真正完成 - 先提交当前 session 并执行统一收尾
+                                    await session.commit()
+                                    await self._finish_task_and_flush_sub_batch(task.id)
+                                    continue
+
+                        # Process the item
+                        if task.strategy == "direct_save" and task.target_account_id:
+                            from app.services.account_manager import account_manager
+                            svc = account_manager.get_service(task.target_account_id)
+                            acct_mgr = account_manager
+                            if not svc:
+                                svc, acct_mgr = _get_svc()
+                        else:
+                            svc, acct_mgr = _get_svc()
+                        
+                        if task.strategy != "push" and svc.is_restricted:
+                            # 尝试切换到未被风控的账号
+                            new_svc, new_acct_mgr = _get_svc()
+                            if new_svc is not svc and not new_svc.is_restricted:
+                                logger.info(f"🔄 账号风控，批量任务切换账号: [{getattr(svc.account, 'id', '?')}] → [{getattr(new_svc.account, 'id', '?')}]")
+                                svc, acct_mgr = new_svc, new_acct_mgr
+                            else:
+                                logger.info(f"⏳ P115 服务当前处于受限状态，批量任务 {task.id} 自动暂停...")
+                                async with async_session() as session:
+                                    await session.execute(
+                                        update(ExcelTask).where(ExcelTask.id == task.id).values(status="paused")
+                                    )
+                                    if item_id:
+                                        await session.execute(
+                                            update(ExcelTaskItem).where(ExcelTaskItem.id == item_id).values(status="待处理")
+                                        )
+                                    await session.commit()
+
+                                if tg_service:
+                                    await tg_service.send_admin_msg(f"⏸️ 检测到所有账号受限，批量转存任务 '{task.name}' 已自动暂停。")
+
+                                self.active_task_id = None
+                                break # 停止当前任务的 worker
+
+                        task_config = {
+                            "target_channels": task.target_channels,
+                            "white_list_keywords": task.white_list_keywords,
+                            "black_list_keywords": task.black_list_keywords,
+                            "skip_large_package": task.skip_large_package,
+                            "strategy": task.strategy,
+                            "target_account_id": task.target_account_id,
+                            "target_dir": task.target_dir,
+                            "sensitive_replace_enabled": task.sensitive_replace_enabled,
+                            "sensitive_replace_pinyin": task.sensitive_replace_pinyin,
+                            "sensitive_replace_tmdb": task.sensitive_replace_tmdb
+                        }
+
+                        is_processed = await self._process_item(item_id, task_config, svc=svc, acct_mgr=acct_mgr)
+                        
+                        if getattr(is_processed, "__eq__", None) and is_processed == "RESTRICTED":
+                            # 尝试切换到未风控账号重试一次
+                            retry_svc, retry_acct_mgr = _get_svc()
+                            if retry_svc is not svc and not retry_svc.is_restricted:
+                                logger.info(f"🔄 处理中途风控，切换账号重试: [{getattr(svc.account, 'id', '?')}] → [{getattr(retry_svc.account, 'id', '?')}]")
+                                is_processed = await self._process_item(item_id, task_config, svc=retry_svc, acct_mgr=retry_acct_mgr)
+
+                        if getattr(is_processed, "__eq__", None) and is_processed == "RESTRICTED":
+                            logger.info(f"⏳ 任务 {task.id} 当前项遇到受限且无可用账号，立即暂停后续处理...")
+                            async with async_session() as session:
+                                await session.execute(
+                                    update(ExcelTask).where(ExcelTask.id == task.id).values(status="paused")
+                                )
+                                await session.commit()
+                            self.active_task_id = None
+                            break
+                        
+                        # 检测并累计分批直接保存的成功次数
+                        if item_id and is_processed != "RESTRICTED":
+                            async with async_session() as session:
+                                item_res = await session.execute(select(ExcelTaskItem).where(ExcelTaskItem.id == item_id))
+                                item_db = item_res.scalar_one_or_none()
+                                if item_db and item_db.status == "成功":
+                                    task_res = await session.execute(select(ExcelTask).where(ExcelTask.id == task.id))
+                                    task_db = task_res.scalar_one()
+                                    if task_db.strategy == "direct_save" and task_db.share_interval > 0:
+                                        task_db.sub_batch_count += 1
+                                        if task_db.sub_batch_start_row == 0:
+                                            task_db.sub_batch_start_row = item_db.row_index
+                                        await session.commit()
+                                        
+                                        if task_db.sub_batch_count >= task_db.share_interval:
+                                            logger.info(f"📦 子批次达到上限数量 ({task_db.sub_batch_count}/{task_db.share_interval})，触发分享与重命名")
+                                            try:
+                                                await self._trigger_sub_batch_share(task.id, svc)
+                                            except Exception as trigger_err:
+                                                logger.error(f"❌ 触发子批次分享异常: {trigger_err}")
+                        
+                    finally:
+                        # Find next row and set is_waiting to True before sleep
+                        if item_id:
+                            async with async_session() as session:
+                                # Look ahead for next pending item
+                                next_result = await session.execute(
+                                    select(ExcelTaskItem.row_index).where(
+                                        ExcelTaskItem.task_id == task.id,
+                                        ExcelTaskItem.status == "待处理"
+                                    ).order_by(ExcelTaskItem.row_index).limit(1)
+                                )
+                                next_row = next_result.scalar_one_or_none()
+                                
+                                if next_row:
+                                    await session.execute(
+                                        update(ExcelTask).where(ExcelTask.id == task.id).values(
+                                            current_row=next_row,
+                                            is_waiting=True
+                                        )
+                                    )
+                                else:
+                                    await session.execute(
+                                        update(ExcelTask).where(ExcelTask.id == task.id).values(
+                                            current_row=0,
+                                            is_waiting=False
+                                        )
+                                    )
+                                await session.commit()
+                        self.active_task_id = None
+                
+                # Rate limiting (Random interval) with capacity check
+                if is_processed:
+                    interval = random.randint(interval_min, interval_max)
+
+                    # 先执行容量检查（使用与当前任务相同的账号）
+                    try:
+                        start_check = datetime.now()
+                        cap_svc, _ = _get_svc()
+                        await cap_svc.check_capacity_and_cleanup(mode="batch")
+                        elapsed = (datetime.now() - start_check).total_seconds()
+                        logger.debug(f"容量检查完成，耗时 {elapsed:.2f}s")
+                    except Exception as ce:
+                        logger.error(f"批量任务容量检查失败: {ce}")
+                        elapsed = 0
+
+                    # 计算剩余等待时间并执行
+                    remaining_sleep = max(0, interval - elapsed)
+                    if remaining_sleep > 0:
+                        await asyncio.sleep(remaining_sleep)
+                else:
+                    # 跳过的项目不等待，直接处理下一个
+                    pass
+                
+            except Exception as e:
+                logger.error(f"Excel 工作线程出错: {e}")
+                await asyncio.sleep(5)
+
+    async def _process_item(self, item_id: int, task_config: dict = None, svc=None, acct_mgr=None):
+        async with async_session() as session:
+            result = await session.execute(
+                select(ExcelTaskItem).where(ExcelTaskItem.id == item_id)
+            )
+            try:
+                item = result.scalar_one()
+                # 如果传了配置字典则直接取，否则回退一次库查询（保险策略）
+                if task_config:
+                    target_channels = task_config.get("target_channels")
+                    white_list = task_config.get("white_list_keywords")
+                    black_list = task_config.get("black_list_keywords")
+                    skip_large_package = task_config.get("skip_large_package")
+                    strategy = task_config.get("strategy", "transfer")
+                    target_account_id = task_config.get("target_account_id")
+                    target_dir = task_config.get("target_dir")
+                    sensitive_replace_enabled = task_config.get("sensitive_replace_enabled", False)
+                    sensitive_replace_pinyin = task_config.get("sensitive_replace_pinyin", False)
+                    sensitive_replace_tmdb = task_config.get("sensitive_replace_tmdb", False)
+                else:
+                    task_result = await session.execute(
+                        select(ExcelTask).where(ExcelTask.id == item.task_id)
+                    )
+                    t_row = task_result.scalar_one()
+                    target_channels = t_row.target_channels
+                    white_list = t_row.white_list_keywords
+                    black_list = t_row.black_list_keywords
+                    skip_large_package = t_row.skip_large_package
+                    strategy = t_row.strategy
+                    target_account_id = t_row.target_account_id
+                    target_dir = t_row.target_dir
+                    sensitive_replace_enabled = t_row.sensitive_replace_enabled
+                    sensitive_replace_pinyin = t_row.sensitive_replace_pinyin
+                    sensitive_replace_tmdb = t_row.sensitive_replace_tmdb
+            except Exception:
+                logger.error(f"Item {item_id} not found or task deleted")
+                return
+
+            # 若未从外部传入，则在此处重新选择账号
+            if svc is None:
+                if strategy == "direct_save" and target_account_id:
+                    from app.services.account_manager import account_manager
+                    svc = account_manager.get_service(target_account_id)
+                    acct_mgr = account_manager
+                if svc is None:
+                    svc, acct_mgr = _get_svc()
+
+            task_id = item.task_id
+            
+            # --- Keyword Filtering Logic ---
+            search_text = f"{item.title or ''} {item.original_url or ''}"
+            if item.item_metadata and isinstance(item.item_metadata, dict):
+                search_text += f" {item.item_metadata.get('full_text', '')}"
+            
+            search_text = search_text.lower()
+            
+            # 1. Check Blacklist (Blacklist Wins)
+            if black_list:
+                black_keywords = [k.strip().lower() for k in black_list.split(',') if k.strip()]
+                for kw in black_keywords:
+                    if kw in search_text:
+                        logger.info(f"Item {item.id} skipped (Blacklist match: {kw})")
+                        item.status = "跳过"
+                        item.error_msg = f"命中黑名单关键词: {kw}"
+                        await session.commit()
+                        await self._update_task_counts(task_id)
+                        return False
+            
+            # 2. Check Whitelist
+            if white_list:
+                white_keywords = [k.strip().lower() for k in white_list.split(',') if k.strip()]
+                if white_keywords:
+                    found_white = False
+                    for kw in white_keywords:
+                        if kw in search_text:
+                            found_white = True
+                            break
+                    
+                    if not found_white:
+                        logger.info(f"Item {item.id} skipped (Whitelist no match)")
+                        item.status = "跳过"
+                        item.error_msg = "未命中白名单关键词"
+                        await session.commit()
+                        await self._update_task_counts(task_id)
+                        return False
+            # --- End Filtering Logic ---
+            
+            original_url = item.original_url
+            if not original_url:
+                item.status = "失败"
+                item.error_msg = "链接为空"
+                await session.commit()
+                await self._update_task_counts(task_id)
+                return True
+
+            # Prepare metadata
+            if item.item_metadata:
+                metadata = item.item_metadata.copy()
+                metadata["share_url"] = original_url
+            else:
+                metadata = {
+                    "description": item.title or "Excel Batch Import",
+                    "full_text": f"云盘分享\n资源名称：{item.title or '未知'}\n分享链接：{{{{share_link}}}}",
+                    "share_url": original_url
+                }
+
+            # Clean code validation
+            clean_code = self._clean_val(item.extraction_code)
+
+            # --- Strategy: Push ---
+            if strategy == "push":
+                url_with_code = original_url
+                if clean_code and "?password=" not in url_with_code:
+                    url_with_code = f"{original_url}?password={clean_code}"
+                if tg_service:
+                    await tg_service.broadcast_to_channels({original_url: url_with_code, "{{share_link}}": url_with_code}, metadata, channel_ids=target_channels)
+                
+                item.status = "成功"
+                item.new_share_url = url_with_code
+                item.error_msg = "直接推送完成"
+                await session.commit()
+                await self._update_task_counts(task_id)
+                return True
+
+            # --- Strategy: Direct Save ---
+            if strategy == "direct_save":
+                try:
+                    # Combine password if present for saving
+                    url_to_save = original_url
+                    if clean_code and "?password=" not in url_to_save:
+                        url_to_save = f"{url_to_save}?password={clean_code}"
+
+                    save_res = await svc.save_share_link(
+                        url_to_save,
+                        metadata=metadata,
+                        target_dir=target_dir or "115-Save",
+                        skip_large_package=True,
+                        is_batch=True,
+                        create_task_subdir=False
+                    )
+                    
+                    if save_res:
+                        if save_res.get("status") == "success":
+                            item.status = "成功"
+                            item.new_share_url = None
+                            item.error_msg = f"已直接保存到 {target_dir or '115-Save'}"
+                            if acct_mgr and svc.account:
+                                asyncio.create_task(acct_mgr.update_last_used(svc.account.id))
+                        elif save_res.get("status") == "pending":
+                            reason = save_res.get("reason")
+                            if reason == "snapshotting":
+                                item.status = "待审核"
+                                item.error_msg = "快照生成中，等待本批次完成后自动重试"
+                            elif reason == "restricted":
+                                item.status = "待处理"
+                                item.error_msg = "检测到115账号限制接收，等待恢复"
+                                await session.commit()
+                                await self._update_task_counts(task_id)
+                                return "RESTRICTED"
+                            else:
+                                item.status = "待审核"
+                                item.error_msg = "审核中，等待本批次完成后自动重试"
+                        elif save_res.get("status") == "skipped":
+                            item.status = "跳过"
+                            item.error_msg = save_res.get("message", "跳过处理")
+                        else:
+                            item.status = "失败"
+                            item.error_msg = save_res.get("message", "保存失败")
+                    else:
+                        item.status = "失败"
+                        item.error_msg = "保存服务无响应"
+                except Exception as e:
+                    logger.exception(f"处理项目失败: {item_id}")
+                    item.status = "失败"
+                    item.error_msg = str(e)
+                
+                await session.commit()
+                await self._update_task_counts(task_id)
+                return True
+
+            # --- Strategy: Transfer (Original Logic) ---
+            # 1. Check history first
+            history_url = await svc.get_history_link(original_url)
+            if history_url:
+                item.status = "成功"
+                item.error_msg = None
+                import json
+                item.new_share_url = json.dumps(history_url) if isinstance(history_url, list) else history_url
+                await session.commit()
+                await self._update_task_counts(task_id)
+                if tg_service:
+                    await tg_service.broadcast_to_channels({original_url: history_url, "{{share_link}}": history_url}, metadata, channel_ids=target_channels)
+                return True
+
+            try:
+                # Combine password if present for saving
+                url_to_save = original_url
+                if clean_code and "?password=" not in url_to_save:
+                    url_to_save = f"{url_to_save}?password={clean_code}"
+
+                save_res = await svc.save_and_share(
+                    url_to_save,
+                    metadata=metadata,
+                    skip_large_package=True,
+                    is_batch=True,
+                    sensitive_replace_enabled=sensitive_replace_enabled,
+                    sensitive_replace_pinyin=sensitive_replace_pinyin,
+                    sensitive_replace_tmdb=sensitive_replace_tmdb
+                )
+                
+                if save_res:
+                    if save_res.get("status") == "success":
+                        share_link = save_res.get("share_link")
+                        recursive_links = save_res.get("recursive_links", [])
+                        
+                        # 合并主链接和分卷链接
+                        all_links = recursive_links + ([share_link] if share_link else [])
+                        
+                        if all_links:
+                            import json
+                            # 如果只有一个链接存字符串，多个存 JSON
+                            link_to_store = json.dumps(all_links) if len(all_links) > 1 else all_links[0]
+
+                            await svc.save_history_link(original_url, all_links)
+                            if acct_mgr and svc.account:
+                                asyncio.create_task(acct_mgr.update_last_used(svc.account.id))
+                            item.new_share_url = link_to_store
+                            item.status = "成功"
+                            item.error_msg = None
+                            
+                            # Broadcast to channels
+                            if tg_service:
+                                if item.item_metadata:
+                                    await tg_service.broadcast_to_channels({original_url: all_links, "{{share_link}}": all_links}, metadata, channel_ids=target_channels)
+                                else:
+                                    await tg_service.broadcast_to_channels({original_url: all_links, "{{share_link}}": all_links}, {"full_text": f"资源名称：{item.title or '未知'}\n分享链接：{{{{share_link}}}}"}, channel_ids=target_channels)
+                        else:
+                            item.status = "失败"
+                            item.error_msg = "转存成功但生成分享链接返回为空"
+                    elif save_res.get("status") == "pending":
+                        reason = save_res.get("reason")
+                        if reason == "snapshotting":
+                            item.status = "待审核"
+                            item.error_msg = "快照生成中，等待本批次完成后自动重试"
+                        elif reason == "restricted":
+                            item.status = "待处理"
+                            item.error_msg = "检测到115账号限制接收，等待恢复"
+                            await session.commit()
+                            await self._update_task_counts(task_id)
+                            return "RESTRICTED"
+                        else:
+                            item.status = "待审核"
+                            item.error_msg = "审核中，等待本批次完成后自动重试"
+                    elif save_res.get("status") == "skipped":
+                        item.status = "跳过"
+                        item.error_msg = save_res.get("message", "跳过处理")
+                    else:
+                        item.status = "失败"
+                        item.error_msg = save_res.get("message", "转存失败")
+                else:
+                    item.status = "失败"
+                    item.error_msg = "转存服务无响应"
+            except Exception as e:
+                logger.exception(f"处理项目失败: {item_id}")
+                item.status = "失败"
+                item.error_msg = str(e)
+            
+            await session.commit()
+            await self._update_task_counts(task_id)
+            return True
+
+    async def _update_task_counts(self, task_id: int):
+        async with async_session() as session:
+            # Get success count
+            success_count = await session.scalar(
+                select(func.count(ExcelTaskItem.id)).where(
+                    ExcelTaskItem.task_id == task_id, 
+                    ExcelTaskItem.status == "成功"
+                )
+            )
+            # Get fail count
+            fail_count = await session.scalar(
+                select(func.count(ExcelTaskItem.id)).where(
+                    ExcelTaskItem.task_id == task_id, 
+                    ExcelTaskItem.status == "失败"
+                )
+            )
+            
+            await session.execute(
+                update(ExcelTask).where(ExcelTask.id == task_id).values(
+                    success_count=success_count,
+                    fail_count=fail_count
+                )
+            )
+            await session.commit()
+
+    async def _trigger_sub_batch_share(self, task_id: int, svc):
+        """执行一个子批次的重命名、分享、推送、删除与清空回收站流程"""
+        from p115client import check_response
+        
+        # 1. 从数据库读取子批次配置和状态
+        async with async_session() as session:
+            result = await session.execute(select(ExcelTask).where(ExcelTask.id == task_id))
+            task = result.scalar_one()
+            
+            start_row = task.sub_batch_start_row
+            sub_batch_count = task.sub_batch_count
+            target_channels = task.target_channels
+            target_dir = task.target_dir or "115-Save"
+            
+            # 获取该批次中最后一条成功的数据行号
+            last_success_row = await session.scalar(
+                select(func.max(ExcelTaskItem.row_index)).where(
+                    ExcelTaskItem.task_id == task_id,
+                    ExcelTaskItem.status == "成功",
+                    ExcelTaskItem.row_index >= start_row
+                )
+            )
+            if not last_success_row:
+                last_success_row = start_row + sub_batch_count - 1
+
+        # 2. 调用 115 网络接口执行操作（在数据库事务和 session 外部）
+        dir_path = target_dir
+        dir_basename = dir_path.strip('/').split('/')[-1]
+        
+        logger.info(f"📂 [分批分享] 获取目标目录 {dir_path} 的 CID")
+        target_cid = await svc._ensure_save_dir(dir_path)
+        
+        if not target_cid or target_cid == 0:
+            logger.error("❌ [分批分享] 无法获取有效的目标目录 CID")
+            return
+            
+        new_folder_name = f"{dir_basename}-{start_row}-{last_success_row}"
+        logger.info(f"📂 [分批分享] 正在将目标目录 '{dir_basename}' (CID: {target_cid}) 重命名为 '{new_folder_name}'")
+        
+        try:
+            rename_resp = await svc._api_call_with_timeout(
+                svc.client.fs_rename_app, (target_cid, new_folder_name), async_=True,
+                **svc._get_ios_ua_kwargs()
+            )
+            check_response(rename_resp)
+        except Exception as re_err:
+            logger.error(f"❌ [分批分享] 目录重命名失败: {re_err}")
+            raise re_err
+            
+        logger.info(f"🔗 [分批分享] 正在为已重命名的目录 '{new_folder_name}' (CID: {target_cid}) 生成分享链接")
+        try:
+            share_link = await svc._share_fids_direct([target_cid])
+            if not share_link:
+                raise RuntimeError("生成分享链接返回为空")
+            logger.info(f"✅ [分批分享] 生成分享链接成功: {share_link}")
+        except Exception as sh_err:
+            logger.error(f"❌ [分批分享] 生成分享链接失败: {sh_err}")
+            raise sh_err
+            
+        # 推送至 TG 频道
+        if target_channels:
+            logger.info(f"📢 [分批分享] 正在将分享链接推送至频道 {target_channels}")
+            try:
+                await tg_service.broadcast_to_channels(
+                    {"{{share_link}}": share_link},
+                    {"full_text": f"资源名称：{new_folder_name}\n分享链接：{{{{share_link}}}}"},
+                    channel_ids=target_channels
+                )
+            except Exception as push_err:
+                logger.error(f"❌ [分批分享] 推送至频道失败: {push_err}")
+                
+        # 1. 分享完成，等待 60 秒后再删除目录
+        logger.info("⏳ [分批分享] 分享已完成，等待 60 秒后删除已分享目录...")
+        await asyncio.sleep(60)
+
+        # 删除重命名后的目录
+        logger.info(f"🗑️ [分批分享] 正在删除已分享的目录 '{new_folder_name}' (CID: {target_cid})")
+        try:
+            del_resp = await svc._api_call_with_timeout(
+                svc.client.fs_delete, target_cid, async_=True,
+                timeout=60, label="fs_delete_sub_batch",
+                **svc._get_ios_ua_kwargs()
+            )
+            check_response(del_resp)
+        except Exception as del_err:
+            logger.error(f"❌ [分批分享] 删除已分享的目录失败: {del_err}")
+            
+        # 2. 等待 60 秒，确保目录完全进入回收站
+        logger.info("⏳ [分批分享] 等待 60 秒，确保已删除目录完全进入回收站...")
+        await asyncio.sleep(60)
+
+        # 清空回收站
+        logger.info("🗑️ [分批分享] 正在清空回收站...")
+        try:
+            await svc._cleanup_recycle_bin_internal()
+        except Exception as clean_err:
+            logger.error(f"❌ [分批分享] 清空回收站失败: {clean_err}")
+            
+        # 重新创建保存目录
+        logger.info(f"📁 [分批分享] 正在重新创建保存目录 {dir_path}")
+        try:
+            new_target_cid = await svc._ensure_save_dir(dir_path)
+            logger.info(f"✅ [分批分享] 重新创建保存目录成功 (新 CID: {new_target_cid})")
+        except Exception as create_err:
+            logger.error(f"❌ [分批分享] 重新创建目录失败: {create_err}")
+            raise create_err
+            
+        # 3. 更新数据库子批次状态
+        async with async_session() as session:
+            await session.execute(
+                update(ExcelTask).where(ExcelTask.id == task_id).values(
+                    sub_batch_start_row=0,
+                    sub_batch_count=0
+                )
+            )
+            await session.commit()
+            logger.info("✅ [分批分享] 子批次处理完成，状态已重置")
+
+    async def _finish_task_and_flush_sub_batch(self, task_id: int):
+        """任务完成时的统一收尾：检查并打包分享最后一批未满 share_interval 的子批次，并标记任务为 completed"""
+        async with async_session() as session:
+            task_res = await session.execute(select(ExcelTask).where(ExcelTask.id == task_id))
+            task_db = task_res.scalar_one_or_none()
+            if not task_db:
+                return
+            sub_batch_count = task_db.sub_batch_count
+            share_interval = task_db.share_interval
+            strategy = task_db.strategy
+            target_account_id = task_db.target_account_id
+            await session.commit()
+
+        if strategy == "direct_save" and share_interval > 0 and sub_batch_count > 0:
+            if target_account_id:
+                from app.services.account_manager import account_manager
+                task_svc = account_manager.get_service(target_account_id)
+            else:
+                task_svc = None
+            if not task_svc:
+                task_svc, _ = _get_svc()
+
+            logger.info(f"🏁 任务完成，正在处理最后一批 sub-batch (剩余 {sub_batch_count} 条)")
+            try:
+                await self._trigger_sub_batch_share(task_id, task_svc)
+            except Exception as final_err:
+                logger.error(f"❌ 运行至最后一条处理最后一批 sub-batch 失败: {final_err}")
+
+        # 重新开启 session 更新状态为 completed
+        async with async_session() as session_comp:
+            await session_comp.execute(
+                update(ExcelTask).where(ExcelTask.id == task_id).values(
+                    status="completed",
+                    current_row=0,
+                    is_waiting=False
+                )
+            )
+            await session_comp.commit()
+
+        self._audit_retry_rounds.pop(task_id, None)
+        await self._update_task_counts(task_id)
+        self.active_task_id = None
+
+    async def start_task(self, task_id: int, skip_count: int = 0, stop_row: int = 0, interval_min: int = 5, interval_max: int = 10, target_channels: list = None, white_list_keywords: str = None, black_list_keywords: str = None, skip_large_package: bool = False, strategy: str = "transfer", target_account_id: int = None, target_dir: str = None, share_interval: int = 0, sensitive_replace_enabled: bool = False, sensitive_replace_pinyin: Union[str, bool, int] = "0", sensitive_replace_tmdb: bool = False):
+        async with async_session() as session:
+            # Get currrent status
+            result = await session.execute(select(ExcelTask).where(ExcelTask.id == task_id))
+            task = result.scalar_one()
+            
+            # Check if another task is already running
+            result = await session.execute(
+                select(ExcelTask).where(ExcelTask.status == "running", ExcelTask.id != task_id)
+            )
+            other_running = result.scalar_one_or_none()
+            
+            new_status = "queued" if other_running else "running"
+            
+            # If resume from paused, dont reset skip/pending
+            # BUT if skip_count or stop_row changed, treat as fresh start
+            is_resume = task.status == "paused" and task.skip_count == skip_count and task.stop_row == stop_row
+            
+            # Update intervals and status
+            task.interval_min = interval_min
+            task.interval_max = interval_max
+            task.status = new_status
+            if target_channels is not None:
+                task.target_channels = target_channels
+            
+            # Save keywords
+            if white_list_keywords is not None:
+                task.white_list_keywords = white_list_keywords
+            if black_list_keywords is not None:
+                task.black_list_keywords = black_list_keywords
+            
+            task.skip_large_package = skip_large_package
+            task.strategy = strategy
+            task.target_account_id = target_account_id
+            task.target_dir = target_dir
+            task.share_interval = share_interval
+            task.sensitive_replace_enabled = sensitive_replace_enabled
+            task.sensitive_replace_pinyin = str(sensitive_replace_pinyin)
+            task.sensitive_replace_tmdb = sensitive_replace_tmdb
+            
+            if not is_resume:
+                self._audit_retry_rounds.pop(task_id, None)
+                task.skip_count = skip_count
+                task.stop_row = stop_row
+                task.current_row = 0
+                task.sub_batch_start_row = 0
+                task.sub_batch_count = 0
+                # Mark first skip_count items as "跳过"
+                await session.execute(
+                    update(ExcelTaskItem).where(
+                        ExcelTaskItem.task_id == task_id,
+                        ExcelTaskItem.row_index <= skip_count
+                    ).values(status="跳过", error_msg=None, new_share_url=None)
+                )
+                if stop_row > 0:
+                    # Mark items within [skip_count+1, stop_row] as "待处理"
+                    await session.execute(
+                        update(ExcelTaskItem).where(
+                            ExcelTaskItem.task_id == task_id,
+                            ExcelTaskItem.row_index > skip_count,
+                            ExcelTaskItem.row_index <= stop_row
+                        ).values(status="待处理", error_msg=None, new_share_url=None)
+                    )
+                    # Mark items after stop_row as "跳过"
+                    await session.execute(
+                        update(ExcelTaskItem).where(
+                            ExcelTaskItem.task_id == task_id,
+                            ExcelTaskItem.row_index > stop_row
+                        ).values(status="跳过", error_msg=None, new_share_url=None)
+                    )
+                else:
+                    # Mark remaining items as "待处理"
+                    await session.execute(
+                        update(ExcelTaskItem).where(
+                            ExcelTaskItem.task_id == task_id,
+                            ExcelTaskItem.row_index > skip_count
+                        ).values(status="待处理", error_msg=None, new_share_url=None)
+                    )
+            
+            await session.commit()
+            
+            if new_status == "running":
+                logger.info(f"任务 {task_id} 开始运行")
+            else:
+                logger.info(f"任务 {task_id} 已进入队列排队")
+
+        await self._update_task_counts(task_id)
+        if new_status == "running":
+            await self.start_worker()
+
+    async def shutdown(self):
+        """Handle graceful shutdown: pause running tasks, reset queued tasks"""
+        logger.info("Excel 批量转存服务正在关闭，正在保存任务状态...")
+        async with async_session() as session:
+            # Reset running, pausing, cancelling, and queued tasks to paused
+            await session.execute(
+                update(ExcelTask).where(
+                    ExcelTask.status.in_(["running", "pausing", "cancelling", "queued"])
+                ).values(status="paused", is_waiting=False)
+            )
+            await session.commit()
+        
+        # Wait for current processing item if any
+        wait_start = datetime.now()
+        while self.active_task_id is not None:
+            await asyncio.sleep(0.1)
+            if (datetime.now() - wait_start).total_seconds() > 30:
+                logger.warning("Excel shutdown wait timeout")
+                break
+        
+        logger.info("Excel 批量转存服务已关闭")
+
+
+    async def pause_task(self, task_id: int):
+        async with async_session() as session:
+            # Set to transitional status first
+            await session.execute(
+                update(ExcelTask).where(ExcelTask.id == task_id).values(status="pausing")
+            )
+            await session.commit()
+        
+        # Safety wait: wait until the current item processing finishes
+        wait_start = datetime.now()
+        while self.active_task_id == task_id:
+            await asyncio.sleep(0.1)
+            if (datetime.now() - wait_start).total_seconds() > 60:
+                logger.warning(f"Pause task {task_id} safety wait timeout")
+                break
+        
+        # Set to final status
+        async with async_session() as session:
+            await session.execute(
+                update(ExcelTask).where(ExcelTask.id == task_id).values(status="paused")
+            )
+            await session.commit()
+        logger.info(f"Task {task_id} paused safely")
+
+    async def cancel_task(self, task_id: int):
+        async with async_session() as session:
+            # Set to transitional status first
+            await session.execute(
+                update(ExcelTask).where(ExcelTask.id == task_id).values(status="cancelling")
+            )
+            await session.commit()
+            
+        # Safety wait: same as pause
+        wait_start = datetime.now()
+        while self.active_task_id == task_id:
+            await asyncio.sleep(0.1)
+            if (datetime.now() - wait_start).total_seconds() > 60:
+                break
+        
+        # Set to final status
+        async with async_session() as session:
+            await session.execute(
+                update(ExcelTask).where(ExcelTask.id == task_id).values(status="cancelled")
+            )
+            await session.commit()
+        logger.info(f"Task {task_id} cancelled safely")
+
+    async def recover_tasks(self):
+        """Recover tasks from non-graceful shutdown"""
+        logger.info("Excel 批量转存服务正在进行故障恢复...")
+        async with async_session() as session:
+            # 1. Reset tasks that were stuck in active or transitional states
+            await session.execute(
+                update(ExcelTask).where(
+                    ExcelTask.status.in_(["running", "pausing", "cancelling", "queued"])
+                ).values(status="paused", is_waiting=False)
+            )
+            # 2. Reset items that were stuck in "处理中"
+            await session.execute(
+                update(ExcelTaskItem).where(ExcelTaskItem.status == "处理中").values(status="待处理")
+            )
+            await session.commit()
+        logger.info("Excel 故障恢复完成")
+
+    async def delete_task(self, task_id: int):
+        async with async_session() as session:
+            await session.execute(delete(ExcelTaskItem).where(ExcelTaskItem.task_id == task_id))
+            await session.execute(delete(ExcelTask).where(ExcelTask.id == task_id))
+            await session.commit()
+
+excel_batch_service = ExcelBatchService()

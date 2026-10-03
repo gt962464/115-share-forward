@@ -61,8 +61,8 @@ _FUNC_SRC = r'''async def _patched_create_share_link(self, save_result: dict):
 
             new_fids = []
             stable_times = 0
-            max_poll_attempts = 45 # 最多等待约 90s
-            min_stable_required = 3 # 稳定不变的次数要求
+            max_poll_attempts = 150 # 最多等待约 90s
+            min_stable_required = 5 # 稳定不变的次数要求
 
             # 体积停滞兜底：顶层结构已建好但体积追不平基准（如违规文件被跳过）时，
             # 体积连续不变达到阈值即判定转存完成，避免死循环空转并触发 405。
@@ -318,8 +318,8 @@ _FUNC_SRC = r'''async def _patched_create_share_link(self, save_result: dict):
                             self._last_verify_failed = True
                             logger.warning(f"🔐 检测到账号登录失效 (创建分享): {share_error}")
                         
-                        # data 缺失：115 非标响应，触发重试
-                        is_rate_limited = isinstance(share_error, KeyError) and share_error.args and share_error.args[0] == "data"
+                        # 115 非标响应（缺少 data 或 state 字段），触发重试
+                        is_rate_limited = isinstance(share_error, KeyError) and share_error.args and share_error.args[0] in ("data", "state")
                         if ("4100005" in error_msg or "已被移动或删除" in error_msg or is_rate_limited) and retry_attempt < max_share_retries:
                             wait = 10 if is_rate_limited else 5
                             logger.warning(f"⚠️ {'115 分享接口触发限速' if is_rate_limited else '文件尚未就绪'}，等待 {wait} 秒后重试...")

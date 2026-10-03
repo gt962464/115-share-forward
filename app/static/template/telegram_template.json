@@ -1,0 +1,28 @@
+{
+    "about": "This is a template for Telegram export JSON",
+    "messages": [
+        {
+            "id": 1,
+            "type": "message",
+            "date": "2024-01-01T00:00:00",
+            "from": "示例频道",
+            "from_id": "channel123",
+            "text": "🎬 标题：示例资源 (2024)\nS01 1080P\n",
+            "text_entities": [
+                {
+                    "type": "bold",
+                    "text": "🎬 标题：示例资源 (2024)"
+                },
+                {
+                    "type": "plain",
+                    "text": "\nS01 1080P\n"
+                },
+                {
+                    "type": "text_link",
+                    "text": "115链接",
+                    "href": "https://115.com/s/xxxxxxxx?password=yyyy"
+                }
+            ]
+        }
+    ]
+}

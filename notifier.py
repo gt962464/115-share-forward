@@ -385,26 +385,27 @@ async def _status_text() -> str:
 
 
 def _log_text(n: int = 20) -> tuple:
-    """读取最近 n 条日志。返回 (text, use_markdown)。"""
     from pathlib import Path
     log_file = Path(os.getenv("LOG_FILE", "/data/bot.log"))
     if not log_file.exists():
-        return "📝 暂无日志文件", False
+        return "\U0001f4dd \u6682\u65e0\u65e5\u5fd7\u6587\u4ef6", False
     try:
-        lines = log_file.read_text(encoding="utf-8").splitlines()
-        recent = lines[-n:]
-        body = "\n".join(recent).replace("```", "``")
-        text = f"📝 最近 {len(recent)} 条日志:\n\n```\n{body}\n```"
+        all_lines = log_file.read_text(encoding="utf-8").splitlines()
+        recent = all_lines[-n:]
+        if len(recent) > 40:
+            recent = recent[-40:]
+        body = chr(10).join(recent)
+        text = "\U0001f4dd \u6700\u8fd1 " + str(len(recent)) + " \u6761\u65e5\u5fd7:" + chr(10) + chr(10) + body
         if len(text) > 3800:
-            text = text[-3800:]
-        return text, True
+            cut = text[-3700:]
+            p = cut.find(chr(10))
+            if p > 0:
+                cut = cut[p + 1:]
+            text = "\U0001f4dd \u65e5\u5fd7\uff08\u5df2\u622a\u65ad\uff09:" + chr(10) + chr(10) + cut
+        return text, False
     except Exception as e:
-        return f"读取日志失败: {e}", False
+        return "\u8bfb\u53d6\u65e5\u5fd7\u5931\u8d25: " + str(e), False
 
-
-# ══════════════════════════════════════════════
-#  /start → 主菜单
-# ══════════════════════════════════════════════
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -434,10 +435,31 @@ async def _render_monitor(query):
     )
 
 
+# 正在处理的链接集合（去重：同一链接同时只处理一次）
+_processing_urls: set = set()
+
 async def _auto_process_and_notify(chat_id: int, url: str, source_name: str):
     print('>>> _auto_process_and_notify ENTERED', flush=True)
     """监听到链接后的自动转存 + 卡片私聊 + 卡片频道 + 自动清理（闭环）。"""
-    await send_private(chat_id, f"🔔 监听到新链接!\n来源: {source_name}\n🔗 {url[:80]}...\n⏳ 正在自动转存...")
+    # 去重：同一链接正在处理时直接跳过
+    _url_key = url.split('?')[0]  # 去掉 password 参数，只比路径
+    if _url_key in _processing_urls:
+        import logging as _lg
+        _lg.getLogger("notifier").info(f"⏭️ 跳过重复链接（正在处理中）: {url[:60]}...")
+        return
+    _processing_urls.add(_url_key)
+    try:
+        await _auto_process_and_notify_inner(chat_id, url, source_name)
+    finally:
+        _processing_urls.discard(_url_key)
+
+async def _auto_process_and_notify_inner(chat_id: int, url: str, source_name: str):
+    from config import DIRECT_SHARE_MODE
+    if DIRECT_SHARE_MODE:
+        _hint = f"🔔 监听到新链接!\n来源: {source_name}\n🔗 {url[:80]}...\n⚡ 直转分享模式（不转存）"
+    else:
+        _hint = f"🔔 监听到新链接!\n来源: {source_name}\n🔗 {url[:80]}...\n⏳ 正在自动转存..."
+    await send_private(chat_id, _hint)
     try:
         result = await process_link(url)
         if result["status"] == "success":
@@ -490,19 +512,54 @@ async def _auto_process_and_notify(chat_id: int, url: str, source_name: str):
                     logger.warning(f"🔧 DEBUG 频道推送结果: {ch_ok}")
                 except Exception as ch_e:
                     logger.error(f"❌ 频道推送异常: {ch_e}", exc_info=True)
-            # ── 安排自动清理源文件 ──
+            # ── 安排自动清理源文件（直转模式无本地目录，跳过）──
             to_cid = result.get("to_cid")
             if to_cid:
                 from pipeline import schedule_cleanup
                 schedule_cleanup(to_cid, name=title, share_link=share_link)
             await sync_to_jying(result, chat_id=chat_id)
-            logger.info(f"✅ 自动转存成功(闭环): {title} → {share_link}")
+            if result.get("direct_share"):
+                logger.info(f"✅ 直转分享完成（原链接未改动）: {title} → {share_link}")
+            else:
+                logger.info(f"✅ 自动转存成功(闭环): {title} → {share_link}")
+
+        elif result["status"] == "skipped_temporary":
+            # 临时分享链接：按要求不分享、不推频道
+            _m = result.get("message", "临时分享链接，已跳过")
+            logger.info(f"⏭️ 跳过临时链接（不分享）: {url} — {_m}")
+            await send_private(chat_id, f"⏭️ 已跳过（临时分享不发布）\n{_m}\n🔗 {url}")
 
         elif result["status"] == "pending":
             # 审核中：只私聊通知，不推频道（等审核通过后再推）
             share_link = result.get("share_link", url)
-            text = f"⏳ 115审核中，已加入轮询队列（通过后自动处理）\n🔗 {share_link}"
+            _reason = result.get("reason") or "auditing"
+            if _reason == "restricted":
+                text = ("🚫 115 接收受限（账号被风控），已转入长间隔重试队列。\n"
+                        "⏳ 每 6 小时重试一次，连续失败会逐步拉长间隔，避免加重风控。\n"
+                        f"🔗 {share_link}")
+            elif _reason == "snapshotting":
+                text = f"⏳ 115 正在生成快照，稍后自动处理\n🔗 {share_link}"
+            else:
+                text = f"⏳ 115 审核中，已加入轮询队列（通过后自动处理）\n🔗 {share_link}"
             await send_private(chat_id, text)
+            # 🔧 立即启动审核轮询：p115 只把链接写进 pending_links 表，
+            # 但没人 create_task 去跑轮询循环 → 链接永远挂着直到重启。
+            # 复用启动时的 _recovered_poll_task（间隔规则一致）。
+            try:
+                _pending_url = result.get("share_url") or url
+                _pending_task = asyncio.create_task(_recovered_poll_task({
+                    "share_url": _pending_url,
+                    "metadata": result.get("metadata") or {},
+                    "db_id": result.get("db_id"),
+                    "reason": result.get("reason") or "auditing",
+                    "attempts": result.get("attempts") or 0,
+                }))
+                _PENDING_TASKS.add(_pending_task)
+                _pending_task.add_done_callback(_PENDING_TASKS.discard)
+                logger.info(f"🔄 已启动审核轮询任务: {_pending_url} "
+                             f"(reason={result.get('reason')}, db_id={result.get('db_id')})")
+            except Exception as _pe:
+                logger.error(f"❌ 启动审核轮询失败: {_pe}", exc_info=True)
         else:
             text = f"❌ 自动转存失败: {result.get('message', '未知错误')}\n🔗 {url}"
             await send_private(chat_id, text)
@@ -1544,6 +1601,10 @@ def setup_bot() -> Application:
     return app
 
 
+# 正在运行的审核轮询任务集合（防止 GC 回收 + 防重复启动）
+_PENDING_TASKS: set = set()
+
+
 # ── 恢复审核中的链接轮询（启动时调用）──
 async def _recover_pending_tasks():
     """从数据库恢复审核中的链接，启动无限期轮询"""
@@ -1615,15 +1676,22 @@ async def _recovered_poll_task(pending_info: dict):
 
     logger.info(f"🔄 开始恢复轮询: {share_url} (原因: {reason})")
 
-    # 间隔：审核中 5 分钟，其他 30 分钟
+    # 间隔：审核中 5 分钟，快照 30 分钟，受限 6 小时
+    # restricted 必须远大于 auditing：115 接收受限是账号级风控，
+    # 短间隔重试只会再次触发限流并延长封禁（正反馈）。
     if reason == "auditing":
         interval = 300
     elif reason == "snapshotting":
         interval = 1800
     elif reason == "restricted":
-        interval = 3600
+        interval = 21600
     else:
         interval = 300
+
+    # 受限链接逐次退避：第 n 次失败按 6h × 2^(n-1) 拉长，封顶 24h
+    if reason == "restricted":
+        _n = min(int(pending_info.get("attempts") or 0), 3)
+        interval = min(interval * (2 ** _n), 86400)
 
     attempt = 0
     while True:
@@ -1648,15 +1716,17 @@ async def _recovered_poll_task(pending_info: dict):
             if status_info.get("is_expired"):
                 logger.warning(f"⏰ 链接过期: {share_url}")
                 # 删除 pending 记录
-                try:
-                    from app.core.database import async_session
-                    from app.models.schema import PendingLink
-                    from sqlalchemy import delete as sql_delete
-                    async with async_session() as session:
-                        await session.execute(sql_delete(PendingLink).where(PendingLink.id == pending_info.get("db_id")))
-                        await session.commit()
-                except Exception:
-                    pass
+                _db_id = pending_info.get("db_id")
+                if _db_id is not None:
+                    try:
+                        from app.core.database import async_session
+                        from app.models.schema import PendingLink
+                        from sqlalchemy import delete as sql_delete
+                        async with async_session() as session:
+                            await session.execute(sql_delete(PendingLink).where(PendingLink.id == _db_id))
+                            await session.commit()
+                    except Exception:
+                        pass
                 return
 
             if status_info.get("is_prohibited"):
@@ -1700,15 +1770,17 @@ async def _recovered_poll_task(pending_info: dict):
                         await send_private(int(tg_user_id), f"❌ 处理失败: {e}\n🔗 {share_url}")
 
                 # 删除 pending 记录
-                try:
-                    from app.core.database import async_session
-                    from app.models.schema import PendingLink
-                    from sqlalchemy import delete as sql_delete
-                    async with async_session() as session:
-                        await session.execute(sql_delete(PendingLink).where(PendingLink.id == pending_info.get("db_id")))
-                        await session.commit()
-                except Exception:
-                    pass
+                _db_id = pending_info.get("db_id")
+                if _db_id is not None:
+                    try:
+                        from app.core.database import async_session
+                        from app.models.schema import PendingLink
+                        from sqlalchemy import delete as sql_delete
+                        async with async_session() as session:
+                            await session.execute(sql_delete(PendingLink).where(PendingLink.id == _db_id))
+                            await session.commit()
+                    except Exception:
+                        pass
                 return
 
         except Exception as e:

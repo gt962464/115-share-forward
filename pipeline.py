@@ -45,9 +45,15 @@ except Exception as _e:
 
 # Apply create_share_link 深度规模匹配兜底 patch
 try:
-    import fix_share_link  # noqa: F401
+    import fix_share_link
 except Exception as _e2:
     logging.getLogger("pipeline").warning(f"fix_share_link import failed: {_e2}")
+
+# Apply fix_en_share 英文名重试 patch
+try:
+    import fix_en_share  # noqa: F401
+except Exception as _e3:
+    logging.getLogger("pipeline").warning(f"fix_en_share import failed: {_e3}")
 
 from config import (
     P115_COOKIE, P115_SAVE_DIR, AUTO_RENAME,
@@ -70,6 +76,36 @@ def video_ext(name: str) -> str:
     return ""
 
 
+# 尾部数字误判黑名单：分辨率 / 视频编码编号
+_EP_FALSE_POSITIVE = {10, 264, 265, 480, 720, 1080, 1440, 2160}
+
+
+def _trailing_episode_number(name: str):
+    """剥掉扩展名后取尾部 1-3 位数字当集数。排除画质/编码/年份/纯数字文件名。"""
+    stem = re.sub(r"\.[a-zA-Z0-9]{1,4}$", "", name).strip()
+    if not stem:
+        return None
+    # 去掉已知的画质/编码/年份 token，剩下纯数字 → 不是集数（12.mkv / 1080p.mkv）
+    core = re.sub(r"(?i)(?<![a-z0-9])(2160p?|1440p?|1080p?|720p?|480p|4k|hd|sd|"
+                  r"x26[45]|h[ .]?26[45]|hevc|avc|av1)(?![a-z0-9])", "", stem)
+    core = re.sub(r"(?<![a-z0-9])((?:19|20)\d{2})(?![0-9])", "", core)
+    # 年份后若紧跟集数数字（余红旧事202601 → 年份2026 + 集数01），把年份切干净
+    core = re.sub(r"(?<![a-z0-9])((?:19|20)\d{2})(?=\d{1,2}(?![0-9]))", "", core)
+    core = core.rstrip(" .-_")
+    if not re.search(r"[a-zA-Z\u4e00-\u9fff]", core):
+        return None
+    # 从清洗后的 core 取数（不能用 stem，否则 2026 会被截成 26）
+    m = re.search(r"(\d{1,3})$", core)
+    if not m:
+        return None
+    n = int(m.group(1))
+    if n < 1 or n in _EP_FALSE_POSITIVE:
+        return None
+    if 1900 <= n <= 2099:
+        return None
+    return n
+
+
 def extract_episode(name: str):
     """从文件名提取 (season, ep)，拿不到返回 None。"""
     m = re.search(r"[Ss](\d{1,2})[.\s_-]?[Ee](\d{1,3})", name)
@@ -86,6 +122,10 @@ def extract_episode(name: str):
     m = re.search(r"-[A-Za-z]+-(\d{1,3})\.[a-zA-Z]{2,4}$", name)
     if m:
         return 1, int(m.group(1))
+    # 匹配「片名+序号」格式：余红旧事01.mkv / The.Simplest.Life.12.mp4
+    ep = _trailing_episode_number(name)
+    if ep:
+        return 1, ep
     return None
 
 
@@ -642,6 +682,158 @@ async def _save_share_with_retry(svc, url: str, metadata: dict = None, max_retri
     return {"status": "error", "message": "超过最大重试次数"}
 
 
+# ── 分享链接有效期判定（原链接直转分享模式用）──
+# 115 shareinfo 语义：
+#   auto_renewal == 1      → 永不过期
+#   share_duration == -1   → 永久（p115.py 里续期用的就是这个值）
+#   share_duration > 0     → 临时，值为天数（1/7/15/30 ...）
+#   share_duration == 0 且 auto_renewal == 0 → 无法判定，按永久处理但记日志
+PERMANENT_DURATION = -1
+
+
+async def get_share_duration(share_url: str):
+    """返回 (is_permanent, detail_dict)。只读，不做任何写操作。"""
+    import asyncio as _aio
+    svc = await get_svc()
+    code, rc = _parse_share_url(share_url)
+    if not code:
+        return None, {}
+    for fn_name in ("share_snap_app", "share_snap"):
+        try:
+            method = getattr(svc.client, fn_name, None)
+            if not method:
+                continue
+            resp = await method(
+                {"share_code": code, "receive_code": rc or "", "cid": 0, "limit": 1, "offset": 0},
+                async_=True,
+            )
+            data = (resp or {}).get("data", {})
+            info = data.get("shareinfo", data.get("share_info", {})) or {}
+            if not info:
+                continue
+            auto_renewal = str(info.get("auto_renewal", "0")).strip()
+            duration = info.get("share_duration")
+            try:
+                duration = int(duration)
+            except (TypeError, ValueError):
+                duration = None
+            is_permanent = (
+                auto_renewal in ("1", "true", "True")
+                or duration == PERMANENT_DURATION
+            )
+            detail = {
+                "share_code": code,
+                "auto_renewal": auto_renewal,
+                "share_duration": duration,
+                "expire_time": info.get("expire_time"),
+                "share_title": info.get("share_title", ""),
+                "has_receive_code": info.get("has_receive_code"),
+                "receive_code": rc or "",
+            }
+            logger.info(
+                f"🔍 分享有效期: {'永久' if is_permanent else '临时'} "
+                f"(auto_renewal={auto_renewal}, share_duration={duration}) — {code}"
+            )
+            return is_permanent, detail
+        except Exception as e:
+            logger.warning(f"get_share_duration ({fn_name}) 失败: {e}")
+    return None, {}
+
+
+async def _process_link_direct_share(url: str) -> dict:
+    """原链接直转分享模式。
+
+    与 process_link 的差别：**零写操作**。
+    不转存、不重命名、不创建新分享 —— 只读取元数据做识别，
+    然后把【原链接本身】交给 notifier 套卡片模板发频道。
+
+    副作用：完全不吃 115 的「转存 + 分享」风控配额。
+    临时分享（auto_renewal=0 且 share_duration>0）直接跳过，不分享。
+
+    返回 dict：
+        {"status": "success", "share_link": <原链接>, ...}   → 走 notifier 的 success 分支
+        {"status": "skipped_temporary", "message": ...}      → 临时链接，notifier 需处理
+        {"status": "error", "message": ...}
+    """
+    top_name, total, share_tmdb_id = await fetch_share_info(url)
+    if not top_name:
+        return {"status": "error", "message": "无法获取分享信息，链接可能无效或已过期"}
+
+    # ── 有效期闸门：临时分享不分享 ──
+    is_permanent, detail = await get_share_duration(url)
+    if is_permanent is False:
+        _d = detail.get("share_duration")
+        _e = detail.get("expire_time")
+        _exp = ""
+        if _e:
+            try:
+                _exp = time.strftime('%Y-%m-%d %H:%M', time.localtime(int(_e)))
+            except Exception:
+                _exp = str(_e)
+        logger.info(f"⏭️ 跳过临时分享链接（{_d} 天，到期 {_exp}）: {url}")
+        return {
+            "status": "skipped_temporary",
+            "message": f"临时分享链接（{_d} 天有效" + (f"，{_exp} 到期" if _exp else "") + "），已跳过不分享",
+            "share_duration": _d,
+            "expire_time": _exp,
+            "title": top_name,
+            "size": format_size(total or 0),
+        }
+    if is_permanent is None:
+        logger.warning(f"⚠️ 无法判定分享有效期，按临时处理并跳过: {url}")
+        return {"status": "skipped_temporary", "message": "无法判定分享有效期，已跳过", "title": top_name}
+
+    # ── 识别（只读）──
+    video_names, scan_diag = await fetch_share_video_files(url)
+    if not video_names:
+        if "超时" in scan_diag:
+            return {"status": "error", "message": f"扫描分享文件超时（{scan_diag}）"}
+        return {"status": "error", "message": f"分享中没有视频文件（{scan_diag}）"}
+
+    base_name = video_names[0] or top_name
+    parsed = parse_filename(base_name)
+    display_title = parsed["title"]
+    tmdb_id = None
+    ident_det = {}
+
+    _se = re.search(r"[Ss](\d{1,2})[Ee]\d{1,3}", base_name)
+    season = int(_se.group(1)) if _se else None
+    try:
+        from identifier import resolve_title
+        ident = await resolve_title(base_name, parsed["title"], parsed.get("year", ""), season,
+                                    parsed.get("tmdb_id") or share_tmdb_id)
+        if ident.get("title"):
+            display_title = ident["title"]
+            parsed["year"] = ident.get("year") or parsed.get("year", "")
+            tmdb_id = ident.get("tmdb_id")
+            ident_det = ident.get("det") or {}
+            if ident.get("source") not in (None, "regex"):
+                logger.info(f"🤖 识别({ident['source']}): {display_title!r} ({parsed.get('year')})")
+    except Exception as e:
+        logger.warning(f"OpenAI 识别失败，使用正则结果: {e}")
+
+    logger.info(
+        f"📋 直转分享: {display_title} | 画质: {parsed['quality']} | "
+        f"文件数: {len(video_names)} | 大小: {format_size(total or 0)} | 链接: 原链接（不转存）"
+    )
+
+    return {
+        "status": "success",
+        "share_link": url,               # ← 原链接，不新建
+        "direct_share": True,
+        "title": display_title,
+        "size": format_size(total or 0),
+        "quality": parsed.get("quality", ""),
+        "source": parsed.get("source", ""),
+        "episode": parsed.get("episode", ""),
+        "encode": parsed.get("encode", ""),
+        "year": parsed.get("year", ""),
+        "tmdb_id": tmdb_id,
+        "det": ident_det,
+        "to_cid": None,                  # 无本地目录 → 不触发清理
+    }
+
+
 async def process_link(
     url: str,
     title_override: str = "",
@@ -659,11 +851,16 @@ async def process_link(
     reset_cancel()  # 新任务开始，清空上一次的取消标志
 
     svc = await get_svc()
-    
+
+    # ── 0) 原链接直转分享模式（不转存、不重命名、不新建分享）──
+    from config import DIRECT_SHARE_MODE
+    if DIRECT_SHARE_MODE:
+        return await _process_link_direct_share(url)
+
     # ── 1) 获取分享信息 ──
     if on_progress:
         await on_progress("🔍 获取分享信息...")
-    
+
     top_name, total, share_tmdb_id = await fetch_share_info(url)
     if not top_name:
         return {"status": "error", "message": "无法获取分享信息，链接可能无效或已过期"}
@@ -720,7 +917,16 @@ async def process_link(
         msg = (save_res or {}).get("message", "未知错误")
         status = (save_res or {}).get("status", "unknown")
         if status == "pending":
-            return {"status": "pending", "message": f"115 审核中: {msg}"}
+            # 🔧 透传 pending 轮询所需字段：reason / db_id / share_url / metadata
+            # 不透传的话 notifier 侧拿不到 db_id，只能靠容器重启恢复。
+            return {
+                "status": "pending",
+                "message": f"115 审核中: {msg}",
+                "reason": save_res.get("reason") or "auditing",
+                "db_id": save_res.get("db_id"),
+                "share_url": save_res.get("share_url") or url,
+                "metadata": save_res.get("metadata") or {},
+            }
         return {"status": "error", "message": f"转存失败: {msg}"}
     
     to_cid = save_res.get("to_cid")
@@ -766,21 +972,47 @@ async def process_link(
         audit = await _wait_share_audit(svc, share_res)
         if isinstance(audit, dict) and not audit.get("ok"):
             reason = audit.get("reason", "unknown")
-            logger.warning(f"🗑️ 分享审核{reason}，清理本地文件: CID={to_cid}")
-            try:
-                await svc.client.fs_delete(to_cid, async_=True)
-                logger.info(f"✅ 已删除违规/失效的本地目录 (CID: {to_cid})")
+            # 违规时尝试英文名重试
+            if reason == 'prohibited':
+                import sys
+                sys.path.insert(0, '/cardbot')
+                from fix_en_share import _en_retry_share
+                new_share = await _en_retry_share(svc, sys.modules[__name__], save_res, to_cid, display_title, parsed.get("year", ""), tmdb_id, ident_det, video_names, parsed)
+                if new_share:
+                    share_res = new_share
+                    audit = {"ok": True}
+                else:
+                    logger.warning(f"🗑️ 英文名重试仍违规，清理本地文件: CID={to_cid}")
+                    try:
+                        await svc.client.fs_delete(to_cid, async_=True)
+                        logger.info(f"✅ 已删除违规/失效的本地目录 (CID: {to_cid})")
+                        try:
+                            await empty_recycle_bin()
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        logger.warning(f"⚠️ 清理失败: {e}")
+                    return {
+                        "status": "error",
+                        "message": f"分享审核{'违规' if reason=='prohibited' else '失效'}，已清理本地文件",
+                        "share_link": share_res,
+                    }
+            else:
+                logger.warning(f"🗑️ 分享审核{reason}，清理本地文件: CID={to_cid}")
                 try:
-                    await empty_recycle_bin()
-                except Exception:
-                    pass
-            except Exception as e:
-                logger.warning(f"⚠️ 清理失败: {e}")
-            return {
-                "status": "error",
-                "message": f"分享审核{'违规' if reason=='prohibited' else '失效'}，已清理本地文件",
-                "share_link": share_res,
-            }
+                    await svc.client.fs_delete(to_cid, async_=True)
+                    logger.info(f"✅ 已删除违规/失效的本地目录 (CID: {to_cid})")
+                    try:
+                        await empty_recycle_bin()
+                    except Exception:
+                        pass
+                except Exception as e:
+                    logger.warning(f"⚠️ 清理失败: {e}")
+                return {
+                    "status": "error",
+                    "message": f"分享审核{'违规' if reason=='prohibited' else '失效'}，已清理本地文件",
+                    "share_link": share_res,
+                }
         if audit and audit.get("ok"):
             # ── 基于所有 video_names 统计真实集数范围 ──
             episode = parsed.get("episode", "")

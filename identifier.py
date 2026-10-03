@@ -457,6 +457,14 @@ async def _pick_tmdb_item(results: list, year: str, season, query_title: str = "
     if len(cands) <= 1:
         return cands[0] if cands else {}
 
+    # 短标题精确匹配优先（Go 1999 这类：先看原名是否完全相等，不看年份）
+    if query_title and len(query_title.strip()) <= 4:
+        _qs = query_title.strip().lower()
+        for it in cands:
+            _o = (it.get("original_name") or it.get("original_title") or "").strip().lower()
+            if _o and _o == _qs:
+                return it
+
     if season is not None and season >= 1:
         tv = [it for it in cands if it.get("media_type") == "tv"]
         if tv:
@@ -467,7 +475,8 @@ async def _pick_tmdb_item(results: list, year: str, season, query_title: str = "
         tolerant = []
         for it in cands:
             ys = (it.get("first_air_date") or it.get("release_date") or "")[:4]
-            if ys.isdigit() and abs(file_year - int(ys)) <= 2:
+            _tol = 5 if (season is not None and int(season) >= 2) else 2
+            if ys.isdigit() and abs(file_year - int(ys)) <= _tol:
                 tolerant.append(it)
         if tolerant:
             # 优先选年份完全匹配的
@@ -480,7 +489,8 @@ async def _pick_tmdb_item(results: list, year: str, season, query_title: str = "
         ]
         if years:
             closest = min(years, key=lambda x: abs(x - file_year))
-            if abs(file_year - closest) > 5:
+            _rej = 8 if (season is not None and int(season) >= 2) else 5
+            if abs(file_year - closest) > _rej:
                 logger.warning(
                     f"⚠️ TMDB 年份差异过大（文件:{file_year} vs TMDB最近:{closest}），拒绝误匹配: {query_title!r}"
                 )
@@ -492,6 +502,14 @@ async def _pick_tmdb_item(results: list, year: str, season, query_title: str = "
             _name = (it.get("name") or it.get("title") or "").strip().lower()
             _orig = (it.get("original_name") or it.get("original_title") or "").strip().lower()
             if _name == _q or _orig == _q:
+                return it
+        # fuzzy: strip leading article (The/A) then compare, e.g. Awaken vs The Awake
+        _strip_art = lambda s: re.sub(r"^(the|a|an)\s+", "", s).strip()
+        _qs = _strip_art(_q)
+        for it in cands:
+            _n2 = _strip_art((it.get("name") or it.get("title") or "").strip().lower())
+            _o2 = _strip_art((it.get("original_name") or it.get("original_title") or "").strip().lower())
+            if (_qs and (_n2 == _qs or _o2 == _qs)):
                 return it
     return cands[0]
 
@@ -569,12 +587,13 @@ async def tmdb_search(title: str, year: str = "", season: int = None,
 
 # ── 统一识别入口（方案 A+C）──
 
-def _year_ok(file_year: str, tmdb_year: str) -> bool:
-    """年份差异 <= 2 年视为合理。"""
+def _year_ok(file_year: str, tmdb_year: str, season=None) -> bool:
+    """年份差异 <= 2 年视为合理；有季数时放宽到 5 年（续季年份 != 首播年份）。"""
     if not file_year or not tmdb_year:
         return True
     try:
-        return abs(int(file_year) - int(tmdb_year)) <= 2
+        tol = 5 if (season is not None and int(season) >= 2) else 2
+        return abs(int(file_year) - int(tmdb_year)) <= tol
     except (ValueError, TypeError):
         return True
 
@@ -623,7 +642,7 @@ async def resolve_title(raw_name: str, regex_title: str, regex_year: str = "",
         _share_name = _share_cn.group(0)
         det = await tmdb_search(_share_name, regex_year, season)
         if det:
-            if _year_ok(regex_year, det.get("year", "")):
+            if _year_ok(regex_year, det.get("year", ""), season):
                 logger.info(f"✅ 分享标题中文名 TMDB 命中: {_share_name!r} → {det['title']!r} ({det.get('year')})")
                 return {
                     "title": det["title"],
@@ -640,12 +659,18 @@ async def resolve_title(raw_name: str, regex_title: str, regex_year: str = "",
     if not _eng_match:
         # 尝试匹配空格分隔的英文标题（如 "The Spirealm"）
         _eng_match = re.match(r"^([A-Z][a-zA-Z]+(?:\s+[A-Za-z][a-zA-Z]+)+)", regex_title)
+    if not _eng_match:
+        # 数字开头的英文标题："9 Years of You" / "1883" / "24 Season 2"
+        _eng_match = re.match(r"^(\d{1,4}\s+[A-Za-z][a-zA-Z]+(?:\s+[A-Za-z][a-zA-Z]+)+)", regex_title)
+    if not _eng_match:
+        # 单个英文单词标题："Ensemble" / "Awaken" / "Fargo"
+        _eng_match = re.match(r"^([A-Z][a-zA-Z]{2,})$", regex_title)
     eng_title = _eng_match.group(1).replace(".", " ") if _eng_match else ""
 
     if eng_title and _tmdb_key():
         det = await tmdb_search(eng_title, regex_year, season, source_name="")
         if det:
-            if _year_ok(regex_year, det.get("year", "")):
+            if _year_ok(regex_year, det.get("year", ""), season):
                 logger.info(f"✅ 英文名 TMDB 命中: {eng_title!r} → {det['title']!r} ({det.get('year')})")
                 return {
                     "title": det["title"],
@@ -662,7 +687,7 @@ async def resolve_title(raw_name: str, regex_title: str, regex_year: str = "",
     if _has_chinese and _tmdb_key():
         det = await tmdb_search(regex_title, regex_year, season, source_name=raw_name)
         if det:
-            if _year_ok(regex_year, det.get("year", "")):
+            if _year_ok(regex_year, det.get("year", ""), season):
                 logger.info(f"✅ 中文名 TMDB 直搜命中: {regex_title!r} → {det['title']!r} ({det.get('year')})")
                 return {
                     "title": det["title"],
@@ -696,7 +721,7 @@ async def resolve_title(raw_name: str, regex_title: str, regex_year: str = "",
                 # 检查原始标题是否匹配（避免 "Smugglers" 匹配到 "The Smugglers"）
                 _orig_name = (det.get("original_name") or det.get("original_title") or "").lower()
                 _title_match = (_orig_name == llm_name.lower())
-                if not _llm_has_cn and (not _title_match or not _year_ok(llm_year or regex_year, det.get("year", ""))):
+                if not _llm_has_cn and (not _title_match or not _year_ok(llm_year or regex_year, det.get("year", ""), season)):
                     logger.info(f"⚠️ LLM 英文名年份不匹配，尝试中文翻译搜索: {llm_name!r}")
                     # 用 LLM 翻译成中文
                     try:
@@ -728,9 +753,16 @@ async def resolve_title(raw_name: str, regex_title: str, regex_year: str = "",
                             for _sfx in ("者", "人", "师", "们"):
                                 if _cn_name.endswith(_sfx) and len(_cn_name) > 2:
                                     _cn_candidates.append(_cn_name[:-1])
+                            # 字级变体：LLM 翻译常见偏差
+                            _cv = {"的": "之", "之": "的", "夫": "芙", "芙": "夫", "法": "发", "发": "法"}
+                            for _cf, _ct in _cv.items():
+                                if _cf in _cn_name:
+                                    _cn_candidates.append(_cn_name.replace(_cf, _ct))
                             for _cn_try in _cn_candidates:
                                 det_cn = await tmdb_search(_cn_try, llm_year or regex_year, season, source_name=raw_name)
-                                if det_cn and _year_ok(llm_year or regex_year, det_cn.get("year", "")):
+                                if not det_cn:
+                                    det_cn = await tmdb_search(_cn_try, llm_year or regex_year, season, source_name="")
+                                if det_cn and _year_ok(llm_year or regex_year, det_cn.get("year", ""), season):
                                     logger.info(f"✅ 中文翻译 TMDB 命中: {_cn_try!r} → {det_cn['title']!r}")
                                     return {
                                         "title": det_cn["title"],

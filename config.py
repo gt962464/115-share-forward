@@ -36,6 +36,7 @@ CONFIG_SCHEMA = {
     "LLM_PROMPT":            ("",     "自定义识别提示词（空=内置默认）", False),
     "LOG_LEVEL":             ("INFO", "日志级别", False),
     "AUTO_RENAME":           ("1",    "自动重命名 0/1", False),
+    "DIRECT_SHARE_MODE":     ("0",    "原链接直转分享 0=转存重命名/1=原链接直接分享(不转存)", False),
     "AUTO_DELETE_AFTER":     ("0",    "发卡成功后自动删除源文件延迟秒数（0=不删除）", False),
     "JYING_APP_ID":              ("",      "聚影开发者 AppID", False),
     "JYING_APP_KEY":             ("",      "聚影 API Key", False),
@@ -169,6 +170,8 @@ TMDB_LANG = (os.getenv("TMDB_LANG") or "zh-CN").strip()
 APP_HTTP_PROXY = os.getenv("APP_HTTP_PROXY", "").strip()
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").strip()
 AUTO_RENAME = os.getenv("AUTO_RENAME", "1").strip().lower() in {"1", "true", "yes"}
+# 原链接直转分享：1=只读原链接直接发频道，0=转存+重命名+自建分享
+DIRECT_SHARE_MODE = os.getenv("DIRECT_SHARE_MODE", "0").strip().lower() in {"1", "true", "yes"}
 SHARE_AUDIT_WAIT_TIMEOUT = int(os.getenv("SHARE_AUDIT_WAIT_TIMEOUT", str(15 * 60)))
 SHARE_AUDIT_POLL_INTERVAL = int(os.getenv("SHARE_AUDIT_POLL_INTERVAL", "30"))
 RETRY_INTERVAL = int(os.getenv("RETRY_INTERVAL", "60"))

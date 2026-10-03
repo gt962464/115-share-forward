@@ -43,6 +43,7 @@ async def main():
         sys.path.insert(0, "/app")
         os.chdir("/cardbot")  # 确保相对路径 data/p115share.db 正确
         from app.core.database import engine, Base
+        from app.models import schema  # noqa: F401
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
         logger.info("✅ 数据库表初始化完成")
@@ -74,7 +75,8 @@ async def main():
         import telegram
         logger.info(f"python-telegram-bot 版本: {telegram.__version__}")
 
-        await app.updater.start_polling(drop_pending_updates=True)
+        from telegram import Update
+        await app.updater.start_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
         me = await bot.get_me()
         logger.info(f"✅ Bot 启动成功: @{me.username} ({me.first_name})")
