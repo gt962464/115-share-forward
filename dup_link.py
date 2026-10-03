@@ -14,6 +14,7 @@
 import json
 import os
 import re
+import threading
 import time
 from pathlib import Path
 
@@ -76,25 +77,29 @@ class _Store:
         limit > 0 时为封顶计数：达到上限后不再累加（避免长尾重复投递
         把无意义的数字越滚越大，同时保持返回值的可读性）。
         """
-        self._load()
         k = _key(url)
         if not k:
             return True, 0
-        rec = self._data.get(k)
-        now = time.time()
-        if rec is None:
-            self._data[k] = {"count": 1, "first": now, "last": now}
-            self._save()
-            return True, 1
-        cur = int(rec.get("count", 1))
-        if limit and cur >= limit:
+        # 整个读-改-写序列必须原子：否则多线程会同时判定 rec is None，
+        # 各自写一份 count=1，磁盘上只留最后一次（实测 20 线程并发下
+        # 放行数正确但库中计数只有 3 而非 20）。RLock 允许与外层 check_and_mark 重入。
+        with _lock:
+            self._load()
+            rec = self._data.get(k)
+            now = time.time()
+            if rec is None:
+                self._data[k] = {"count": 1, "first": now, "last": now}
+                self._save()
+                return True, 1
+            cur = int(rec.get("count", 1))
+            if limit and cur >= limit:
+                rec["last"] = now
+                self._save()
+                return False, cur
+            rec["count"] = cur + 1
             rec["last"] = now
             self._save()
-            return False, cur
-        rec["count"] = cur + 1
-        rec["last"] = now
-        self._save()
-        return False, rec["count"]
+            return False, rec["count"]
 
     def peek(self, url: str):
         """只查询不写入 → (是否已处理过, 累计次数)。"""
@@ -117,6 +122,12 @@ class _Store:
 
 _store = _Store()
 
+# 保护「查 + 写」的原子性：同一次投递可能被监听回调与私聊提交同时触发，
+# 无锁时多个执行流会同时读到「未处理」而全部放行（实测同一次投递内
+# 「倾世皇妃」被处理 3 次）。用 threading.RLock 而非 asyncio.Lock：
+# 本模块入口是同步函数不能 await，且 asyncio.Lock 会绑定创建它的 event loop。
+_lock = threading.RLock()
+
 
 def check_and_mark(url: str):
     """
@@ -124,13 +135,17 @@ def check_and_mark(url: str):
 
     should_process=True  → 第一次投递，正常处理
     should_process=False → 重复投递，已累加计数并跳过
-    count = 累计投递次数
+
+    「查 + 写」在同一把锁内完成。check_and_mark 是**同步**函数，
+    但可能从多个协程/线程被调用（监听回调 + 私聊提交），
+    无锁时它们会同时读到「未处理」而全部放行 —— 日志实证同一次投递内
+    「倾世皇妃」被处理 3 次。用线程锁而非 asyncio.Lock：
+    同步代码里不能 await，且 asyncio.Lock 绑定了创建它的 loop。
     """
     limit = max(1, int(os.getenv("DUP_LINK_MAX", "3")))
-    first, count = _store.hit(url, limit=limit)
-    if first:
-        return True, 1
-    return False, count
+    with _lock:
+        first, count = _store.hit(url, limit=limit)
+    return (True, 1) if first else (False, count)
 
 
 def is_seen(url: str):

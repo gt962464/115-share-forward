@@ -740,6 +740,31 @@ async def get_share_duration(share_url: str):
     return None, {}
 
 
+def summarize_episode(video_names, fallback: str = "") -> str:
+    """从全部视频文件名统计真实集数范围。
+
+    优先用 extract_episode（支持 SxxExx / 第N集 / 片名+序号）；
+    单集返回 S01E03，多集返回 S01E01-E10，跨季用空格分隔。
+    兼容直发模式与转存模式，避免只看第一个文件名导致集数错误。
+    """
+    ep_numbers = []
+    for vn in (video_names or []):
+        got = extract_episode(vn)
+        if got:
+            ep_numbers.append((int(got[0]), int(got[1])))
+    if not ep_numbers:
+        return fallback
+    seasons = sorted({s for s, _ in ep_numbers})
+    parts = []
+    for s in seasons:
+        eps = sorted({e for ss, e in ep_numbers if ss == s})
+        if len(eps) == 1:
+            parts.append(f"S{s:02d}E{eps[0]:02d}")
+        else:
+            parts.append(f"S{s:02d}E{eps[0]:02d}-E{eps[-1]:02d}")
+    return " ".join(parts)
+
+
 async def _process_link_direct_share(url: str) -> dict:
     """原链接直转分享模式。
 
@@ -817,6 +842,9 @@ async def _process_link_direct_share(url: str) -> dict:
         f"文件数: {len(video_names)} | 大小: {format_size(total or 0)} | 链接: 原链接（不转存）"
     )
 
+    episode = summarize_episode(video_names, parsed.get("episode", ""))
+    logger.info(f"📊 集数统计: {len(video_names)} 个视频文件, 集数: {episode or '(电影/无集数)'}")
+
     return {
         "status": "success",
         "share_link": url,               # ← 原链接，不新建
@@ -825,10 +853,11 @@ async def _process_link_direct_share(url: str) -> dict:
         "size": format_size(total or 0),
         "quality": parsed.get("quality", ""),
         "source": parsed.get("source", ""),
-        "episode": parsed.get("episode", ""),
+        "episode": episode,
         "encode": parsed.get("encode", ""),
         "year": parsed.get("year", ""),
         "tmdb_id": tmdb_id,
+        "file_count": len(video_names),
         "det": ident_det,
         "to_cid": None,                  # 无本地目录 → 不触发清理
     }
