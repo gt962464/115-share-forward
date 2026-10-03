@@ -665,7 +665,23 @@ async def resolve_title(raw_name: str, regex_title: str, regex_year: str = "",
     if not _eng_match:
         # 单个英文单词标题："Ensemble" / "Awaken" / "Fargo"
         _eng_match = re.match(r"^([A-Z][a-zA-Z]{2,})$", regex_title)
-    eng_title = _eng_match.group(1).replace(".", " ") if _eng_match else ""
+    if not _eng_match:
+        # 宽松兜底：首词过短或含撇号/连字符的标题
+        #   "A Shop for Killers"     → 首词 "A" 只有 1 个字符
+        #   "JoJo's Bizarre Adventure"→ 首词含所有格撇号
+        #   "Loki's ... " / "Spider-Man ..." 同理
+        # 要求至少两个词，避免把 "Movie" 之类的噪声当标题。
+        _loose = re.match(
+            r"^([A-Za-z][A-Za-z\u2019'\-]*(?:[\s\u2019'\-]+[A-Za-z][A-Za-z\u2019'\-]*)+)",
+            regex_title,
+        )
+        if _loose:
+            # 去掉所有格撇号（JoJo's → JoJos），TMDB 侧更易匹配
+            eng_title = re.sub(r"[\u2019'](?=[a-z])", "", _loose.group(1))
+        else:
+            eng_title = ""
+    else:
+        eng_title = _eng_match.group(1).replace(".", " ")
 
     if eng_title and _tmdb_key():
         det = await tmdb_search(eng_title, regex_year, season, source_name="")
