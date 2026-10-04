@@ -425,6 +425,61 @@ async def _tmdb_detail(media_type: str, item_id, item: dict = None) -> dict | No
     else:
         name_local = det.get("title", "") or item.get("title", "")
         name_orig = det.get("original_title", "") or item.get("original_title", "")
+
+    # ── 回退补全：韩日/非中文条目在 zh-CN 下常为空壳 ──
+    # 实测 movie/1647238 (산의 손뼉 2026)：zh-CN 返回 title=韩文原名、
+    # overview 空、无海报；en-US 则有 title='The Quiet Applause' + 537 字简介。
+    # 语言偏好只影响译名，不该导致「简介/海报全丢」。
+    if (not det.get("overview") or not det.get("poster_path")) and orig_lang != "zh":
+        for _fb in ("en-US", "ko", "ja"):
+            if _fb == _tmdb_lang():
+                continue
+            _st, _dt = await _aio_get(
+                f"https://api.themoviedb.org/3/{media_type}/{item_id}",
+                params={"api_key": _tmdb_key(), "language": _fb},
+            )
+            if _st != 200:
+                continue
+            try:
+                _f = json.loads(_dt)
+            except Exception:
+                continue
+            # 只补空字段，不覆盖已有的中文数据
+            _filled = []
+            if not det.get("overview") and _f.get("overview"):
+                det["overview"] = _f["overview"]
+                _filled.append("overview")
+            if not det.get("poster_path") and _f.get("poster_path"):
+                det["poster_path"] = _f["poster_path"]
+                _filled.append("poster")
+            if not det.get("vote_average") and _f.get("vote_average"):
+                det["vote_average"] = _f["vote_average"]
+                _filled.append("rating")
+            if not det.get("genres") and _f.get("genres"):
+                det["genres"] = _f["genres"]
+                _filled.append("genres")
+            if _filled:
+                logger.info(f"🌐 TMDB {item_id} {media_type} 用 {_fb} 语言补全: {', '.join(_filled)}")
+            if _filled:
+                break
+
+    # ── 无海报时用背景图兜底 ──
+    # 实测 movie/1647238: posters=0 但 backdrops=4。
+    # 纯文字卡片在频道里很难辨认，用 backdrop 至少能有个视觉。
+    if not det.get("poster_path"):
+        try:
+            _st, _dt = await _aio_get(
+                f"https://api.themoviedb.org/3/{media_type}/{item_id}/images",
+                params={"api_key": _tmdb_key()},
+            )
+            if _st == 200:
+                _imgs = json.loads(_dt)
+                _bd = _imgs.get("backdrops") or []
+                if _bd:
+                    det["poster_path"] = _bd[0].get("file_path")
+                    logger.info(f"🖼 TMDB {item_id} 无海报，回退使用背景图")
+        except Exception:
+            pass
     # 优先用本地化名；如果本地化名为空，对非中文内容尝试用搜索结果的 name（通常是英文）
     _has_latin = bool(re.search(r"[A-Za-z]{2,}", name_local or ""))
     _has_cjk = bool(re.search(r"[\u4e00-\u9fff]", name_local or ""))
