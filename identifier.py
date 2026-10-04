@@ -725,6 +725,31 @@ async def resolve_title(raw_name: str, regex_title: str, regex_year: str = "",
                 }
             logger.warning(f"⚠️ 中文名直搜年份差异过大: {regex_title!r} vs {det.get('year')}")
 
+    # ── 2.9) 走到这里说明带 season 的 tv 搜索和中文名直搜都没命中。
+    # 但源站可能把电影按剧集格式封装（文件名带 S01E01），这时 season 过滤
+    # 会把 movie 候选全灭掉。去掉 season 重搜，并用 movie 详情端点确认类型。
+    # 实测「犯罪生活.S01E01.1080P.BluRay.AVC」：tv 搜不到 → movie/209189 命中。
+    # 两个关键点：
+    #   1) 必须不传 source_name —— 否则 tmdb_search 的 LLM 校验会拿带 SxxExx 的
+    #      文件名判定「这是剧集」，把 movie 候选否掉。
+    #   2) 必须放在所有正常分支之后 —— 放前面会抢走真剧集的匹配
+    #      （实测「9 Years of You」被误判为 movie）。
+    if season and _tmdb_key():
+        _nos = await tmdb_search(regex_title, regex_year, None)
+        if _nos and _nos.get("tmdb_id"):
+            _nid = _nos["tmdb_id"]
+            _mdet = await _tmdb_detail("movie", _nid)
+            if _mdet and _year_ok(regex_year, _mdet.get("year", ""), None):
+                logger.info(f"🎬 文件名带 SxxExx 但 TMDB 判定为电影，忽略季号: "
+                            f"{regex_title!r} → {_mdet['title']!r} ({_mdet.get('year')})")
+                return {
+                    "title": _mdet["title"],
+                    "year": _mdet.get("year") or regex_year,
+                    "tmdb_id": _mdet.get("tmdb_id") or _nid,
+                    "source": "tmdb_movie_noseason",
+                    "det": _mdet,
+                }
+
     llm_info = await llm_parse_filename(raw_name) if _llm_key() else None
     llm_name = ((llm_info or {}).get("name") or "").strip()
     llm_year = str((llm_info or {}).get("year") or "").strip()

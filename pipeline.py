@@ -808,6 +808,55 @@ async def probe_audit_state(share_url: str):
     return None, {}
 
 
+def _ident_with_source(ident_det: dict, ident_source: str) -> dict:
+    """把 resolve 的 source 标记并入 det，供 is_movie_candidate 判定。
+
+    det 本身不含 media_type（tmdb_search / _tmdb_detail 都不返回该字段），
+    唯一可靠的 movie 证据来自 identifier 的 source 值：resolve_title 的
+    「去掉 season 重搜 + movie 端点确认」分支会返回 tmdb_movie_noseason。
+    该分支**只会在所有正常匹配都失败后才执行**，所以 source 里出现 movie
+    就是「TMDB 确认这是电影」的强证据，可以安全地清掉误标的集数。
+    """
+    if not ident_det:
+        return {}
+    out = dict(ident_det)
+    if ident_source:
+        out["source"] = ident_source
+    return out
+
+
+def is_movie_candidate(det: dict) -> bool:
+    """TMDB 类型判定：det 明确是 movie 时返回 True。
+
+    某些源站把电影按剧集格式封装（文件名带 S01E01），需据此忽略误标的集数。
+    tmdb_search 的返回值不含 media_type，故以 genres 是否全为「电影」类为准；
+    genre 缺失时保守返回 False（宁可保留集数也不要误删）。
+    """
+    if not det:
+        return False
+
+    # 1) 明确的 media_type 优先
+    mt = str(det.get("media_type") or "").lower()
+    if mt == "movie":
+        return True
+    if mt == "tv":
+        return False
+
+    # 2) 来源标记：identifier.py 里 movie 专用分支的 source 值
+    src = str(det.get("source") or "").lower()
+    if "movie" in src:
+        return True
+
+    # 3) genres：只认「明确含电影类型」的证据。
+    #    早期版本用「没有剧集标记就算电影」，实测把 余红旧事(犯罪)、
+    #    9 Years of You(剧情) 这类剧集全误判成电影，集数被清空 —— 错删比错留更糟。
+    #    现在要求 genres 里出现「电影」二字才认定是电影；判不出就保守返回 False。
+    g = str(det.get("genres") or "")
+    if not g:
+        return False
+    return "电影" in g
+
+
 async def _process_link_direct_share(url: str) -> dict:
     """原链接直转分享模式。
 
@@ -878,6 +927,7 @@ async def _process_link_direct_share(url: str) -> dict:
     display_title = parsed["title"]
     tmdb_id = None
     ident_det = {}
+    ident_source = ""
 
     _se = re.search(r"[Ss](\d{1,2})[Ee]\d{1,3}", base_name)
     season = int(_se.group(1)) if _se else None
@@ -890,6 +940,7 @@ async def _process_link_direct_share(url: str) -> dict:
             parsed["year"] = ident.get("year") or parsed.get("year", "")
             tmdb_id = ident.get("tmdb_id")
             ident_det = ident.get("det") or {}
+            ident_source = ident.get("source") or ""
             if ident.get("source") not in (None, "regex"):
                 logger.info(f"🤖 识别({ident['source']}): {display_title!r} ({parsed.get('year')})")
     except Exception as e:
@@ -901,6 +952,10 @@ async def _process_link_direct_share(url: str) -> dict:
     )
 
     episode = summarize_episode(video_names, parsed.get("episode", ""))
+    # TMDB 判定为电影时，文件名里的 SxxExx 多为误标（源站按剧集格式封装电影）
+    if episode and is_movie_candidate(_ident_with_source(ident_det, ident_source)):
+        logger.info(f"🎬 TMDB 判定为电影，忽略误标的集数标记: {episode!r}")
+        episode = ""
     logger.info(f"📊 集数统计: {len(video_names)} 个视频文件, 集数: {episode or '(电影/无集数)'}")
 
     return {
@@ -981,6 +1036,7 @@ async def process_link(
             parsed["year"] = ident.get("year") or parsed.get("year", "")
             tmdb_id = ident.get("tmdb_id")
             ident_det = ident.get("det") or {}
+            ident_source = ident.get("source") or ""
             if ident.get("source") not in (None, "regex"):
                 logger.info(f"🤖 识别({ident['source']}): {display_title!r} ({parsed.get('year')})")
     except Exception as e:
@@ -1123,6 +1179,10 @@ async def process_link(
                         eps = sorted(set(e for ss, e in ep_numbers if ss == s))
                         parts.append(f"S{s:02d}E{eps[0]:02d}-E{eps[-1]:02d}")
                     episode = " ".join(parts)
+            # TMDB 判定为电影时，文件名里的 SxxExx 多为误标
+            if episode and is_movie_candidate(_ident_with_source(ident_det, ident_source)):
+                logger.info(f"🎬 TMDB 判定为电影，忽略误标的集数标记: {episode!r}")
+                episode = ""
             logger.info(f"📊 集数统计: {len(ep_numbers)} 集, 结果: {episode or '(电影/无集数)'}")
 
             # 分享成功后自动去重
