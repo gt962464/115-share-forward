@@ -572,8 +572,35 @@ async def _pick_tmdb_item(results: list, year: str, season, query_title: str = "
 _TMDB_STRIP_PREFIXES = re.compile(r"^(?:央视|CCTV|中国|大陆|内地|国产|正版|官方|高清|蓝光|4K|8K)\s*")
 
 
+def _cn_core_candidates(text: str):
+    """从整串文件名里抠出「中文核心标题」候选，返回 [(候选, 是否剥掉年份前缀), ...]，长的在前。
+
+    用于晚会/年番这类「文件名带一堆频道、画质、英文噪声」而 TMDB 条目名只有中文核心词的场景：
+      「总台8K超高清频道 2026年中央广播电视总台中秋晚会 CCTV 8K CMG ...」
+        → 「2026年中央广播电视总台中秋晚会」/「中央广播电视总台中秋晚会」
+    只保留含 >=4 个汉字的片段，短噪声（如「总台」）不产生候选，
+    因此正常片名走不到这里，本函数是纯兜底。
+    """
+    out, seen = [], set()
+    if not text:
+        return out
+    for tok in re.split(r"[^0-9A-Za-z\u4e00-\u9fff]+", text):
+        if not tok or len(re.findall(r"[\u4e00-\u9fff]", tok)) < 4:
+            continue
+        forms = [tok]
+        stripped = re.sub(r"^(?:19|20)\d{2}\s*年", "", tok)
+        if stripped != tok and len(re.findall(r"[\u4e00-\u9fff]", stripped)) >= 4:
+            forms.append(stripped)
+        for i, f in enumerate(forms):
+            if f not in seen:
+                seen.add(f)
+                out.append((f, i == 1))
+    out.sort(key=lambda x: -len(x[0]))
+    return out
+
+
 async def tmdb_search(title: str, year: str = "", season: int = None,
-                      source_name: str = "") -> dict | None:
+                      source_name: str = "", media_type: str = None) -> dict | None:
     """TMDB 搜索 + 详情 + OpenAI 校验闸。命中返回详情 dict，否则 None。
 
     source_name（原始文件名）：传入后搜索命中的候选先交 OpenAI 校验，
@@ -601,31 +628,34 @@ async def tmdb_search(title: str, year: str = "", season: int = None,
 
     try:
         use_tv = season is not None and season >= 1
-        results, item = await _do_search(title, media_type="tv" if use_tv else None)
-        logger.info(f"🔍 TMDB 搜索: {title!r} (type={'tv' if use_tv else 'multi'})")
+        # media_type 显式指定时优先于 season 推断（年番 franchise 只在 TV 端点存在）
+        _forced_type = media_type if media_type in ("tv", "movie") else None
+        _base_type = _forced_type or ("tv" if use_tv else None)
+        results, item = await _do_search(title, media_type=_base_type)
+        logger.info(f"🔍 TMDB 搜索: {title!r} (type={_base_type or 'multi'})")
 
         if not results and title:
             stripped = _TMDB_STRIP_PREFIXES.sub("", title).strip()
             if stripped and stripped != title:
                 logger.info(f"🔍 TMDB 前缀剥离重试: {title!r} -> {stripped!r}")
-                results, item = await _do_search(stripped)
+                results, item = await _do_search(stripped, media_type=_base_type)
 
         # If year specified but no year-matched item found, retry without language filter
         # (language=zh-CN can filter out results whose original title differs from query)
         if year and (not results or not item):
             logger.info(f"🔍 TMDB 年份匹配失败，去掉语言参数重试: {title!r} year={year}")
-            results2, item2 = await _do_search(title, lang="")
+            results2, item2 = await _do_search(title, lang="", media_type=_base_type)
             if results2 and item2:
                 results, item = results2, item2
 
         if not results or not item:
             return None
 
-        media_type = item.get("media_type") or ("tv" if use_tv else "movie")
+        _item_media = item.get("media_type") or _base_type or "movie"
         item_id = item.get("id")
         if not item_id:
             return None
-        det = await _tmdb_detail(media_type, item_id, item)
+        det = await _tmdb_detail(_item_media, item_id, item)
         if det and source_name:
             verdict = await llm_verify_match(source_name, det)
             if verdict is False:
@@ -780,6 +810,43 @@ async def resolve_title(raw_name: str, regex_title: str, regex_year: str = "",
                 }
             logger.warning(f"⚠️ 中文名直搜年份差异过大: {regex_title!r} vs {det.get('year')}")
 
+    # ── 2.85) 中文核心标题重试（晚会/年番：整串文件名搜不到，拆中文片段并剥 YYYY年 前缀）──
+    # 实测「[总台8K超高清频道 2026年中央广播电视总台中秋晚会].CCTV-8K.CMG.The.Mid...」：
+    #   整串搜 → null；「2026年中央广播电视总台中秋晚会」TMDB 无 2026 条目 → null；
+    #   剥年份得「中央广播电视总台中秋晚会」→ TV 236139（franchise，season 37 就是 2026 年秋晚）。
+    # 两条守则：
+    #   1) 候选自带 YYYY年 前缀时，结果年份必须等于文件年份 —— 否则等于拿去年条目顶今年的；
+    #   2) 剥年份后的候选强制走 TV 端点，且标题必须完全一致（同一档节目）才认。
+    if _tmdb_key():
+        for _cand, _from_year_strip in _cn_core_candidates(regex_title):
+            _mt_order = ("tv",) if _from_year_strip else (None, "tv")
+            for _mt in _mt_order:
+                _det = await tmdb_search(_cand, regex_year, season,
+                                         source_name=raw_name, media_type=_mt)
+                if not _det:
+                    continue
+                _cand_year_m = re.match(r"^((?:19|20)\d{2})", _cand or "")
+                _cand_year = _cand_year_m.group(1) if _cand_year_m else ""
+                _exact = (_det.get("title") or "").strip() == (_cand or "").strip()
+                if _exact:
+                    # franchise 条目的 year 是「开播年」（中央广播电视总台中秋晚会=1991），
+                    # 展示成 (1991) 对今年的内容是错的 —— 有文件年份就用文件年份
+                    if regex_year and str(_det.get("year") or "") != str(regex_year):
+                        logger.info(f"📅 franchise 命中，展示年份改用文件年份: "
+                                    f"{_det.get('year')} -> {regex_year}")
+                        _det = {**_det, "year": str(regex_year)}
+                    logger.info(f"✅ 中文核心标题命中(标题完全一致): {_cand!r} → {_det['title']!r} ({_det.get('year')})")
+                    return {"title": _det["title"], "year": _det.get("year") or regex_year,
+                            "tmdb_id": _det.get("tmdb_id"), "source": "tmdb_cn_core", "det": _det}
+                if _cand_year and regex_year and str(_det.get("year") or "") != str(regex_year):
+                    logger.info(f"⏭ 中文核心标题年份不匹配（年番条目需年份一致）: "
+                                f"{_cand!r} → {_det.get('title')!r} ({_det.get('year')})")
+                    continue
+                if _year_ok(regex_year, _det.get("year", ""), season):
+                    logger.info(f"✅ 中文核心标题 TMDB 命中: {_cand!r} → {_det['title']!r} ({_det.get('year')})")
+                    return {"title": _det["title"], "year": _det.get("year") or regex_year,
+                            "tmdb_id": _det.get("tmdb_id"), "source": "tmdb_cn_core", "det": _det}
+
     # ── 2.9) 走到这里说明带 season 的 tv 搜索和中文名直搜都没命中。
     # 但源站可能把电影按剧集格式封装（文件名带 S01E01），这时 season 过滤
     # 会把 movie 候选全灭掉。去掉 season 重搜，并用 movie 详情端点确认类型。
@@ -907,6 +974,9 @@ async def resolve_title(raw_name: str, regex_title: str, regex_year: str = "",
                             "source": "tmdb_llm",
                             "det": det,
                         }
+        # LLM 常照抄点号分隔的英文名（The Mid.Autumn.Festival.Gala），卡片展示认空格分隔
+        if llm_name and re.fullmatch(r"(?:[A-Za-z0-9]+\.)+[A-Za-z0-9]+", llm_name):
+            llm_name = llm_name.replace(".", " ")
         logger.info(f"🤖 LLM 识别: {regex_title!r} -> {llm_name!r}")
         return {"title": llm_name, "year": llm_year or regex_year, "tmdb_id": None, "source": "llm"}
 
