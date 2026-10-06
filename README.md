@@ -1,5 +1,7 @@
 # 115 分享转存机器人 v2
 
+> 📋 运维交接 / 排错手册：[docs/handover.md](docs/handover.md)
+
 纯 Telegram Bot 交互的 115 分享转存系统。
 
 ## 功能
