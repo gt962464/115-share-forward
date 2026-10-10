@@ -123,6 +123,7 @@ grep -nE "已补丁|失败|ERROR" /opt/115-bot/data/bot.log | tail -20
 | **BUG-12** | 剧集文件名 `余红旧事01.mkv` 全被命名成同一个名字，靠 `-2/-3/...` 硬撑 | `extract_episode()` 四条正则全不认「片名+序号」格式 → 17 个文件 `extract_episode` 全返 `None` | 命名结果出现 `-2`~`-17` 后缀 | ✅ **已修复+上线** | `pipeline.py` `_trailing_episode_number` | 尾部 1-3 位数字当集数 + 三重守卫（画质/编码黑名单、年份 1900-2099、纯数字文件名）。**清洗与取值必须用同一字符串**——踩过 3 轮才收敛 |
 | **BUG-13** | `9 Years of You` / `Ensemble` 卡片全「暂无」或**匹配到完全错误的条目** | 英文标题正则要求首字母 `[A-Z]` 且**至少两个词** → 数字开头（`9 Years…`）和单词标题（`Ensemble`）都漏掉 → 掉进 LLM 翻译路径 → 中文词被误译成无关国产剧（`Ensemble` → `tmdb-94772 演员请就位`），**且带合法 tmdb_id，看起来像成功命中** | `DOT_RE: None / SPACE_RE: None`；直搜 `tmdb_search('Ensemble')` 本可拿到 `262062 群英会` | ✅ **已修复+上线** | `identifier.py` `resolve_title` 英文提取段 | 补两条分支：`^\d{1,4}\s+Word(\s+Word)+` 和 `^[A-Z][a-zA-Z]{2,}$` |
 | **BUG-14** | 《2026年中央广播电视总台中秋晚会》8K 卡片标题/标签是点号英文 `The Mid.Autumn.Festival.Gala`，类型评分全「暂无」 | 三层叠加：①整串文件名（含频道/画质/英文噪声）直接丢 TMDB → null；②「2026年中央广播电视总台中秋晚会」TMDB **无 2026 条目** → null；③唯一中文分支用的是整串 `regex_title`，没有「中文核心片段」重试 → 掉进 LLM，LLM 照抄点号英文名且无 TMDB 命中 | 日志 `🔍 TMDB 搜索: '总台8K超高清频道 2026年...'` → null；`🤖 LLM 识别 → 'The Mid.Autumn.Festival.Gala'`；`🚫 OpenAI 否决 → '2025湖南卫视芒果TV中秋之夜'`（这次否决是对的）；TMDB tv **236139** 的 season 37 = **2026-09-25** 与源文件日期完全吻合 | ✅ **已修复+上线**（commit `7c81e3e`，rebuild 2026-10-06 06:24 UTC） | `identifier.py` `_cn_core_candidates()` + `resolve_title` 2.85 分支 + `tmdb_search(media_type=)` | 中文核心片段（≥4 汉字）+ 剥 `YYYY年` 前缀 → 强制 TV 端点 → **标题完全一致才认 franchise**；候选自带年份时要求结果年份 == 文件年份（防拿 2025 条目顶 2026 内容）；franchise 展示年份改用文件年份（否则卡片会写成 1991）。**遗留**：分享标题仍叫 `The Mid.Autumn.Festival.Gala (2026)`（`share_update` 只能改密码/有效期/取消，改不了标题，且内容已被清理无法重命名） |
+| **BUG-15** | 电影《你的婚礼》文件名带 `S01E01`（`你的婚礼.S01E01.2021.2160P...`），卡片说是电影、文件名却按剧集命名 | **判定只做了一半**：卡片层早有 `is_movie_candidate` 会清掉误标集数，但**文件重命名层 `_rename_video_tree` 根本不接这个信息**，只认文件名里的 `SxxExx` 就照写。源站把电影按剧集格式封装（BUG-14 时的「犯罪生活.S01E01」同源问题），重命名层无从分辨 | `resolve_title(season=1)` → `source=tmdb_movie_noseason`、`tmdb_id=723640`（识别其实**是对的**）；`extract_episode` 返 `(1,1)` → `build_canonical_name` 拼出 `S01E01`；真数据 BEFORE/AFTER 实测见右栏 | ✅ **已修复+上线**（commit `7f72bb3`，rebuild 2026-10-10 14:37 CST） | `pipeline.py` `_rename_video_tree` / `_rename_saved` / `process_link`；`identifier.py` `_tmdb_detail` | ①`_tmdb_detail` 返回值补 `media_type`（不再靠 source 字符串猜）；②`_rename_video_tree(..., is_movie=)` 电影分支跳过 `extract_episode`（含递归）；③`process_link` 识别后算 `_is_movie_now` 下传；④顺手补 `ident_source = ""` 初始化（原为 try 块内赋值，识别异常会在集数统计处 `NameError`）。**验证**：单测（电影不带 S01E01 / 剧集保留 / 多文件去重）+ 识别回归 4 case + **真数据 E2E**（`3536800260061922949`，改名前后 API 3/3 成功、结构未变） |
 
 ### 5.1 双流程模式（DIRECT_SHARE_MODE）⭐ 2026-10-03 新增
 
@@ -159,6 +160,7 @@ swstuk73fhw  share_duration=1(天)     -> 临时 -> status=skipped_temporary
 
 | 日期 | commit | 内容 |
 | --- | --- | --- |
+| 10-10 | `7f72bb3` | **电影不带 S01E01（BUG-15）**：`_tmdb_detail` 补 `media_type`；`_rename_video_tree`/`_rename_saved` 增加 `is_movie` 参数（电影分支不提取集号，含递归）；`process_link` 识别后算 `_is_movie_now` 下传；补 `ident_source` 初始化。单测 + 识别回归 + 真数据 E2E 三层验证，rebuild 2026-10-10 14:37 CST |
 | 10-06 | `7c81e3e` | **中文核心标题兜底（BUG-14）**：年番/franchise 条目不再掉进 LLM（`_cn_core_candidates` + `resolve_title` 2.85 分支 + `tmdb_search(media_type=)` + LLM 点号英文名还原空格）。同日重发频道卡片（msg 1625，带海报/类型/简介） |
 | 10-03 | rebuild | **双流程模式上线**：`DIRECT_SHARE_MODE` 开关 + `_process_link_direct_share()` + `skipped_temporary` 分支；限流退避阶梯（BUG-11）；`COPY app/ /app/` 入 Dockerfile |
 | 10-03 | patch | 审核轮询修复（BUG-10：`notifier.py` 立即 `create_task` + `pipeline.py` 字段透传）；尾部集数识别（BUG-12）；数字开头/单词英文标题（BUG-13） |
@@ -188,6 +190,7 @@ swstuk73fhw  share_duration=1(天)     -> 临时 -> status=skipped_temporary
 | 7 | 切到 `DIRECT_SHARE_MODE=1` 观察频道产出 | 宸煊 | 临时链接会被全数跳过，若源全为临时则频道零产出；确认后决定是否保留该模式 |
 | 8 | `DIRECT_SHARE_MODE` 是否需要「临时链接也发、仅标记」的第二档 | 宸煊 | 当前只有发/不发两档 |
 | 9 | **2026-10-06 重做「中秋晚会」单留下的 90.34GB 内容未清理**（`AUTO_DELETE_AFTER=15` 本会在发卡后自动删，本次是手工重跑，没排这个任务） | 宸煊 | 批准后：枚举 `自动转存/中央广播电视总台中秋晚会 (2026) (tmdb-236139)` 取当前 CID → 移回收站 → 清空回收站。**分享不受影响**（旧单已实测：内容删光后分享照常可读） |
+| 10 | **BUG-15 修复过程中测试留下的残留**（2026-10-10）：3 个测试分享 `sws9bmn3we4` / `sws9qc33we4` / `sws9qx13we4`（均 `share_state=1`，其中 2 个的底层目录已被 `auto_dedup` 删掉、大概率是死链）+ 1 个 31GB 目录 `3536800260061922949`（文件名已按修复后逻辑改对，仅作验证用）。**用户给的源链接 `sws9l5s3we4` 不动** | 宸煊 | 批准后：`share_update(action=cancel)` 取消 3 个测试分享（可恢复）→ `fs_delete(3536800260061922949)` → 清空回收站 |
 
 ---
 
@@ -264,6 +267,9 @@ ssh root@<宿主IP> "echo '$B64' | base64 -d > /tmp/probe.py && \
 17. **找源链接别只搜 `115.com`**：上游分享域名是 `115cdn.com`，正则匹配 `115.com/s/` 必漏。而且不是每单都走监听入口——不走的单子日志里压根没有源 URL。可靠做法：用 Telethon 读**投稿鸡自己的私聊**（源信息卡片会留在那里，含中文名 + TMDB id + 源链接），按 `115cdn?` 或中文片名搜。
 18. **读 Telethon 用户会话先复制文件**：监听进程一直占着 `/data/user.session`，直接 `TelegramClient("/data/user.session", …)` 报 `sqlite3.OperationalError: database is locked`。先 `shutil.copy` 到 `/tmp/xxx.session` 再连，删除频道消息也走这个副本（Bot API 只能删自己发的）。
 19. **取消分享用 `share_update({"share_code": …, "action": "cancel"})`**：返回 `state=true`，`share_list` 里 `share_state=4 (已取消)`，**可恢复**；`action="delete"` 才是彻底删。另外 `usershare_list` 是「群组共享」列表，自己的分享要用 `share_list`（`GET share/slist`），传错会看到 0 条误以为没有分享。
+20. **识别层的类型判定 ≠ 重命名层的文件名**（2026-10-10，BUG-15）：`resolve_title` 认出是电影，只影响**卡片**（`is_movie_candidate` 清集数）；`_rename_video_tree` 是**另一条独立路径**，它只 `extract_episode(文件名)`，压根不看识别结果。凡是「卡片对了但文件名不对」的单子，先查这一层有没有把类型信息传下去。修完必须**三层验证**：mock 单测（不碰 115）→ 识别回归（老 case 防回归）→ 真数据 E2E（拿自己测试产生的目录跑，before/after 对比）。
+21. **`docker cp` 热替换对运行中的进程无效**（2026-10-10）：把新 `.py` 拷进容器只让**新起的 python 进程**看到新代码，**已运行的 bot 进程仍持旧模块**。要让修复真正生效必须 `docker compose up -d --build`。所以顺序是：改文件 → `docker cp` 进容器（供测试脚本用）→ 跑三层验证 → 确认无在跑任务 → rebuild → 校验宿主/容器 md5 一致 + 启动日志干净。
+22. **`Dockerfile` 没 COPY 的文件在容器里根本不存在**：宿主 `/opt/115-bot/*.py` 与容器 `/cardbot/` 是两套（见 BUG-6 `fix_rename`）。判断某文件在不在，`docker exec 115-bot ls /cardbot/` 看，别看宿主。
 
 ---
 
@@ -275,6 +281,6 @@ ssh root@<宿主IP> "echo '$B64' | base64 -d > /tmp/probe.py && \
 
 ---
 
-**交接结论：** 系统正常运行，双流程模式已上线（`DIRECT_SHARE_MODE` 默认 `0`，即原流程）。2026-10-03 修复并上线 BUG-10~13：审核轮询不启动（`create_task` 缺失 + `db_id` 字段被丢）、限流文案掩盖真因且重试滚雪球、片名+序号集数识别失败、英文标题正则漏数字开头与单词标题。新增只读直转模式（`=1`）作为限流期的绕过方案。2026-10-06：**换 115 账号**（UID `<新号>`，读写已实测通过：转存 7.1GB 秒传 + 分享快照正常）；修复并上线 **BUG-14**（年番/franchise 中文核心标题兜底，commit `7c81e3e`）并重发频道卡片。同日按修复后的流程**完整重做该单**：从投稿鸡私聊挖回源链接（`115cdn` 域名）→ 重新转存 90.34GB → 文件名正确落在 `中央广播电视总台中秋晚会.2026.HDTV-Cxuan.ts` → 建新长期分享（`share_state=1`，标题带 `(tmdb-236139)` 标记）→ 频道新卡 `1631`（带海报）、删掉指向旧分享的 `1625`、旧分享置为 `share_state=4`（已取消，可恢复）。新增坑位 16~19，重做单的内容清理见待办 9。
+**交接结论：** 系统正常运行，双流程模式已上线（`DIRECT_SHARE_MODE` 默认 `0`，即原流程）。2026-10-03 修复并上线 BUG-10~13：审核轮询不启动（`create_task` 缺失 + `db_id` 字段被丢）、限流文案掩盖真因且重试滚雪球、片名+序号集数识别失败、英文标题正则漏数字开头与单词标题。新增只读直转模式（`=1`）作为限流期的绕过方案。2026-10-06：**换 115 账号**（UID `<新号>`，读写已实测通过：转存 7.1GB 秒传 + 分享快照正常）；修复并上线 **BUG-14**（年番/franchise 中文核心标题兜底，commit `7c81e3e`）并重发频道卡片。同日按修复后的流程**完整重做该单**：从投稿鸡私聊挖回源链接（`115cdn` 域名）→ 重新转存 90.34GB → 文件名正确落在 `中央广播电视总台中秋晚会.2026.HDTV-Cxuan.ts` → 建新长期分享（`share_state=1`，标题带 `(tmdb-236139)` 标记）→ 频道新卡 `1631`（带海报）、删掉指向旧分享的 `1625`、旧分享置为 `share_state=4`（已取消，可恢复）。新增坑位 16~19，重做单的内容清理见待办 9。2026-10-10：修复并上线 **BUG-15**（电影被按剧集重命名、文件名带 `S01E01`，commit `7f72bb3`）——识别层本来就认得对，缺的是把 `media_type` 传到重命名层；三层验证（mock 单测 / 识别回归 / 真数据 E2E）后 rebuild 上线。新增坑位 20~22、待办 10（测试残留清理待批）。
 
 剩余开放项：BUG-4（`_get_dir_items` 翻页截断）、BUG-6（`fix_rename` 死代码）、BUG-7（配置双写）、git PAT 轮换、待办 7~8（直转模式频道产出观察 / 是否需要「临时链接也发」的第三档）、多 CK 轮流改造（底座 `AccountManager` 已具备，`/cardbot` 尚未接入，见 2026-10-06 讨论）。
