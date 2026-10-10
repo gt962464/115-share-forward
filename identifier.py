@@ -499,6 +499,8 @@ async def _tmdb_detail(media_type: str, item_id, item: dict = None) -> dict | No
         "original_name": name_orig,
         "tmdb_id": item_id,
         "year": year_full[:4],
+        # media_type 供下游 is_movie_candidate 判定（电影不该带 SxxExx）
+        "media_type": media_type,
         "genres": "、".join([g for g in genres if g]),
         "rating": det.get("vote_average") or item.get("vote_average") or 0,
         "overview": det.get("overview") or item.get("overview") or "",

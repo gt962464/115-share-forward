@@ -216,8 +216,13 @@ def infer_audio_codec(video_names):
     return max(cnt, key=cnt.get)
 
 
-async def _rename_video_tree(svc, folder_id, title_cn, year, tmdb_id, suffix="Cxuan"):
-    """递归重命名目录树中的全部视频；保留 Season 等原有子目录名。"""
+async def _rename_video_tree(svc, folder_id, title_cn, year, tmdb_id, suffix="Cxuan",
+                             is_movie: bool = False):
+    """递归重命名目录树中的全部视频；保留 Season 等原有子目录名。
+
+    is_movie=True 时忽略文件名里的 SxxExx —— 源站常把电影按剧集格式封装
+    （实测「你的婚礼.S01E01.2021.2160p」是电影 723640），照写会污染文件名。
+    """
     ok = fail = total = 0
     sub = await _get_dir_items(svc, folder_id)
     sub = list({str(x["id"]): x for x in sub}.values())
@@ -235,6 +240,10 @@ async def _rename_video_tree(svc, folder_id, title_cn, year, tmdb_id, suffix="Cx
         # First pass: extract episode numbers, track which files have them
         ep_info = []  # (index, season, ep or None)
         for i, v in enumerate(vids):
+            if is_movie:
+                # 电影：文件名里的 SxxExx 是源站误标，一律不提取
+                ep_info.append((i, None, None))
+                continue
             e = extract_episode(v["name"])
             if e:
                 ep_info.append((i, e[0], e[1]))
@@ -292,6 +301,7 @@ async def _rename_video_tree(svc, folder_id, title_cn, year, tmdb_id, suffix="Cx
     for child in child_dirs:
         c_ok, c_fail, c_total = await _rename_video_tree(
             svc, child["id"], title_cn, year, tmdb_id, suffix=suffix,
+            is_movie=is_movie,
         )
         ok += c_ok
         fail += c_fail
@@ -300,7 +310,7 @@ async def _rename_video_tree(svc, folder_id, title_cn, year, tmdb_id, suffix="Cx
 
 
 async def _rename_saved(svc, to_cid, title_cn: str, year: str, tmdb_id, suffix: str = "Cxuan",
-                        expected_video_count: int = 0):
+                        expected_video_count: int = 0, is_movie: bool = False):
     """对已转存到 to_cid 的目录树做规范重命名：顶层文件夹 + 每个视频文件。
 
     文件夹命名：`{名字} ({年}) (tmdb-{id})`
@@ -367,6 +377,7 @@ async def _rename_saved(svc, to_cid, title_cn: str, year: str, tmdb_id, suffix: 
                 logger.warning(f"⚠️ 重命名异常 {folder_id} -> {folder_name}: {ex}")
             v_ok, v_fail, v_total = await _rename_video_tree(
                 svc, folder_id, title_cn, year, tmdb_id, suffix=suffix,
+                is_movie=is_movie,
             )
             ok += v_ok
             fail += v_fail
@@ -811,11 +822,10 @@ async def probe_audit_state(share_url: str):
 def _ident_with_source(ident_det: dict, ident_source: str) -> dict:
     """把 resolve 的 source 标记并入 det，供 is_movie_candidate 判定。
 
-    det 本身不含 media_type（tmdb_search / _tmdb_detail 都不返回该字段），
-    唯一可靠的 movie 证据来自 identifier 的 source 值：resolve_title 的
-    「去掉 season 重搜 + movie 端点确认」分支会返回 tmdb_movie_noseason。
-    该分支**只会在所有正常匹配都失败后才执行**，所以 source 里出现 movie
-    就是「TMDB 确认这是电影」的强证据，可以安全地清掉误标的集数。
+    det 现已带 media_type（_tmdb_detail 新增），这是最可靠的判定；
+    source 是第二重保险 —— resolve_title 的「去掉 season 重搜 + movie 端点确认」
+    分支返回 tmdb_movie_noseason，该分支只在所有正常匹配失败后执行，
+    source 含 movie 同样是「TMDB 确认这是电影」的强证据。
     """
     if not ident_det:
         return {}
@@ -1028,6 +1038,7 @@ async def process_link(
     _se = re.search(r"[Ss](\d{1,2})[Ee]\d{1,3}", base_name)
     season = int(_se.group(1)) if _se else None
     ident_det = {}
+    ident_source = ""
     try:
         from identifier import resolve_title
         ident = await resolve_title(base_name, parsed["title"], parsed.get("year", ""), season, parsed.get("tmdb_id") or share_tmdb_id)
@@ -1041,6 +1052,11 @@ async def process_link(
                 logger.info(f"🤖 识别({ident['source']}): {display_title!r} ({parsed.get('year')})")
     except Exception as e:
         logger.warning(f"OpenAI 识别失败，使用正则结果: {e}")
+
+    # TMDB 判定为电影 → 重命名层忽略文件名里的 SxxExx 误标
+    _is_movie_now = is_movie_candidate(_ident_with_source(ident_det, ident_source))
+    if _is_movie_now and season is not None:
+        logger.info(f"🎬 TMDB 判定为电影（{ident_source or 'det'}），重命名忽略 SxxExx 误标")
     
     logger.info(
         f"📋 处理: {display_title} | 画质: {parsed['quality']} | "
@@ -1095,6 +1111,7 @@ async def process_link(
             _, _, _, new_cid = await _rename_saved(
                 svc, to_cid, display_title, parsed.get("year", ""), tmdb_id,
                 expected_video_count=len(video_names),
+                is_movie=_is_movie_now,
             )
             # 分享根无文件夹时，_rename_saved 已自动创建规范文件夹
             if new_cid:
