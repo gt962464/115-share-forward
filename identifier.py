@@ -514,13 +514,26 @@ async def _pick_tmdb_item(results: list, year: str, season, query_title: str = "
     if len(cands) <= 1:
         return cands[0] if cands else {}
 
-    # 短标题精确匹配优先（Go 1999 这类：先看原名是否完全相等，不看年份）
+    # 短标题精确匹配优先（Go 1999 这类：先看标题是否完全相等，不看年份）
+    # 同名多条目（如 Hope 2026 有157分钟正片 + 两部0票短片）→ 年份命中优先，再按票数排，
+    # 防止排序靠前的短片抢走正片。
     if query_title and len(query_title.strip()) <= 4:
         _qs = query_title.strip().lower()
+        _hits = []
         for it in cands:
             _o = (it.get("original_name") or it.get("original_title") or "").strip().lower()
-            if _o and _o == _qs:
-                return it
+            _n = (it.get("name") or it.get("title") or "").strip().lower()
+            if (_o and _o == _qs) or (_n and _n == _qs):
+                _hits.append(it)
+        if _hits:
+            _fy = str(year or "").strip()
+            if _fy.isdigit():
+                _yh = [it for it in _hits
+                       if (it.get("first_air_date") or it.get("release_date") or "")[:4] == _fy]
+                if _yh:
+                    _hits = _yh
+            _hits.sort(key=lambda x: int(x.get("vote_count") or 0), reverse=True)
+            return _hits[0]
 
     if season is not None and season >= 1:
         tv = [it for it in cands if it.get("media_type") == "tv"]
@@ -536,9 +549,12 @@ async def _pick_tmdb_item(results: list, year: str, season, query_title: str = "
             if ys.isdigit() and abs(file_year - int(ys)) <= _tol:
                 tolerant.append(it)
         if tolerant:
-            # 优先选年份完全匹配的
+            # 优先选年份完全匹配的；同年多候选按票数排（正片 >> 0票短片/占位条目）
             exact = [it for it in tolerant if str(file_year) == ((it.get("first_air_date") or it.get("release_date") or "")[:4])]
-            return exact[0] if exact else tolerant[0]
+            if exact:
+                exact.sort(key=lambda x: int(x.get("vote_count") or 0), reverse=True)
+                return exact[0]
+            return tolerant[0]
         years = [
             int((it.get("first_air_date") or it.get("release_date") or "")[:4])
             for it in cands
@@ -628,6 +644,55 @@ async def tmdb_search(title: str, year: str = "", season: int = None,
             return [], None
         return results, await _pick_tmdb_item(results, year, season, query_title=q)
 
+    async def _year_fallback_search() -> dict | None:
+        """年份定向兜底：/search/multi 不支持年份过滤且常被老条目霸榜
+        （实测 'Hope' → 1994年 Chicago Hope 打头，2026正片只在 movie 端点），
+        被否决/无候选时按年份直查 movie/tv 端点，按年份+票数取前3个候选
+        逐个走 detail + LLM 校验，全部被否决才放弃。"""
+        if not year or not str(year).isdigit():
+            return None
+        pool = []
+        for _mt, _yparam in (("movie", "year"), ("tv", "first_air_date_year")):
+            if _forced_type and _forced_type != _mt:
+                continue
+            try:
+                st, text = await _aio_get(
+                    f"https://api.themoviedb.org/3/search/{_mt}",
+                    params={"api_key": _tmdb_key(), "query": title, _yparam: str(year)},
+                )
+                if st != 200:
+                    continue
+                for it in (json.loads(text).get("results") or [])[:10]:
+                    it["media_type"] = _mt
+                    pool.append(it)
+            except Exception as e:
+                logger.warning(f"年份定向搜索异常（{_mt}）: {e}")
+        if not pool:
+            return None
+        _tried: set = set()
+        for _ in range(3):
+            item = await _pick_tmdb_item(
+                [x for x in pool if x.get("id") not in _tried],
+                year, season, query_title=title,
+            )
+            if not item or not item.get("id") or item.get("id") in _tried:
+                break
+            _tried.add(item.get("id"))
+            det_fb = await _tmdb_detail(item.get("media_type") or _base_type or "movie",
+                                        item.get("id"), item)
+            if not det_fb:
+                continue
+            if source_name:
+                verdict_fb = await llm_verify_match(source_name, det_fb)
+                if verdict_fb is False:
+                    logger.warning(f"🚫 年份兜底候选被否决，继续试: {det_fb.get('title')!r}")
+                    continue
+            det_fb["year_fallback"] = True
+            logger.info(f"📅 年份定向兜底命中: {det_fb.get('title')!r} ({det_fb.get('year')}) "
+                        f"[{item.get('media_type')}/{item.get('id')}]")
+            return det_fb
+        return None
+
     try:
         use_tv = season is not None and season >= 1
         # media_type 显式指定时优先于 season 推断（年番 franchise 只在 TV 端点存在）
@@ -651,6 +716,9 @@ async def tmdb_search(title: str, year: str = "", season: int = None,
                 results, item = results2, item2
 
         if not results or not item:
+            _det_fb = await _year_fallback_search()
+            if _det_fb:
+                return _det_fb
             return None
 
         _item_media = item.get("media_type") or _base_type or "movie"
@@ -665,6 +733,9 @@ async def tmdb_search(title: str, year: str = "", season: int = None,
                     f"🚫 OpenAI 否决 TMDB 候选，放弃: {title!r} -> {det.get('title')!r} "
                     f"(源文件: {source_name[:50]})"
                 )
+                _det_fb = await _year_fallback_search()
+                if _det_fb:
+                    return _det_fb
                 return None
         return det
     except Exception as e:
@@ -880,6 +951,12 @@ async def resolve_title(raw_name: str, regex_title: str, regex_year: str = "",
     if llm_name and llm_name.lower() not in _LLM_INVALID_NAMES:
         if _tmdb_key():
             det = await tmdb_search(llm_name, llm_year or regex_year, season, source_name=raw_name)
+            if det and det.get("year_fallback"):
+                # 年份定向兜底的候选已按源文件名过 LLM 校验，直接采用，
+                # 不再进入译名重搜（英文原名非拉丁文时 _title_match 必失败，会搅局）
+                logger.info(f"✅ LLM 路径年份兜底命中: {llm_name!r} → {det['title']!r} ({det.get('year')})")
+                return {"title": det["title"], "year": det.get("year") or llm_year or regex_year,
+                        "tmdb_id": det.get("tmdb_id"), "source": "tmdb_year_fallback", "det": det}
             if det:
                 # 如果 LLM 返回英文且年份不匹配，尝试用中文名重搜
                 _llm_has_cn = bool(re.search(r"[一-鿿]", llm_name))

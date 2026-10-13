@@ -1211,6 +1211,7 @@ async def process_link(
                 "status": "success",
                 "share_link": share_res,
                 "title": display_title,
+                "year": parsed.get("year", ""),
                 "quality": parsed["quality"],
                 "source": parsed["source"],
                 "episode": episode,

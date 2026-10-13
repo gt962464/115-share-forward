@@ -69,7 +69,7 @@ async def sync_to_jying(result: dict, chat_id: int = None):
     title = result.get("title", "")
     share_link = result.get("share_link", "")
     det = result.get("det") or {}
-    year = det.get("year", "")
+    year = det.get("year") or result.get("year", "")
     tmdb_id = result.get("tmdb_id") or det.get("id")
     original_title = det.get("original_title", "") or result.get("original_title", "")
 
@@ -552,7 +552,7 @@ async def _auto_process_and_notify_inner(chat_id: int, url: str, source_name: st
             tmdb_rating = f"{float(det['rating']):.1f}/10" if det.get("rating") else "暂无评分"
             try:
                 card = _build_card(
-                    title=title, year=det.get("year", ""),
+                    title=title, year=det.get("year") or result.get("year", ""),
                     genres=det.get("genres") or "暂无",
                     tmdb_rating=tmdb_rating,
                     douban_rating=douban or "暂无评分",
@@ -1575,7 +1575,7 @@ async def _handle_link(message, url: str):
         tmdb_rating = f"{float(det['rating']):.1f}/10" if det.get("rating") else "暂无评分"
         try:
             card = _build_card(
-                title=title, year=det.get("year", ""),
+                title=title, year=det.get("year") or result.get("year", ""),
                 genres=det.get("genres") or "暂无",
                 tmdb_rating=tmdb_rating,
                 douban_rating=douban or "暂无评分",
