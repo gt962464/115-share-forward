@@ -41,6 +41,7 @@ CONFIG_SCHEMA = {
     "AUTO_DELETE_AFTER":     ("0",    "发卡成功后自动删除源文件延迟秒数（0=不删除）", False),
     "JYING_APP_ID":              ("",      "聚影开发者 AppID", False),
     "JYING_APP_KEY":             ("",      "聚影 API Key", False),
+    "JYING_AUTO_SYNC":           ("1",     "发卡后自动同步到聚影 0=关闭/1=开启", False),
     "RECYCLE_PASSWORD":      ("",     "115 回收站密码（清空回收站用）", True),
 }
 

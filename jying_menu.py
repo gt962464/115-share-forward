@@ -1,6 +1,7 @@
 """聚影 Bot 菜单 — 纯新增文件，不修改原有函数。"""
 import html
 import logging
+import os
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 logger = logging.getLogger("jying_menu")
@@ -10,6 +11,15 @@ logger = logging.getLogger("jying_menu")
 #  菜单构建
 # ══════════════════════════════════════════════
 
+def _autosync_on() -> bool:
+    """读取自动同步开关当前状态（默认开启）。"""
+    try:
+        val = str(os.getenv("JYING_AUTO_SYNC", "1") or "1").strip().lower()
+        return val not in ("0", "false", "off", "no", "")
+    except Exception:
+        return True
+
+
 def jying_main_menu():
     """聚影一级菜单"""
     kb = [
@@ -18,6 +28,10 @@ def jying_main_menu():
         [InlineKeyboardButton("🔍 搜索聚影", callback_data="jy_search"),
          InlineKeyboardButton("✅ 每日签到", callback_data="jy_checkin")],
         [InlineKeyboardButton("📊 签到状态", callback_data="jy_stats")],
+        [InlineKeyboardButton(
+            "🔁 自动同步：" + ("🟢 已开启" if _autosync_on() else "🔴 已关闭"),
+            callback_data="jy_autosync",
+        )],
         [InlineKeyboardButton("🔙 返回主菜单", callback_data="menu_main")],
     ]
     return InlineKeyboardMarkup(kb)
@@ -62,7 +76,45 @@ async def handle_jying_callback(query, data: str) -> bool:
         await _handle_stats(query)
         return True
 
+    if data == "jy_autosync":
+        await _handle_autosync_toggle(query)
+        return True
+
     return False
+
+
+async def _handle_autosync_toggle(query):
+    """切换「发卡后自动同步到聚影」开关，状态持久化到 .env。"""
+    was_on = _autosync_on()
+    new_val = "0" if was_on else "1"
+    saved = True
+    try:
+        import config
+        msg = config.set_config("JYING_AUTO_SYNC", new_val)
+        if msg.startswith("❌"):
+            saved = False
+    except Exception as e:
+        logger.warning(f"写入 JYING_AUTO_SYNC 失败: {e}")
+        saved = False
+
+    if not saved:
+        # 兜底：至少在当前进程生效
+        import os as _os
+        _os.environ["JYING_AUTO_SYNC"] = new_val
+
+    now_on = (new_val == "1")
+    head = "🟢 已开启" if now_on else "🔴 已关闭"
+    tip = (
+        "转存发卡成功后会自动同步到聚影。"
+        if now_on else
+        "转存发卡后不再自动同步；手动「📤 同步到聚影」仍可用。"
+    )
+    warn = "" if saved else "\n⚠️ 写入 .env 失败，重启后可能回到旧值。"
+    await query.edit_message_text(
+        f"🎬 聚影功能\n\n🔁 自动同步：{head}\n{tip}{warn}",
+        reply_markup=jying_main_menu(),
+    )
+    logger.info(f"🔁 聚影自动同步开关 → {new_val}（by {query.from_user.id}）")
 
 
 # ══════════════════════════════════════════════

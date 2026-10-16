@@ -64,6 +64,16 @@ async def send_channel(text: str, parse_mode: str = None):
 
 
 
+def _jying_auto_sync() -> bool:
+    """聚影自动同步开关（聚影菜单里可切，写入 .env 的 JYING_AUTO_SYNC）。"""
+    try:
+        import os
+        val = str(os.getenv("JYING_AUTO_SYNC", "1") or "1").strip().lower()
+        return val not in ("0", "false", "off", "no", "")
+    except Exception:
+        return True
+
+
 async def sync_to_jying(result: dict, chat_id: int = None):
     """同步成功的 115 转存结果到聚影，并记录结果。"""
     title = result.get("title", "")
@@ -585,7 +595,10 @@ async def _auto_process_and_notify_inner(chat_id: int, url: str, source_name: st
             if to_cid:
                 from pipeline import schedule_cleanup
                 schedule_cleanup(to_cid, name=title, share_link=share_link)
-            await sync_to_jying(result, chat_id=chat_id)
+            if _jying_auto_sync():
+                await sync_to_jying(result, chat_id=chat_id)
+            else:
+                logger.info("⏸️ 聚影自动同步已关闭（菜单开关），跳过")
             if result.get("direct_share"):
                 logger.info(f"✅ 直转分享完成（原链接未改动）: {title} → {share_link}")
             else:
@@ -1622,9 +1635,12 @@ async def _handle_link(message, url: str):
         except Exception as e:
             logger.warning(f"⚠️ 安排清理任务失败（不影响转存）: {e}")
 
-        # auto sync to jying
+        # auto sync to jying（受菜单开关 JYING_AUTO_SYNC 控制）
         try:
-            await sync_to_jying(result, chat_id=message.chat.id)
+            if _jying_auto_sync():
+                await sync_to_jying(result, chat_id=message.chat.id)
+            else:
+                logger.info("⏸️ 聚影自动同步已关闭（菜单开关），跳过")
         except Exception as e:
             logger.warning(f"Jying sync error (non-fatal): {e}")
 
