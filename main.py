@@ -111,6 +111,16 @@ async def main():
     from pipeline import start_cleanup_worker
     start_cleanup_worker()
 
+    # ── 4) 审核中队列恢复 ──
+    # 🔧 _recover_pending_tasks 之前只定义、从未被调用 → 容器重启后队列里的
+    # 审核中链接依旧躺着没人轮询。这里启动时触发一次恢复。
+    try:
+        from notifier import _recover_pending_tasks
+        asyncio.create_task(_recover_pending_tasks())
+        logger.info("🔄 已触发审核队列恢复轮询")
+    except Exception as e:
+        logger.warning(f"⚠️ 触发审核队列恢复失败: {e}")
+
     logger.info("=" * 50)
     logger.info("✅ 启动流程完成!")
     if me:

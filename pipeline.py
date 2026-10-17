@@ -1073,15 +1073,24 @@ async def process_link(
     })
     
     if not save_res or save_res.get("status") != "success":
-        msg = (save_res or {}).get("message", "未知错误")
         status = (save_res or {}).get("status", "unknown")
+        _reason = (save_res or {}).get("reason") or "auditing"
         if status == "pending":
+            # 🔧 文案按 reason 区分：以前服务端 pending 不带 message，统一兜底成
+            # 「未知错误」，看着像故障，实际是 115 在审核/生成快照，属正常等待。
+            _fallback = {
+                "auditing": "115 审核中，放行后自动处理",
+                "snapshotting": "115 正在生成快照，稍后自动处理",
+                "restricted": "115 账号接收受限，已转入长间隔重试",
+            }.get(_reason, "115 暂时无法转存，稍后自动重试")
+            _raw_msg = (save_res or {}).get("message")
+            msg = f"115 审核中: {_raw_msg}" if _raw_msg else _fallback
             # 🔧 透传 pending 轮询所需字段：reason / db_id / share_url / metadata
             # 不透传的话 notifier 侧拿不到 db_id，只能靠容器重启恢复。
             return {
                 "status": "pending",
-                "message": f"115 审核中: {msg}",
-                "reason": save_res.get("reason") or "auditing",
+                "message": msg,
+                "reason": _reason,
                 "db_id": save_res.get("db_id"),
                 "share_url": save_res.get("share_url") or url,
                 "metadata": save_res.get("metadata") or {},

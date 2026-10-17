@@ -634,19 +634,26 @@ async def _auto_process_and_notify_inner(chat_id: int, url: str, source_name: st
             # 因此用 force=True 让审核通过后的重试跳过投递去重闸门。
             try:
                 _pending_url = result.get("share_url") or url
-                _pending_task = asyncio.create_task(_recovered_poll_task({
-                    "share_url": _pending_url,
-                    "metadata": result.get("metadata") or {},
-                    "db_id": result.get("db_id"),
-                    "reason": _reason,
-                    "attempts": result.get("attempts") or 0,
-                    "direct_share": _is_direct,
-                }))
-                _PENDING_TASKS.add(_pending_task)
-                _pending_task.add_done_callback(_PENDING_TASKS.discard)
-                logger.info(f"🔄 已启动审核轮询任务: {_pending_url} "
-                             f"(reason={_reason}, db_id={result.get('db_id')}, "
-                             f"direct={_is_direct})")
+                if _pending_url in _POLLING_URLS:
+                    logger.info(f"⏭️ 该链接已有轮询任务，跳过重复启动: {_pending_url}")
+                else:
+                    _POLLING_URLS.add(_pending_url)
+                    _pending_task = asyncio.create_task(_recovered_poll_task({
+                        "share_url": _pending_url,
+                        "metadata": result.get("metadata") or {},
+                        "db_id": result.get("db_id"),
+                        "reason": _reason,
+                        "attempts": result.get("attempts") or 0,
+                        "direct_share": _is_direct,
+                    }))
+                    _PENDING_TASKS.add(_pending_task)
+                    _pending_task.add_done_callback(_PENDING_TASKS.discard)
+                    _pending_task.add_done_callback(
+                        lambda _t, _u=_pending_url: _POLLING_URLS.discard(_u)
+                    )
+                    logger.info(f"🔄 已启动审核轮询任务: {_pending_url} "
+                                 f"(reason={_reason}, db_id={result.get('db_id')}, "
+                                 f"direct={_is_direct})")
             except Exception as _pe:
                 logger.error(f"❌ 启动审核轮询失败: {_pe}", exc_info=True)
         else:
@@ -1645,14 +1652,47 @@ async def _handle_link(message, url: str):
             logger.warning(f"Jying sync error (non-fatal): {e}")
 
     elif result["status"] == "pending":
+        _reason = result.get("reason") or "auditing"
+        _is_direct = bool(result.get("direct_share"))
+        _pmsg = result.get("message") or {
+            "auditing": "115 审核中，放行后自动处理",
+            "snapshotting": "115 正在生成快照，稍后自动处理",
+            "restricted": "115 账号接收受限，已转入长间隔重试",
+        }.get(_reason, "115 暂时无法转存，稍后自动重试")
         try:
             await status_msg.edit_text(
-                f"⏳ {result.get('message', '处理中...')}\n"
-                f"🔗 {result.get('share_link', url)}\n完成后会自动通知。",
+                f"⏳ {_pmsg}\n"
+                f"🔗 {result.get('share_link', url)}\n"
+                "已加入自动轮询，放行后会自动处理并通知你。",
                 reply_markup=_back(),
             )
         except Exception:
             pass
+        # 🔧 私聊提交路径也必须启动轮询：原先只有频道/通用路径(613行)会 create_task，
+        # 私聊进审核的链接没人轮询 → 永远挂着（重启才恢复）。
+        try:
+            _pending_url = result.get("share_url") or url
+            if _pending_url in _POLLING_URLS:
+                logger.info(f"⏭️ 该链接已有轮询任务，跳过重复启动(私聊): {_pending_url}")
+            else:
+                _POLLING_URLS.add(_pending_url)
+                _pending_task = asyncio.create_task(_recovered_poll_task({
+                    "share_url": _pending_url,
+                    "metadata": result.get("metadata") or {},
+                    "db_id": result.get("db_id"),
+                    "reason": _reason,
+                    "attempts": result.get("attempts") or 0,
+                    "direct_share": _is_direct,
+                }))
+                _PENDING_TASKS.add(_pending_task)
+                _pending_task.add_done_callback(_PENDING_TASKS.discard)
+                _pending_task.add_done_callback(
+                    lambda _t, _u=_pending_url: _POLLING_URLS.discard(_u)
+                )
+                logger.info(f"🔄 已启动审核轮询任务(私聊): {_pending_url} "
+                            f"(reason={_reason}, db_id={result.get('db_id')}, direct={_is_direct})")
+        except Exception as _pe:
+            logger.error(f"❌ 启动审核轮询失败(私聊): {_pe}", exc_info=True)
     elif result["status"] == "cancelled":
         try:
             await status_msg.edit_text("🛑 任务已取消", reply_markup=_back())
@@ -1723,6 +1763,8 @@ def setup_bot() -> Application:
 
 # 正在运行的审核轮询任务集合（防止 GC 回收 + 防重复启动）
 _PENDING_TASKS: set = set()
+# 已在轮询中的分享链接（防重复起任务：同一链接被反复提交时只跑一个轮询）
+_POLLING_URLS: set = set()
 
 
 # ── 恢复审核中的链接轮询（启动时调用）──
@@ -1773,9 +1815,15 @@ async def _recover_pending_tasks():
                 logger.info(f"  ↳ {task.share_url} (状态: {task.status})")
                 # 创建 MockMessage 用于回复
                 import asyncio
+                _url = task.share_url
+                if _url in _POLLING_URLS:
+                    logger.info(f"  ⏭️ 已在轮询中，跳过: {_url}")
+                    continue
+                _POLLING_URLS.add(_url)
                 _t = asyncio.create_task(_recovered_poll_task(pending_info))
                 _PENDING_TASKS.add(_t)
                 _t.add_done_callback(_PENDING_TASKS.discard)
+                _t.add_done_callback(lambda _tt, _u=_url: _POLLING_URLS.discard(_u))
     except Exception as e:
         logger.error(f"❌ 恢复 pending tasks 异常: {e}", exc_info=True)
 
@@ -1816,9 +1864,14 @@ async def _recovered_poll_task(pending_info: dict):
         interval = min(interval * (2 ** _n), 86400)
 
     attempt = 0
+    _first_check = True
     while True:
         attempt += 1
-        await asyncio.sleep(interval)
+        # 首次检查缩短到 10 秒（审核常已放行，不必干等 5 分钟）；
+        # restricted 属账号级风控，首次也保持长间隔，避免加重限流。
+        _sleep = 10 if (reason == "auditing" and _first_check) else interval
+        _first_check = False
+        await asyncio.sleep(_sleep)
 
         try:
             # 获取 share status
