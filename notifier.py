@@ -197,16 +197,22 @@ def _can_submit(user_id: int) -> bool:
 # ══════════════════════════════════════════════
 
 def _main_menu() -> InlineKeyboardMarkup:
-    from config import DIRECT_SHARE_MODE
+    from config import DIRECT_SHARE_MODE, get_rename_suffix
     _mode_btn = InlineKeyboardButton(
         "⚡ 直发模式 ✅" if DIRECT_SHARE_MODE else "📥 转存模式 ✅",
         callback_data="menu_pushmode",
+    )
+    _sfx = get_rename_suffix()
+    _suffix_btn = InlineKeyboardButton(
+        f"🏷️ 文件名后缀：🟢 -{_sfx}" if _sfx else "🏷️ 文件名后缀：🔴 已关闭",
+        callback_data="rename_suffix_toggle",
     )
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📥 提交链接", callback_data="menu_link"),
          InlineKeyboardButton("📊 运行状态", callback_data="menu_status")],
         [_mode_btn,
          InlineKeyboardButton("📡 监听管理", callback_data="menu_monitor")],
+        [_suffix_btn],
         [InlineKeyboardButton("📝 查看日志", callback_data="menu_log")],
         [InlineKeyboardButton("⚙️ 查看配置", callback_data="menu_config"),
          InlineKeyboardButton("📋 可配置项", callback_data="menu_setlist")],
@@ -975,6 +981,38 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.info(f"🔀 推送模式切换: DIRECT_SHARE_MODE={_val} by {user_id}")
         await query.edit_message_text(f"{_after}\n{_eff}\n\n{msg}",
                                       reply_markup=_pushmode_menu())
+
+    # ── 重命名文件名后缀开关（-Cxuan）──
+    elif data == "rename_suffix_toggle":
+        if not _can_submit(user_id):
+            await query.edit_message_text("⛔ 你没有操作权限", reply_markup=_back())
+            return
+        from config import set_config, get_rename_suffix
+        _cur = get_rename_suffix()
+        _new = "0" if _cur else "Cxuan"
+        msg = set_config("RENAME_SUFFIX", _new)
+        _saved = not msg.startswith("❌")
+        if not _saved:
+            # 兜底：至少当前进程生效（get_rename_suffix 运行时读 os.environ）
+            import os as _os
+            _os.environ["RENAME_SUFFIX"] = _new
+        _now = get_rename_suffix()
+        if _now:
+            _head = f"🟢 已开启（-{_now}）"
+            _tip = (f"之后重命名的文件会带后缀，例如\n"
+                    f"九门.S01E01.2026.2160P.WEB-DL.DTS5.1.DV.H.265-{_now}.mp4")
+        else:
+            _head = "🔴 已关闭"
+            _tip = ("之后重命名的文件不带后缀，例如\n"
+                    "九门.S01E01.2026.2160P.WEB-DL.DTS5.1.DV.H.265.mp4")
+        _warn = "" if _saved else "\n⚠️ 写入 .env 失败，重启后可能回到旧值。"
+        logger.info(f"🏷️ 文件名后缀开关 → {_new}（by {user_id}）")
+        await query.edit_message_text(
+            f"🏷️ 重命名文件名后缀\n\n当前：{_head}\n{_tip}\n\n"
+            f"只影响之后的新任务（已转存的文件不追溯）；\n"
+            f"文件夹命名 (年) (tmdb-id) 不受影响。{_warn}",
+            reply_markup=_main_menu(),
+        )
 
     # ── OpenAI 设置（二级：四项可编辑 → 三级回复新值）──
     elif data == "menu_openai":

@@ -59,6 +59,7 @@ from config import (
     P115_COOKIE, P115_SAVE_DIR, AUTO_RENAME,
     SHARE_AUDIT_WAIT_TIMEOUT, SHARE_AUDIT_POLL_INTERVAL,
     RETRY_INTERVAL, MAX_RETRY,
+    get_rename_suffix,
 )
 
 logger = logging.getLogger("pipeline")
@@ -216,13 +217,26 @@ def infer_audio_codec(video_names):
     return max(cnt, key=cnt.get)
 
 
-async def _rename_video_tree(svc, folder_id, title_cn, year, tmdb_id, suffix="Cxuan",
+def _rename_suffix() -> str:
+    """重命名用的文件名后缀（菜单开关 RENAME_SUFFIX 控制；空串 = 不加）。
+
+    运行时读取，开关切换后对新任务立即生效（已转存的文件不追溯）。
+    """
+    try:
+        return get_rename_suffix()
+    except Exception:
+        return "Cxuan"
+
+
+async def _rename_video_tree(svc, folder_id, title_cn, year, tmdb_id, suffix=None,
                              is_movie: bool = False):
     """递归重命名目录树中的全部视频；保留 Season 等原有子目录名。
 
     is_movie=True 时忽略文件名里的 SxxExx —— 源站常把电影按剧集格式封装
     （实测「你的婚礼.S01E01.2021.2160p」是电影 723640），照写会污染文件名。
     """
+    if suffix is None:
+        suffix = _rename_suffix()
     ok = fail = total = 0
     sub = await _get_dir_items(svc, folder_id)
     sub = list({str(x["id"]): x for x in sub}.values())
@@ -309,18 +323,20 @@ async def _rename_video_tree(svc, folder_id, title_cn, year, tmdb_id, suffix="Cx
     return ok, fail, total
 
 
-async def _rename_saved(svc, to_cid, title_cn: str, year: str, tmdb_id, suffix: str = "Cxuan",
+async def _rename_saved(svc, to_cid, title_cn: str, year: str, tmdb_id, suffix: str = None,
                         expected_video_count: int = 0, is_movie: bool = False):
     """对已转存到 to_cid 的目录树做规范重命名：顶层文件夹 + 每个视频文件。
 
     文件夹命名：`{名字} ({年}) (tmdb-{id})`
-    单集命名：保留全部技术元数据 + `-{suffix}` 后缀
+    单集命名：保留全部技术元数据 + `-{suffix}` 后缀（suffix 空则不加）
                  e.g. `九门.S01E01.2026.2160P.WEB-DL.DTS5.1.DV.H.265-Cxuan.mp4`
     电影/无集数：`{名字}.{年}.{画质}.{源}.{音频}.{HDR}.{编码}-Cxuan.mkv`（不带 S/E）
 
     若分享根没有文件夹（如单文件电影），自动建规范文件夹并把文件移入，
     返回 (ok, fail, total, new_cid)，new_cid 非空表示新建了文件夹。
     """
+    if suffix is None:
+        suffix = _rename_suffix()
     ok = fail = total = 0
     new_cid = None
     folder_name = build_folder_name(title_cn, year, tmdb_id)

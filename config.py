@@ -36,6 +36,7 @@ CONFIG_SCHEMA = {
     "LLM_PROMPT":            ("",     "自定义识别提示词（空=内置默认）", False),
     "LOG_LEVEL":             ("INFO", "日志级别", False),
     "AUTO_RENAME":           ("1",    "自动重命名 0/1", False),
+    "RENAME_SUFFIX":         ("Cxuan", "重命名文件名后缀（Cxuan；0=不加后缀）", False),
     "DIRECT_SHARE_MODE":     ("0",    "原链接直转分享 0=转存重命名/1=原链接直接分享(不转存)", False),
     "DUP_LINK_MAX":          ("3",    "同一链接重复投递几次后不再记录(1=只处理首次)", False),
     "AUTO_DELETE_AFTER":     ("0",    "发卡成功后自动删除源文件延迟秒数（0=不删除）", False),
@@ -172,6 +173,20 @@ TMDB_LANG = (os.getenv("TMDB_LANG") or "zh-CN").strip()
 APP_HTTP_PROXY = os.getenv("APP_HTTP_PROXY", "").strip()
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").strip()
 AUTO_RENAME = os.getenv("AUTO_RENAME", "1").strip().lower() in {"1", "true", "yes"}
+
+# 重命名时追加在文件名末尾的标签（如 xxx.H.265-Cxuan.mp4）。
+# 设为 0/off/空 则不加后缀；运行时读取，菜单开关切换后立即生效。
+_RENAME_SUFFIX_OFF = {"0", "off", "false", "no", "none", ""}
+
+
+def get_rename_suffix() -> str:
+    """当前文件名后缀（空串 = 不加后缀）。"""
+    try:
+        val = str(os.environ.get("RENAME_SUFFIX", "Cxuan") or "").strip()
+    except Exception:
+        return "Cxuan"
+    return "" if val.lower() in _RENAME_SUFFIX_OFF else val
+
 # 原链接直转分享：1=只读原链接直接发频道，0=转存+重命名+自建分享
 DIRECT_SHARE_MODE = os.getenv("DIRECT_SHARE_MODE", "0").strip().lower() in {"1", "true", "yes"}
 SHARE_AUDIT_WAIT_TIMEOUT = int(os.getenv("SHARE_AUDIT_WAIT_TIMEOUT", str(15 * 60)))
