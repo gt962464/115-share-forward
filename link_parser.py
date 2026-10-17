@@ -108,3 +108,14 @@ def parse_ed2k(url: str) -> dict:
     if not name or size < 0 or not re.fullmatch(r"[A-F0-9]{32}", file_hash, re.I):
         raise ValueError("ed2k 文件名、大小或哈希无效")
     return {"url": url, "name": name, "size": size, "hash": file_hash}
+
+
+def build_ed2k_url(name: str, size, file_hash: str) -> str:
+    """生成规范的（「完美」）ed2k 链接。
+
+    源频道的链接常见两个毛病：文件名带空格/未编码、结尾缺 "/"，粘进
+    115 离线下载或迅雷会被截断。这里统一：文件名 URL 编码 + 哈希大写 +
+    结尾补 "/"。文件名只是标签，哈希才是文件身份，改名不影响下载内容。
+    """
+    _name = urllib.parse.quote(str(name or "file"), safe="")
+    return f"ed2k://|file|{_name}|{int(size)}|{str(file_hash).upper()}|/"

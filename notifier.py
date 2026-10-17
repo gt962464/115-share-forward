@@ -19,7 +19,7 @@ from config import (
     set_config, get_config, format_config_list,
     CONFIG_SCHEMA,
 )
-from link_parser import extract_115_links, extract_ed2k_links, parse_ed2k
+from link_parser import extract_115_links, extract_ed2k_links, parse_ed2k, build_ed2k_url
 from pipeline import process_link, format_size
 from monitor import get_monitor
 
@@ -1495,6 +1495,50 @@ def _channel_target():
     return int(TG_CHANNEL_ID) if TG_CHANNEL_ID.lstrip("-").isdigit() else TG_CHANNEL_ID
 
 
+def _clean_ed2k_name(name: str) -> str:
+    """识别失败时的兜底：去掉 {tmdbid-xxx} 等花括号标记，空白压成点。"""
+    import re as _re
+    n = _re.sub(r"[{｛][^}｝]*[}｝]", "", str(name or ""))
+    n = _re.sub(r"\s+", ".", n.strip())
+    n = _re.sub(r"\.{2,}", ".", n)          # 空格→点后别留出连续点
+    n = _re.sub(r"第\.(\d{1,3})\.集", r"第\1集", n)
+    return (n.strip(".") or "file.mkv")
+
+
+def _perfect_ed2k_name(item_name: str, title_cn: str = "", year: str = "",
+                       season: int = None, audio: str = "") -> str:
+    """按本站命名规范重建 ed2k 文件名（「完美链接」用）。
+
+    规范：{标题}.S{季}E{集}.{年}.{画质}.{源}.{音频}.{HDR}.{编码}[-后缀].{ext}
+    例：まめとむぎ.2026.S01E03.第 3 集.1080p.LINETV.WEB-DL.H.264.AAC.2.0.{tmdbid-333357}.mkv
+        → まめとむぎ.S01E03.2026.1080P.LINETV.WEB-DL.AAC.H.264-Cxuan.mkv
+    电影（无 S/E、无 第x集）：{标题}.{年}.{画质}.{源}.{音频}.{编码}[-后缀].{ext}
+    识别失败退回清理后的原名；后缀开关（RENAME_SUFFIX）关闭则不追加 -Cxuan。
+    """
+    import re as _re
+    from pipeline import parse_filename, build_canonical_name, video_ext
+    from config import get_rename_suffix
+
+    p = parse_filename(item_name)
+    ext = video_ext(item_name) or ".mkv"
+    _se = _re.search(r"[Ss](\d{1,2})[Ee](\d{1,3})(?:[-~]?[Ee]?(\d{1,3}))?", item_name)
+    _mc = _re.search(r"第\s*(\d{1,3})\s*集", item_name)
+    if _se:
+        _season, ep_start = int(_se.group(1)), int(_se.group(2))
+        ep_end = int(_se.group(3)) if _se.group(3) else None
+    elif _mc:
+        _season = season or 1
+        ep_start, ep_end = int(_mc.group(1)), None
+    else:
+        _season, ep_start, ep_end = None, None, None
+    name = build_canonical_name(
+        (title_cn or p["title"]), _season, ep_start, ep_end,
+        (p.get("year") or year or ""), p.get("quality", ""), p.get("source", ""),
+        audio, "", p.get("encode", ""), ext, get_rename_suffix(),
+    )
+    return name or _clean_ed2k_name(item_name)
+
+
 async def _build_and_push_ed2k(ed2k_links: list, private_chat_id: int = None) -> dict:
     """解析 ed2k → 识别 → 海报卡片：私聊 + 频道各发一份（不涉及 115 转存）。
 
@@ -1502,7 +1546,7 @@ async def _build_and_push_ed2k(ed2k_links: list, private_chat_id: int = None) ->
     返回 {ok, private, channel, channel_target, title, count, error?}
     """
     import re as _re
-    from pipeline import parse_filename, format_size, VIDEO_EXTS
+    from pipeline import parse_filename, format_size, VIDEO_EXTS, infer_audio_codec
     from identifier import resolve_title, douban_rating, fetch_poster_bytes
 
     items = []
@@ -1520,6 +1564,13 @@ async def _build_and_push_ed2k(ed2k_links: list, private_chat_id: int = None) ->
     parsed = parse_filename(base["name"])
     _se = _re.search(r"[Ss](\d{1,2})[Ee]\d{1,3}", base["name"])
     season = int(_se.group(1)) if _se else None
+
+    # 音频编码（与 115 转存管线一致：从文件名推断，取出现最多的）
+    try:
+        audio = infer_audio_codec([it["name"] for it in items]) or ""
+    except Exception as _ae:
+        logger.warning(f"⚠️ ed2k 音频推断失败: {_ae}")
+        audio = ""
 
     try:
         ident = await resolve_title(
@@ -1567,19 +1618,37 @@ async def _build_and_push_ed2k(ed2k_links: list, private_chat_id: int = None) ->
             douban_rating=douban or "暂无评分",
             quality=parsed["quality"], source=parsed["source"],
             size_text=format_size(total), episode=episode_text,
-            encode=parsed["encode"], audio="",
-            link_line=f"🔗 ED2K 链接：共 {len(items)} 个文件（下方发完整链接）",
+            encode=parsed["encode"], audio=audio,
+            link_line=f"🔗 ED2K 链接：共 {len(items)} 个文件（下方发完美链接）",
             overview=det.get("overview", ""),
         )
     except Exception as e:
         logger.warning(f"⚠️ ed2k 卡片构建失败，降级为纯文本: {e}")
         card = f"🎬 {title} ({year})\n🔗 ED2K 链接：共 {len(items)} 个文件"
 
+    # 🔧 完美链接：识别后按本站命名规范重建文件名（去空格/{tmdbid} 标记、
+    # 规范化 SxxExx/画质/来源/编码），URL 编码 + 补结尾斜杠 → 直接可粘进
+    # 115 离线下载/迅雷。文件名只是标签（哈希才是文件身份），改名不影响下载内容，
+    # 且 115 离线下载会按新名字保存。
+    perfect_links = []
+    for it in items:
+        try:
+            _pname = _perfect_ed2k_name(it["name"], title_cn=title, year=year,
+                                        season=season, audio=audio)
+        except Exception as _pe:
+            logger.warning(f"⚠️ ed2k 文件名规范化失败，退回清理原名: {_pe}", exc_info=True)
+            _pname = _clean_ed2k_name(it["name"])
+        try:
+            perfect_links.append(build_ed2k_url(_pname, it["size"], it["hash"]))
+        except Exception:
+            perfect_links.append(it["url"])
+
     links_block = "\n".join(
-        f"{i}. {html_escape(u, quote=False)}" for i, u in enumerate(ed2k_links, 1)
+        f"{i}. {html_escape(u, quote=False)}" for i, u in enumerate(perfect_links, 1)
     )
     links_message = (
-        f"📎 {title}｜完整 ED2K 链接（{len(ed2k_links)}个）：\n<pre>{links_block}</pre>"
+        f"📎 {title}｜完美 ED2K 链接（{len(perfect_links)}个，已按命名规范转化）：\n"
+        f"<pre>{links_block}</pre>"
     )
 
     # 私聊（提交者/管理员）+ 频道分别发送，各自 catch
