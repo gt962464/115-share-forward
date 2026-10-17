@@ -711,8 +711,16 @@ async def _start_login_flow(query, user_id: int):
             logger.info(f"🔗 监听到 115 链接: {url[:60]}... (来源: {source_name})")
             await _auto_process_and_notify(user_id, url, source_name)
 
+        async def on_ed2k_found(ed2k_links: list, source_name: str, event):
+            logger.info(f"🔗 监听到 ed2k 链接 {len(ed2k_links)} 个 (来源: {source_name})")
+            try:
+                await push_ed2k_from_monitor(ed2k_links, source_name)
+            except Exception as e:
+                logger.error(f"❌ ed2k 卡片处理异常: {e}", exc_info=True)
+
         try:
-            monitor = Monitor(on_link_found=on_link_found, on_login_prompt=on_login_prompt)
+            monitor = Monitor(on_link_found=on_link_found, on_login_prompt=on_login_prompt,
+                              on_ed2k_found=on_ed2k_found)
         except Exception as e:
             await query.edit_message_text(f"❌ 初始化监听器失败: {e}", reply_markup=_monitor_back_menu())
             return
@@ -720,6 +728,15 @@ async def _start_login_flow(query, user_id: int):
     else:
         # 复用已有实例，登录提示发给本次点击的人
         monitor.on_login_prompt = on_login_prompt
+        # 兼容旧实例（升级前创建的没有 ed2k 回调）
+        if getattr(monitor, "on_ed2k_found", None) is None:
+            async def on_ed2k_found(ed2k_links: list, source_name: str, event):
+                logger.info(f"🔗 监听到 ed2k 链接 {len(ed2k_links)} 个 (来源: {source_name})")
+                try:
+                    await push_ed2k_from_monitor(ed2k_links, source_name)
+                except Exception as e:
+                    logger.error(f"❌ ed2k 卡片处理异常: {e}", exc_info=True)
+            monitor.on_ed2k_found = on_ed2k_found
 
     await query.edit_message_text(
         "🔐 已发起登录流程。\n\n"
@@ -1478,8 +1495,12 @@ def _channel_target():
     return int(TG_CHANNEL_ID) if TG_CHANNEL_ID.lstrip("-").isdigit() else TG_CHANNEL_ID
 
 
-async def _handle_ed2k(message, ed2k_links: list):
-    """ed2k 链接：解析 → OpenAI/TMDB 识别 → 海报卡片发私聊+频道（不进 115 转存）。"""
+async def _build_and_push_ed2k(ed2k_links: list, private_chat_id: int = None) -> dict:
+    """解析 ed2k → 识别 → 海报卡片：私聊 + 频道各发一份（不涉及 115 转存）。
+
+    两条路径共用：私聊提交（_handle_ed2k）与频道监听（push_ed2k_from_monitor）。
+    返回 {ok, private, channel, channel_target, title, count, error?}
+    """
     import re as _re
     from pipeline import parse_filename, format_size, VIDEO_EXTS
     from identifier import resolve_title, douban_rating, fetch_poster_bytes
@@ -1489,8 +1510,9 @@ async def _handle_ed2k(message, ed2k_links: list):
         try:
             items.append(parse_ed2k(url))
         except Exception as e:
-            await message.reply_text(f"⚠️ ed2k 链接无效: {e}", reply_markup=_back())
-            return
+            logger.warning(f"ed2k 链接无效: {e}")
+            return {"ok": False, "private": False, "channel": False, "channel_target": False,
+                    "title": "", "count": len(ed2k_links), "error": f"ed2k 链接无效: {e}"}
 
     # 用视频文件做识别基准（没有视频就用第一个文件）
     videos = [it for it in items if it["name"].lower().endswith(VIDEO_EXTS)]
@@ -1498,8 +1520,6 @@ async def _handle_ed2k(message, ed2k_links: list):
     parsed = parse_filename(base["name"])
     _se = _re.search(r"[Ss](\d{1,2})[Ee]\d{1,3}", base["name"])
     season = int(_se.group(1)) if _se else None
-
-    status_msg = await message.reply_text(f"🔍 识别 ed2k 资源: {base['name'][:60]}...")
 
     try:
         ident = await resolve_title(
@@ -1562,29 +1582,84 @@ async def _handle_ed2k(message, ed2k_links: list):
         f"📎 {title}｜完整 ED2K 链接（{len(ed2k_links)}个）：\n<pre>{links_block}</pre>"
     )
 
-    # 私聊（回复给提交者）+ 频道分别发送，各自 catch
-    try:
-        private_ok = await _send_card_to(message.chat.id, card, links_message, poster)
-    except Exception as e:
-        logger.error(f"❌ ed2k 私聊卡片发送异常: {e}", exc_info=True)
-        private_ok = False
+    # 私聊（提交者/管理员）+ 频道分别发送，各自 catch
+    private_ok = False
+    if private_chat_id:
+        try:
+            private_ok = await _send_card_to(private_chat_id, card, links_message, poster)
+        except Exception as e:
+            logger.error(f"❌ ed2k 私聊卡片发送异常: {e}", exc_info=True)
 
     channel_ok = False
+    target = None
     try:
         target = _channel_target()
         channel_ok = await _send_card_to(target, card, links_message, poster) if target else False
     except Exception as e:
         logger.error(f"❌ ed2k 频道卡片发送异常: {e}", exc_info=True)
 
+    return {
+        "ok": bool(private_ok or channel_ok),
+        "private": private_ok,
+        "channel": channel_ok,
+        "channel_target": bool(target),
+        "title": title,
+        "count": len(ed2k_links),
+    }
+
+
+async def _handle_ed2k(message, ed2k_links: list):
+    """ed2k 链接（私聊提交）：解析 → 识别 → 卡片发私聊+频道（不进 115 转存）。"""
+    status_msg = None
     try:
-        await status_msg.edit_text(
-            f"{'✅' if private_ok else '⚠️'} ed2k 卡片发送完成（未转存）\n"
-            f"私聊：{'成功' if private_ok else '失败'}"
-            + (f"｜频道：{'成功' if channel_ok else '失败'}" if target else "｜频道：未配置"),
-            reply_markup=_back(),
-        )
+        _name = parse_ed2k(ed2k_links[0])["name"][:60] if ed2k_links else ""
+        status_msg = await message.reply_text(f"🔍 识别 ed2k 资源: {_name}...")
     except Exception:
         pass
+
+    res = await _build_and_push_ed2k(ed2k_links, private_chat_id=message.chat.id)
+
+    if res.get("error"):
+        text = f"⚠️ {res['error']}"
+    else:
+        text = (
+            f"{'✅' if res.get('private') else '⚠️'} ed2k 卡片发送完成（未转存）\n"
+            f"私聊：{'成功' if res.get('private') else '失败'}"
+            + (f"｜频道：{'成功' if res.get('channel') else '失败'}"
+               if res.get("channel_target") else "｜频道：未配置")
+        )
+    try:
+        if status_msg is not None:
+            await status_msg.edit_text(text, reply_markup=_back())
+        else:
+            await message.reply_text(text, reply_markup=_back())
+    except Exception:
+        pass
+
+
+async def push_ed2k_from_monitor(ed2k_links: list, source_name: str = "") -> dict:
+    """频道监听捕获的 ed2k：识别 → 卡片推频道 + 私聊通知（不转存）。
+
+    源频道大量资源是 ed2k 形式（sender 的解锁机器人格式），原先监听器
+    只认 115 链接 → 这类消息被直接忽略。现在与私聊提交走同一套卡片逻辑。
+    """
+    chat_id = None
+    try:
+        from app.core.config import settings as _settings
+        chat_id = int(_settings.TG_USER_ID) if getattr(_settings, "TG_USER_ID", None) else None
+    except Exception:
+        chat_id = None
+
+    res = await _build_and_push_ed2k(ed2k_links, private_chat_id=chat_id)
+    if res.get("error"):
+        logger.warning(f"⚠️ 监听到的 ed2k 处理失败（来源 {source_name}）: {res['error']}")
+    else:
+        logger.info(
+            f"✅ ed2k 卡片已处理（来源 {source_name}）: {res.get('title')}｜"
+            f"{res.get('count')} 个文件｜私聊={'成功' if res.get('private') else '失败'}｜"
+            f"频道={'成功' if res.get('channel') else '未推送'}"
+        )
+    return res
 
 
 async def _handle_link(message, url: str):

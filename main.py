@@ -95,11 +95,22 @@ async def main():
             chat_id = int(TG_USER_ID) if TG_USER_ID else None
             await _auto_process_and_notify(chat_id, url, source_name)
 
+        # 🔧 ed2k：源频道很多资源是 ed2k:// 格式（无 115 链接），监听器以前整条忽略。
+        # 现在走 notifier 的 ed2k 卡片流程（识别 + 发卡到频道 + 私聊通知，不转存）。
+        async def on_ed2k_found(ed2k_links: list, source_name: str, event):
+            logger.info(f"🔗 监听到 ed2k 链接 {len(ed2k_links)} 个 (来源: {source_name})")
+            try:
+                from notifier import push_ed2k_from_monitor
+                await push_ed2k_from_monitor(ed2k_links, source_name)
+            except Exception as e:
+                logger.error(f"❌ ed2k 卡片处理异常: {e}", exc_info=True)
+
         async def on_login_prompt(prompt: str):
             if TG_USER_ID:
                 await send_private(int(TG_USER_ID), prompt)
 
-        monitor = Monitor(on_link_found=on_link_found, on_login_prompt=on_login_prompt)
+        monitor = Monitor(on_link_found=on_link_found, on_login_prompt=on_login_prompt,
+                          on_ed2k_found=on_ed2k_found)
         set_monitor(monitor)
         try:
             await monitor.start()

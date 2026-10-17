@@ -16,7 +16,9 @@ CTRL_RE = re.compile(r"[\u200b\u200c\u200d\u2066-\u2069\ufeff]")
 # 尾部多余字符
 TRAIL_RE = re.compile(r"[^A-Za-z0-9?=&:/._-]+$")
 # ed2k://|file|文件名|文件大小|哈希|/，文件名通常已 URL 编码
-ED2K_RE = re.compile(r"ed2k://\|file\|[^|\r\n]+\|\d+\|[A-Fa-f0-9]{32}\|/", re.I)
+# 🔧 结尾的 "/" 可选：源频道大量链接写成 ...|哈希|（无结尾斜杠），
+# 原先正则强制 \|/ → 这类链接一律提取失败（表现就是「识别不出来」）。
+ED2K_RE = re.compile(r"ed2k://\|file\|[^|\r\n]+\|\d+\|[A-Fa-f0-9]{32}\|/?", re.I)
 # ed2k 尾部标点
 _ED2K_TAIL_RE = re.compile(r"[\s。，,；;！!？?#]+$")
 

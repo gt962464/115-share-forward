@@ -16,7 +16,7 @@ from telethon.errors import (
 )
 
 from config import TG_SESSION, set_config
-from link_parser import extract_115_links
+from link_parser import extract_115_links, extract_ed2k_links
 
 logger = logging.getLogger("monitor")
 
@@ -53,10 +53,13 @@ def get_monitor():
 class Monitor:
     """Telegram 用户账号监听器。"""
 
-    def __init__(self, on_link_found=None, on_login_prompt=None):
+    def __init__(self, on_link_found=None, on_login_prompt=None, on_ed2k_found=None):
         """
         on_link_found: async callback(link: str, source_name: str, message)
         当发现 115 链接时调用。
+
+        on_ed2k_found: async callback(ed2k_links: list, source_name: str, message)
+        当发现 ed2k 链接（源频道常见格式，无 115 链接）时调用。
 
         on_login_prompt: async callback(prompt: str)
         需要用户输入手机号/验证码/密码时调用（用于私聊 Bot 通知管理员）。
@@ -72,6 +75,7 @@ class Monitor:
         self.client = TelegramClient(TG_SESSION, self.api_id, self.api_hash, proxy=make_proxy())
         self.on_link_found = on_link_found
         self.on_login_prompt = on_login_prompt
+        self.on_ed2k_found = on_ed2k_found
         self._running = False
 
         # 运行时状态（动态读当前环境变量，热切换时更新并持久化回 .env）
@@ -321,8 +325,28 @@ class Monitor:
         text = event.raw_text or ""
         entities = event.message.entities
         links = extract_115_links(text, entities)
-        if not links:
+
+        # 🔧 ed2k：源频道大量资源是 ed2k:// 格式（解锁机器人样式，无 115 链接），
+        # 原先这里 if not links: return → 这类消息被整条忽略。
+        # 同一条消息里已经有 115 链接时不处理 ed2k，避免同一资源发两张卡。
+        ed2k_links = [] if links else extract_ed2k_links(text)
+
+        if not links and not ed2k_links:
             return
+
+        _source_cache = {"value": None}
+
+        async def _resolve_source() -> str:
+            if _source_cache["value"] is None:
+                src = "unknown"
+                try:
+                    sender = await event.get_sender()
+                    src = (getattr(sender, "first_name", None)
+                           or getattr(sender, "username", None) or "unknown")
+                except Exception:
+                    pass
+                _source_cache["value"] = src
+            return _source_cache["value"]
 
         for link_info in links:
             # 去重 key 只用链接本身（不含 event.id）。
@@ -334,13 +358,7 @@ class Monitor:
                 continue
             self._mark_processed(key)
 
-            source = "unknown"
-            try:
-                sender = await event.get_sender()
-                source = getattr(sender, "first_name", None) or getattr(sender, "username", None) or "unknown"
-            except Exception:
-                pass
-
+            source = await _resolve_source()
             logger.info(f"🔗 监听到 115 链接: [{event_type}] 来自 {source}: {link_info['url'][:60]}...")
 
             if self.on_link_found:
@@ -348,6 +366,31 @@ class Monitor:
                     await self.on_link_found(link_info["url"], source, event)
                 except Exception as e:
                     logger.error(f"处理链接回调失败: {e}")
+
+        if not ed2k_links:
+            return
+
+        # ed2k 去重：按链接本身（前缀 ed2k: 与 115 链接 key 区分开）
+        fresh = [u for u in ed2k_links if f"ed2k:{u}" not in self._processed_keys]
+        if not fresh:
+            logger.info(f"⏭️ 监听去重：ed2k 已处理过，跳过（{len(ed2k_links)} 个）")
+            return
+
+        if self.on_ed2k_found is None:
+            logger.info(f"ℹ️ 收到 ed2k 消息（{len(fresh)} 个）但未接 ed2k 回调，忽略")
+            return
+
+        for u in fresh:
+            self._mark_processed(f"ed2k:{u}")
+
+        source = await _resolve_source()
+        logger.info(f"🔗 监听到 ed2k 链接 {len(fresh)} 个: [{event_type}] 来自 {source}: "
+                    f"{fresh[0][:60]}...")
+
+        try:
+            await self.on_ed2k_found(fresh, source, event)
+        except Exception as e:
+            logger.error(f"处理 ed2k 回调失败: {e}", exc_info=True)
 
     async def stop(self):
         self._running = False
